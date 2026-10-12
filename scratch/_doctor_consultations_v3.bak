@@ -1,0 +1,651 @@
+<?php
+session_start();
+include("dbconnection.php");
+include_once("includes/rbac_guard.php");
+
+if(!isset($_SESSION['user_id'])) {
+    header("Location: index.php");
+    exit();
+}
+
+// RBAC: Restrict strictly to doctor role
+$user_role = rbac_get_role();
+if($user_role !== 'doctor') {
+    header("Location: " . rbac_home_url($user_role));
+    exit();
+}
+
+$me = (int)$_SESSION['user_id'];
+
+// Appointment this doctor may act on: assigned to them (or unassigned) and still Approved
+function consult_get_appt($conn, $apt_id, $me) {
+    $st = $conn->prepare("SELECT * FROM appointments WHERE id = ? AND status = 'Approved' AND (doctor_id = ? OR doctor_id IS NULL)");
+    $st->bind_param("ii", $apt_id, $me);
+    $st->execute();
+    return $st->get_result()->fetch_assoc();
+}
+
+// Pet ids for an appointment (multi-pet aware): appointment_pets first, else match by owner + name
+function consult_pet_ids($conn, $appt) {
+    $ids = [];
+    $names = [];
+    $r = $conn->query("SELECT pet_id, pet_name FROM appointment_pets WHERE appointment_id = " . (int)$appt['id']);
+    if ($r) while ($p = $r->fetch_assoc()) {
+        if ($p['pet_id']) $ids[] = (int)$p['pet_id']; else $names[] = $p['pet_name'];
+    }
+    if (!$ids && !$names) $names = array_map('trim', explode(',', $appt['pet_name']));
+    if ($names) {
+        $st = $conn->prepare("SELECT id FROM pets WHERE user_id = ? AND name = ? LIMIT 1");
+        foreach ($names as $nm) {
+            $st->bind_param("is", $appt['user_id'], $nm);
+            $st->execute();
+            if ($row = $st->get_result()->fetch_assoc()) $ids[] = (int)$row['id'];
+        }
+    }
+    return array_values(array_unique($ids));
+}
+
+// Edit Rx (before printing) — only this doctor's consultations
+if (isset($_POST['save_rx'])) {
+    header('Content-Type: application/json');
+    $cid = (int)($_POST['consult_id'] ?? 0);
+    $own = $conn->prepare("SELECT c.id, c.appointment_id FROM consultations c JOIN appointments a ON a.id = c.appointment_id
+                           WHERE c.id = ? AND (a.doctor_id = ? OR (a.doctor_id IS NULL AND c.vet_name = (SELECT fullname FROM users WHERE id = ?)))");
+    $own->bind_param("iii", $cid, $me, $me);
+    $own->execute();
+    $c = $own->get_result()->fetch_assoc();
+
+    $diagnosis    = trim($_POST['diagnosis'] ?? '');
+    $treatment    = trim($_POST['treatment'] ?? '');
+    $prescription = trim($_POST['prescription'] ?? '');
+    $followup     = preg_match('/^\d{4}-\d{2}-\d{2}$/', $_POST['followup_date'] ?? '') ? $_POST['followup_date'] : null;
+
+    if (!$c) {
+        echo json_encode(['ok' => false, 'error' => 'Record not found or not yours to edit.']);
+    } elseif ($diagnosis === '' || $treatment === '') {
+        echo json_encode(['ok' => false, 'error' => 'Diagnosis and treatment are required.']);
+    } else {
+        $up = $conn->prepare("UPDATE consultations SET diagnosis=?, treatment=?, prescription=?, followup_date=? WHERE id=?");
+        $up->bind_param("ssssi", $diagnosis, $treatment, $prescription, $followup, $cid);
+        $ok = $up->execute();
+
+        // Keep the matching EMR entries in sync
+        $emr_notes = 'Treatment: ' . $treatment
+                   . ($prescription !== '' ? "\nPrescription: " . $prescription : '')
+                   . ($followup ? "\nFollow-up: " . date('M d, Y', strtotime($followup)) : '');
+        $em = $conn->prepare("UPDATE medical_records SET description=?, notes=? WHERE appointment_id=? AND record_type='checkup'");
+        $em->bind_param("ssi", $diagnosis, $emr_notes, $c['appointment_id']);
+        $em->execute();
+
+        echo json_encode(['ok' => $ok, 'error' => $ok ? null : 'Could not save changes.']);
+    }
+    exit();
+}
+
+// Add Consultation logic
+if(isset($_POST['save_consultation'])) {
+    $apt_id       = (int)$_POST['appointment_id'];
+    $appt         = consult_get_appt($conn, $apt_id, $me);
+    if (!$appt) {
+        $_SESSION['message'] = 'Appointment not found, already completed, or assigned to another doctor.';
+        $_SESSION['msg_type'] = 'danger';
+        header("Location: doctor_consultations.php");
+        exit();
+    }
+    // Attending vet = doctor assigned to the appointment (fallback: the doctor completing it)
+    $vq = $conn->prepare("SELECT COALESCE(d.fullname, me.fullname) AS vet_name
+                          FROM appointments a
+                          LEFT JOIN users d  ON d.id = a.doctor_id
+                          LEFT JOIN users me ON me.id = ?
+                          WHERE a.id = ?");
+    $vq->bind_param("ii", $_SESSION['user_id'], $apt_id);
+    $vq->execute();
+    $vet_name = $vq->get_result()->fetch_assoc()['vet_name'] ?? ($_SESSION['user'] ?? '');
+    $diagnosis    = trim($_POST['diagnosis']);
+    $treatment    = trim($_POST['treatment']);
+    $prescription = trim($_POST['prescription']);
+    $followup     = !empty($_POST['followup_date']) ? $_POST['followup_date'] : NULL;
+    
+    $lab_url = NULL;
+    if(isset($_FILES['lab_result']) && $_FILES['lab_result']['error'] === 0) {
+        $ext = strtolower(pathinfo($_FILES['lab_result']['name'], PATHINFO_EXTENSION));
+        if(in_array($ext, ['pdf', 'jpg', 'jpeg', 'png'])) {
+            $lab_url = uniqid('lab_') . '.' . $ext;
+            if(!file_exists('uploads/labs/')) {
+                mkdir('uploads/labs/', 0777, true);
+            }
+            move_uploaded_file($_FILES['lab_result']['tmp_name'], 'uploads/labs/' . $lab_url);
+        }
+    }
+
+    // Insert to consultations
+    $stmt = $conn->prepare("INSERT INTO consultations(appointment_id, vet_name, diagnosis, treatment, prescription, followup_date, lab_results_url) VALUES(?,?,?,?,?,?,?)");
+    $stmt->bind_param("issssss", $apt_id, $vet_name, $diagnosis, $treatment, $prescription, $followup, $lab_url);
+    
+    if($stmt->execute()){
+        $new_consult_id = $conn->insert_id;
+
+        // Mark appointment as Completed
+        $conn->query("UPDATE appointments SET status='Completed' WHERE id=$apt_id");
+
+        // Add the visit to each pet's medical record (EMR)
+        $emr_notes = 'Treatment: ' . $treatment
+                   . ($prescription !== '' ? "\nPrescription: " . $prescription : '')
+                   . ($followup ? "\nFollow-up: " . date('M d, Y', strtotime($followup)) : '');
+        $emr_title = $appt['service_type'] ?: 'Consultation';
+        $emr_date  = date('Y-m-d');
+        $emr = $conn->prepare("INSERT INTO medical_records (pet_id, appointment_id, record_type, title, description, doctor_name, record_date, status, notes) VALUES (?, ?, 'checkup', ?, ?, ?, ?, 'Completed', ?)");
+        foreach (consult_pet_ids($conn, $appt) as $pid) {
+            $emr->bind_param("iisssss", $pid, $apt_id, $emr_title, $diagnosis, $vet_name, $emr_date, $emr_notes);
+            $emr->execute();
+        }
+
+        // Followup notification if set
+        if(!empty($followup)) {
+            $apt_info = $conn->query("SELECT user_id, pet_name FROM appointments WHERE id=$apt_id")->fetch_assoc();
+            if($apt_info) {
+                $uid = $apt_info['user_id'];
+                $pname = $apt_info['pet_name'];
+                $fdate = date("M d, Y", strtotime($followup));
+                $notif = "Recommended follow-up visit for <b>$pname</b> on <b>$fdate</b>.";
+                $ins_n = $conn->prepare("INSERT INTO notifications(user_id, message) VALUES(?, ?)");
+                $ins_n->bind_param("is", $uid, $notif);
+                $ins_n->execute();
+            }
+        }
+        
+        $_SESSION['message'] = "Consultation recorded! <a href='print_rx.php?id=$new_consult_id' target='_blank' class='btn btn-sm btn-light fw-bold ms-2'><i class='fa fa-print me-1'></i>Print Rx Slip</a>";
+        $_SESSION['msg_type'] = "success";
+    } else {
+        $_SESSION['message'] = "Error saving consultation: " . $conn->error;
+        $_SESSION['msg_type'] = "danger";
+    }
+    header("Location: doctor_consultations.php");
+    exit();
+}
+
+// Fetch Approved Appointments (Pending Consultations)
+$active_query = "
+    SELECT a.*, u.fullname as client_name, d.fullname as doctor_name
+    FROM appointments a 
+    JOIN users u ON a.user_id = u.id 
+    LEFT JOIN users d ON d.id = a.doctor_id
+    WHERE a.status='Approved' AND a.service_type != 'Pet Boarding Reservation'
+      AND (a.doctor_id = $me OR a.doctor_id IS NULL)
+    ORDER BY a.appointment_date ASC, a.appointment_time ASC
+";
+$active_apts = $conn->query($active_query);
+
+// Group the queue: overdue / today / upcoming
+$today = date('Y-m-d');
+$queue = ['overdue' => [], 'today' => [], 'upcoming' => []];
+while ($r = $active_apts->fetch_assoc()) {
+    $k = $r['appointment_date'] < $today ? 'overdue' : ($r['appointment_date'] === $today ? 'today' : 'upcoming');
+    $queue[$k][] = $r;
+}
+$queue_total = count($queue['overdue']) + count($queue['today']) + count($queue['upcoming']);
+
+// Fetch Recent Consultations
+$recent_query = "
+    SELECT c.*, a.pet_name, a.service_type, u.fullname as client_name
+    FROM consultations c
+    JOIN appointments a ON c.appointment_id = a.id
+    JOIN users u ON a.user_id = u.id
+    WHERE a.doctor_id = $me OR (a.doctor_id IS NULL AND c.vet_name = (SELECT fullname FROM users WHERE id = $me))
+    ORDER BY c.created_at DESC LIMIT 10
+";
+$recent_consults = $conn->query($recent_query);
+
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<title>Consultations | VetAdmin</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+<style>
+:root {
+    --primary: #2563eb;
+    --secondary: #475569;
+    --dark: #0f172a;
+    --light-bg: #f8fafc;
+    --sidebar-width:260px;
+}
+body { background: #f8fafc !important; font-family: 'Inter', sans-serif; color: #334155; }
+
+.main-content {
+    margin-left: 260px !important;
+    width: calc(100% - 260px) !important;
+    max-width: calc(100% - 260px) !important;
+    padding: 24px 28px !important;
+    min-height: 100vh;
+    box-sizing: border-box !important;
+}
+
+@media (max-width: 1200px) {
+    .main-content { padding: 20px 20px !important; }
+}
+
+@media (max-width: 768px) {
+    .main-content { margin-left: 0 !important; width: 100% !important; max-width: 100% !important; padding: 16px !important; }
+    .sidebar { position: relative !important; width: 100% !important; height: auto !important; }
+}
+
+.card-premium {
+    background: white; border: none; border-radius: 16px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.04); padding: 24px; margin-bottom: 24px;
+}
+.form-control, .form-select { border-radius: 12px; border: 1px solid #e2e8f0; padding: 10px 14px; }
+.table-custom thead th { background: #f8fafc; color: #64748b; text-transform: uppercase; font-size: 11px; font-weight: 700; border-bottom: 2px solid #e2e8f0; }
+
+/* ====== WHITE SIDEBAR THEME ====== */
+.sidebar {
+    background: #ffffff !important;
+    width: var(--sidebar-width, 260px) !important;
+    height: 100vh !important;
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    padding: 28px 20px 24px !important;
+    z-index: 1000 !important;
+    display: flex !important;
+    flex-direction: column !important;
+    border-right: 1px solid #eef2f6 !important;
+    box-shadow: none !important;
+    overflow-y: auto !important;
+}
+
+.sidebar-brand {
+    display: flex !important;
+    align-items: center !important;
+    gap: 12px !important;
+    margin-bottom: 24px !important;
+    padding: 0 4px !important;
+    text-decoration: none !important;
+}
+
+.sidebar-brand-icon {
+    width: 44px !important;
+    height: 44px !important;
+    min-width: 44px !important;
+    border-radius: 13px !important;
+    background: #2563eb !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    color: #ffffff !important;
+    font-size: 20px !important;
+    flex-shrink: 0 !important;
+    box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+}
+
+.sidebar-brand span {
+    font-weight: 800 !important;
+    color: #182032 !important;
+    font-size: 22px !important;
+    letter-spacing: -0.4px !important;
+}
+
+.sidebar-user {
+    margin-bottom: 24px !important;
+    padding: 15px 18px !important;
+    border-radius: 14px !important;
+    background: #f8fafc !important;
+    border: 1px solid #eef2f6 !important;
+}
+
+.sidebar-user .welcome {
+    font-size: 13px !important;
+    color: #64748b !important;
+    font-weight: 500 !important;
+    line-height: 1.3 !important;
+}
+
+.sidebar-user .uname {
+    font-weight: 700 !important;
+    color: #0f172a !important;
+    font-size: 15.5px !important;
+    margin-top: 3px !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+}
+
+.sidebar a {
+    display: flex !important;
+    align-items: center !important;
+    gap: 14px !important;
+    padding: 12px 16px !important;
+    border-radius: 12px !important;
+    color: #334155 !important;
+    text-decoration: none !important;
+    margin-bottom: 4px !important;
+    font-weight: 600 !important;
+    font-size: 14.5px !important;
+    transition: all 0.2s ease !important;
+    letter-spacing: -0.1px !important;
+}
+
+.sidebar a i {
+    width: 22px !important;
+    text-align: center !important;
+    font-size: 16px !important;
+    color: #64748b !important;
+    transition: color 0.2s !important;
+    flex-shrink: 0 !important;
+}
+
+.sidebar a:hover {
+    background: #f8fafc !important;
+    color: #0f172a !important;
+}
+
+.sidebar a:hover i {
+    color: #2563eb !important;
+}
+
+.sidebar a.active {
+    background: #2563eb !important;
+    color: #ffffff !important;
+    font-weight: 700 !important;
+    box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+}
+
+.sidebar a.active i {
+    color: #ffffff !important;
+}
+
+.sidebar .sidebar-logout {
+    margin-top: auto !important;
+    padding-top: 20px !important;
+    border-top: 1px solid #f1f5f9 !important;
+}
+
+.sidebar .sidebar-logout a {
+    color: #dc2626 !important;
+    font-weight: 600 !important;
+    margin-bottom: 0 !important;
+}
+
+.sidebar .sidebar-logout a i {
+    color: #dc2626 !important;
+}
+
+.sidebar .sidebar-logout a:hover {
+    background: #fef2f2 !important;
+    color: #b91c1c !important;
+}
+
+.sidebar::-webkit-scrollbar { width: 5px; }
+.sidebar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.06); border-radius: 10px; }
+.sidebar::-webkit-scrollbar-track { background: transparent; }
+</style>
+    <link rel="stylesheet" href="assets/pragmavet.css">
+    <link href="assets/global-style.css" rel="stylesheet">
+</head>
+<body>
+
+<?php if(isset($_SESSION['message'])): ?>
+<div class="position-fixed top-0 end-0 p-3" style="z-index: 9999">
+    <div class="alert alert-<?php echo $_SESSION['msg_type']; ?> shadow-sm">
+        <?php echo $_SESSION['message']; unset($_SESSION['message'], $_SESSION['msg_type']); ?>
+    </div>
+</div>
+<?php endif; ?>
+
+<!-- SIDEBAR -->
+<div class="sidebar">
+    <div class="sidebar-brand">
+        <div class="sidebar-brand-icon"><i class="fa fa-user-md"></i></div>
+        <span>PragmaVet</span>
+    </div>
+    <div class="sidebar-user">
+        <div class="welcome">Welcome Doctor,</div>
+        <div class="uname"><?php echo htmlspecialchars($_SESSION['fullname'] ?? $_SESSION['username'] ?? 'Veterinarian'); ?></div>
+    </div>
+    <a href="doctor.php" class=""><i class="fa fa-calendar-check"></i> <span>Schedule & Availability</span></a>
+    <a href="doctor_consultations.php" class="active"><i class="fa fa-stethoscope"></i> <span>Active Consultations</span></a>
+    <a href="doctor_patients.php" class=""><i class="fa fa-paw"></i> <span>Patient EMR Lookup</span></a>
+    <a href="doctor_inventory.php" class=""><i class="fa fa-boxes"></i> <span>Pharmacy Stock</span></a>
+    <a href="doctor_messages.php" class=""><i class="fa fa-comments"></i> <span>Client Direct Chat</span></a>
+    <div class="sidebar-logout">
+        <a href="logout.php"><i class="fa fa-sign-out-alt"></i> <span>Logout</span></a>
+    </div>
+</div>
+
+<div class="main-content">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h2 class="fw-bold m-0 text-dark">Active Consultations</h2>
+            <p class="text-muted mb-0">Record clinical diagnoses, treatments, lab results, and pharmacy prescriptions.</p>
+        </div>
+    </div>
+
+    <div class="row">
+        <!-- PENDING CONSULTATIONS -->
+        <div class="col-xl-5">
+            <div class="card-premium border-top border-4 border-primary">
+                <h5 class="fw-bold mb-4"><i class="fa fa-clipboard-list text-primary me-2"></i> Ready for Consultation</h5>
+                
+                <?php if($queue_total > 0): ?>
+                    <?php
+                    $groups = [
+                        'overdue'  => ['Overdue', 'fa-triangle-exclamation', '#dc2626', 'Past their date and never completed. Staff handle No Shows and rescheduling.'],
+                        'today'    => ['Today', 'fa-sun', '#2563eb', ''],
+                        'upcoming' => ['Upcoming', 'fa-calendar-days', '#64748b', ''],
+                    ];
+                    foreach ($groups as $gk => $g):
+                        if (empty($queue[$gk])) continue; ?>
+                    <div class="d-flex align-items-center gap-2 mt-2 mb-2">
+                        <i class="fa <?= $g[1] ?>" style="color:<?= $g[2] ?>;"></i>
+                        <span class="fw-bold text-uppercase" style="font-size:12px;letter-spacing:.06em;color:<?= $g[2] ?>;"><?= $g[0] ?></span>
+                        <span class="badge rounded-pill" style="background:<?= $g[2] ?>1a;color:<?= $g[2] ?>;"><?= count($queue[$gk]) ?></span>
+                    </div>
+                    <?php if ($g[3]): ?><p class="small text-muted mb-2"><?= $g[3] ?></p><?php endif; ?>
+                    <div class="list-group mb-3">
+                    <?php foreach ($queue[$gk] as $row): ?>
+                        <div class="list-group-item list-group-item-action p-3 mb-2 border rounded" <?= $gk === 'overdue' ? 'style="border-left:4px solid #dc2626 !important;"' : '' ?>>
+                            <div class="d-flex justify-content-between align-items-center mb-2">
+                                <h6 class="mb-0 fw-bold"><?php echo htmlspecialchars($row['pet_name']); ?></h6>
+                                <span class="badge <?= $gk === 'overdue' ? 'bg-danger-subtle text-danger border border-danger-subtle' : 'bg-light text-dark border' ?>">
+                                    <?php echo date("M d", strtotime($row['appointment_date'])); ?> · <?php echo date("g:i A", strtotime($row['appointment_time'])); ?>
+                                </span>
+                            </div>
+                            <p class="mb-2 text-muted small"><i class="fa fa-tag me-1"></i> <?php echo htmlspecialchars($row['service_type']); ?>
+                                <?php if (!$row['doctor_id']): ?><span class="badge bg-warning-subtle text-warning-emphasis ms-1">Unassigned</span><?php endif; ?>
+                            </p>
+                            <button class="btn btn-sm btn-outline-primary w-100" data-bs-toggle="modal" data-bs-target="#consultModal<?php echo $row['id']; ?>">
+                                Add Medical Logic
+                            </button>
+                        </div>
+
+                        <!-- MODAL FOR THIS APT -->
+                        <div class="modal fade" id="consultModal<?php echo $row['id']; ?>" tabindex="-1">
+                            <div class="modal-dialog modal-lg modal-dialog-centered">
+                                <div class="modal-content border-0 shadow">
+                                    <div class="modal-header bg-light">
+                                        <h5 class="fw-bold mb-0">Consultation: <?php echo htmlspecialchars($row['pet_name']); ?></h5>
+                                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                                    </div>
+                                    <div class="modal-body p-4">
+                                        <form method="POST" enctype="multipart/form-data">
+                                            <input type="hidden" name="appointment_id" value="<?php echo $row['id']; ?>">
+                                            <div class="mb-3">
+                                                <label class="form-label fw-bold small">ATTENDING VETERINARIAN</label>
+                                                <input type="text" class="form-control bg-light" value="<?php echo htmlspecialchars($row['doctor_name'] ?: ($_SESSION['user'] ?? '')); ?>" readonly tabindex="-1" style="cursor:not-allowed;">
+                                                <small class="text-muted"><i class="fa fa-lock me-1"></i><?php echo $row['doctor_name'] ? 'Assigned veterinarian for this appointment.' : 'No vet was assigned; recorded under your name.'; ?></small>
+                                            </div>
+                                            <div class="mb-3">
+                                                <label class="form-label fw-bold small">DIAGNOSIS</label>
+                                                <textarea name="diagnosis" class="form-control" rows="3" required></textarea>
+                                            </div>
+                                            <div class="mb-3">
+                                                <label class="form-label fw-bold small">TREATMENT PLAN</label>
+                                                <textarea name="treatment" class="form-control" rows="3" required></textarea>
+                                            </div>
+                                            
+                                            <div class="p-3 mb-3" style="background: rgba(43,108,176,0.05); border: 1px dashed rgba(43,108,176,0.3); border-radius: 8px;">
+                                                <label class="form-label fw-bold small text-secondary"><i class="fa fa-file-pdf me-1"></i> ATTACH LAB RESULTS / X-RAY</label>
+                                                <input type="file" name="lab_result" class="form-control" accept=".pdf, .jpg, .jpeg, .png">
+                                                <small class="text-muted d-block mt-1">Accepts PDF or Image files.</small>
+                                            </div>
+
+                                            <div class="row g-2 mb-3">
+                                                <div class="col-md-7">
+                                                    <label class="form-label fw-bold small text-dark">PRESCRIPTION TEXT</label>
+                                                    <textarea name="prescription" class="form-control" rows="2" placeholder="Brief textual description of medications..."></textarea>
+                                                </div>
+                                                <div class="col-md-5">
+                                                    <label class="form-label fw-bold small text-dark">RECOMMENDED FOLLOW-UP</label>
+                                                    <input type="date" name="followup_date" class="form-control" min="<?= date('Y-m-d') ?>">
+                                                </div>
+                                            </div>
+
+                                            <button type="submit" name="save_consultation" class="btn btn-primary w-100 py-3 fw-bold rounded-pill shadow-sm">Save & Complete Appointment</button>
+                                        </form>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    <?php endforeach; ?>
+                    </div>
+                    <?php endforeach; ?>
+                <?php else: ?>
+                    <p class="text-muted text-center py-4">No approved appointments waiting for consultation.</p>
+                <?php endif; ?>
+            </div>
+        </div>
+
+        <!-- RECENT CONSULTATIONS LOG -->
+        <div class="col-xl-7">
+            <div class="card-premium">
+                <h5 class="fw-bold mb-4"><i class="fa fa-history text-secondary me-2"></i> Recent Clinical Records</h5>
+                
+                <?php if($recent_consults->num_rows > 0): ?>
+                <div class="table-responsive">
+                    <table class="table table-custom table-hover align-middle">
+                        <thead>
+                            <tr>
+                                <th>Pet & Vet</th>
+                                <th>Diagnosis</th>
+                                <th>Resources</th>
+                                <th>Date</th>
+                                <th class="text-end">Rx Slip</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php while($row = $recent_consults->fetch_assoc()): ?>
+                            <tr>
+                                <td>
+                                    <div class="fw-bold text-dark"><?php echo htmlspecialchars($row['pet_name']); ?></div>
+                                    <div class="small text-muted"><?php echo htmlspecialchars($row['vet_name']); ?></div>
+                                </td>
+                                <td><span class="text-truncate d-inline-block" style="max-width: 140px;" title="<?php echo htmlspecialchars($row['diagnosis']); ?>"><?php echo htmlspecialchars($row['diagnosis']); ?></span></td>
+                                <td>
+                                    <?php if(!empty($row['lab_results_url'])): ?>
+                                        <a href="uploads/labs/<?php echo htmlspecialchars($row['lab_results_url']); ?>" target="_blank" class="badge bg-info text-dark text-decoration-none shadow-sm"><i class="fa fa-file-pdf me-1"></i>Lab PDF</a>
+                                    <?php else: ?>
+                                        <span class="text-muted small">No File</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td class="text-muted small"><?php echo date("M d", strtotime($row['created_at'])); ?></td>
+                                <td class="text-end">
+                                    <button type="button" class="btn btn-sm btn-outline-primary rounded-pill px-2.5 py-1 fw-bold" title="Review, edit and print the prescription slip"
+                                        onclick='openRxEditor(<?= json_encode([
+                                            "id" => (int)$row["id"], "pet" => $row["pet_name"], "diagnosis" => $row["diagnosis"],
+                                            "treatment" => $row["treatment"], "prescription" => $row["prescription"], "followup" => $row["followup_date"]
+                                        ], JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP) ?>)'>
+                                        <i class="fa fa-pen-to-square me-1"></i> Edit &amp; Print Rx
+                                    </button>
+                                </td>
+                            </tr>
+                            <?php endwhile; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <?php else: ?>
+                    <p class="text-muted text-center py-4">No past records to display.</p>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- EDIT RX MODAL -->
+<div class="modal fade" id="rxEditModal" tabindex="-1">
+    <div class="modal-dialog modal-lg modal-dialog-centered">
+        <div class="modal-content border-0 shadow">
+            <div class="modal-header bg-light">
+                <h5 class="fw-bold mb-0"><i class="fa fa-prescription me-2 text-primary"></i>Prescription Slip: <span id="rxPet"></span></h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form id="rxEditForm" class="modal-body p-4">
+                <input type="hidden" name="save_rx" value="1">
+                <input type="hidden" name="consult_id" id="rxId">
+                <div id="rxAlert"></div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold small">DIAGNOSIS</label>
+                    <textarea name="diagnosis" id="rxDiagnosis" class="form-control" rows="2" required></textarea>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold small">PRESCRIPTION (Rx)</label>
+                    <textarea name="prescription" id="rxPrescription" class="form-control" rows="4" placeholder="e.g. Amoxicillin 250mg — 1 tablet twice a day for 7 days"></textarea>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold small">TREATMENT PLAN / INSTRUCTIONS</label>
+                    <textarea name="treatment" id="rxTreatment" class="form-control" rows="3" required></textarea>
+                </div>
+                <div class="mb-1" style="max-width:260px;">
+                    <label class="form-label fw-bold small">RECOMMENDED FOLLOW-UP</label>
+                    <input type="date" name="followup_date" id="rxFollowup" class="form-control">
+                </div>
+            </form>
+            <div class="modal-footer border-0 px-4 pb-4">
+                <a href="#" id="rxPrintOnly" target="_blank" class="btn btn-link text-muted me-auto px-0">Print without changes</a>
+                <button type="button" class="btn btn-light border rounded-pill px-3" onclick="saveRx(false)"><i class="fa fa-save me-1"></i> Save</button>
+                <button type="button" class="btn btn-primary rounded-pill px-4 fw-bold" onclick="saveRx(true)"><i class="fa fa-print me-1"></i> Save &amp; Print</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+function openRxEditor(c) {
+    document.getElementById('rxPet').textContent = c.pet || '';
+    document.getElementById('rxId').value = c.id;
+    document.getElementById('rxDiagnosis').value = c.diagnosis || '';
+    document.getElementById('rxTreatment').value = c.treatment || '';
+    document.getElementById('rxPrescription').value = c.prescription || '';
+    document.getElementById('rxFollowup').value = c.followup || '';
+    document.getElementById('rxPrintOnly').href = 'print_rx.php?id=' + c.id;
+    document.getElementById('rxAlert').innerHTML = '';
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('rxEditModal')).show();
+}
+
+function saveRx(andPrint) {
+    var form = document.getElementById('rxEditForm');
+    if (!form.reportValidity()) return;
+    var id = document.getElementById('rxId').value;
+    // Open the print tab now (inside the click) so pop-up blockers allow it
+    var win = andPrint ? window.open('', '_blank') : null;
+    fetch('doctor_consultations.php', { method: 'POST', body: new FormData(form) })
+        .then(function(r) { return r.json(); })
+        .then(function(res) {
+            if (!res.ok) throw new Error(res.error || 'Could not save changes.');
+            if (win) win.location = 'print_rx.php?id=' + id;
+            location.reload();
+        })
+        .catch(function(err) {
+            if (win) win.close();
+            document.getElementById('rxAlert').innerHTML = '<div class="alert alert-danger py-2 small">' + err.message.replace(/</g, '&lt;') + '</div>';
+        });
+}
+</script>
+    <script src="mousetrail.js"></script>
+</body>
+</html>

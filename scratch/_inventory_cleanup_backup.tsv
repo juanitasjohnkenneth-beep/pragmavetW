@@ -1,0 +1,7 @@
+id	item_name	category	quantity	price_per_unit	expiry_date	batch_number	lot_number	unit_of_measure	reorder_level	supplier	cost_price	created_at
+1	vaccine	Vaccine	100	10.00	2027-02-02	NULL	NULL	piece	10	NULL	0.00	2026-09-24 23:25:47
+3	Rabies Vaccine	Medicine	26	265.00	2026-04-01	NULL	NULL	piece	10	NULL	0.00	2026-09-24 23:25:47
+150	50-60 mL syringes	Consumables	100	0.00	NULL	NULL	NULL	piece	10	NULL	0.00	2026-09-24 23:25:47
+151	Needles 18G-27G	Consumables	100	0.00	NULL	NULL	NULL	piece	10	NULL	0.00	2026-09-24 23:25:47
+160	50-60 mL syringes	Consumables	100	0.00	NULL	NULL	NULL	piece	10	NULL	0.00	2026-09-24 23:25:47
+161	Needles 18G-27G	Consumables	100	0.00	NULL	NULL	NULL	piece	10	NULL	0.00	2026-09-24 23:25:47

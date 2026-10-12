@@ -1,0 +1,773 @@
+<?php
+/**
+ * PragmaVet – Unified SaaS Calendar Component v4
+ * Hybrid PHP (data/sidebar) + Vanilla JS (grid rendering, navigation, filtering).
+ * Month navigation is client-side — no page reload, resets to today on refresh.
+ * Event-type checkboxes filter the grid live.
+ */
+
+function render_saas_calendar($events, $role, $current_user_id = null, $sidebarHTML = '') {
+
+    // ── 1. Role-Based Event Filtering ────────────────────────────────────────
+    $filtered_events = [];
+    foreach ($events as $event) {
+        if     ($role === 'admin')  { $filtered_events[] = $event; }
+        elseif ($role === 'staff')  { 
+            // Vet Staff sees events assigned to the selected Vet Staff
+            if (!empty($current_user_id) && $current_user_id !== 'all') {
+                if ((int)($event['staffId'] ?? 0) === (int)$current_user_id) {
+                    $filtered_events[] = $event;
+                }
+            } else {
+                $filtered_events[] = $event;
+            }
+        }
+        elseif ($role === 'doctor') { if ((int)($event['doctorId'] ?? 0) === (int)$current_user_id) $filtered_events[] = $event; }
+        elseif ($role === 'client') { if ((int)($event['ownerId']  ?? 0) === (int)$current_user_id) $filtered_events[] = $event; }
+    }
+
+    // ── 2. Encode events to JSON for JS ──────────────────────────────────────
+    $js_events = json_encode(array_values($filtered_events), JSON_HEX_APOS | JSON_HEX_QUOT);
+
+    // ── 3. Stats (PHP-side, so sidebar is accurate) ──────────────────────────
+    $total_count   = count($filtered_events);
+    $pending_count = 0;
+    foreach ($filtered_events as $e) {
+        if (strtolower($e['status'] ?? '') === 'pending') $pending_count++;
+    }
+
+    // ── 4. Unique instance ID (allows multiple calendars per page) ───────────
+    $uid = 'saas_cal_' . substr(md5($role . $current_user_id . uniqid()), 0, 8);
+
+    ob_start();
+    ?>
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         SaaS Calendar Component  |  role: <?php echo htmlspecialchars($role); ?>
+    ══════════════════════════════════════════════════════════════════════════ -->
+    <div id="<?php echo $uid; ?>"
+         style="display:flex;flex-direction:row;width:100%;height:100%;font-family:'Inter',sans-serif;border-radius:1rem;overflow:hidden;overflow-x:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.07);border:1px solid #e2e8f0;background:#fff;">
+
+        <?php if ($role === 'admin' || $role === 'doctor' || $role === 'staff'): ?>
+        <!-- ── LEFT SIDEBAR ──────────────────────────────────────────────── -->
+        <div style="width:270px;min-width:270px;background:#ffffff;border-right:1px solid #e2e8f0;display:flex;flex-direction:column;overflow:hidden;">
+
+            <!-- Branding -->
+            <div style="padding:18px 20px 14px;border-bottom:1px solid #f1f5f9;">
+                <div style="font-size:12px;font-weight:800;color:#0f172a;letter-spacing:-.3px;display:flex;align-items:center;gap:6px;">
+                    <span style="width:8px;height:8px;border-radius:50%;background:#3b82f6;display:inline-block;"></span>
+                    <?php echo $role === 'admin' ? 'Admin Dashboard' : ($role === 'staff' ? 'Vet Staff Portal' : 'Doctor Portal'); ?>
+                </div>
+            </div>
+
+            <!-- Event Type Filters -->
+            <div style="padding:14px 20px 10px;">
+                <p style="font-size:10px;font-weight:700;text-transform:uppercase;color:#94a3b8;letter-spacing:.08em;margin:0 0 8px;">Event Types</p>
+                <label class="<?php echo $uid; ?>-filter-label" style="display:flex;align-items:center;gap:8px;font-size:12px;font-weight:500;color:#374151;padding:4px 0;cursor:pointer;">
+                    <input type="checkbox" class="<?php echo $uid; ?>-filter" data-category="service" data-keywords="consultation,general checkup,laboratory,dental,confinement" checked style="accent-color:#3b82f6;width:13px;height:13px;">
+                    <span style="width:8px;height:8px;border-radius:50%;background:#3b82f6;flex-shrink:0;"></span> Consultations
+                </label>
+                <label class="<?php echo $uid; ?>-filter-label" style="display:flex;align-items:center;gap:8px;font-size:12px;font-weight:500;color:#374151;padding:4px 0;cursor:pointer;">
+                    <input type="checkbox" class="<?php echo $uid; ?>-filter" data-category="service" data-keywords="vaccination,deworming" checked style="accent-color:#10b981;width:13px;height:13px;">
+                    <span style="width:8px;height:8px;border-radius:50%;background:#10b981;flex-shrink:0;"></span> Vaccinations
+                </label>
+                <label class="<?php echo $uid; ?>-filter-label" style="display:flex;align-items:center;gap:8px;font-size:12px;font-weight:500;color:#374151;padding:4px 0;cursor:pointer;">
+                    <input type="checkbox" class="<?php echo $uid; ?>-filter" data-category="service" data-keywords="surgery" checked style="accent-color:#f97316;width:13px;height:13px;">
+                    <span style="width:8px;height:8px;border-radius:50%;background:#f97316;flex-shrink:0;"></span> Surgeries
+                </label>
+                <label class="<?php echo $uid; ?>-filter-label" style="display:flex;align-items:center;gap:8px;font-size:12px;font-weight:500;color:#374151;padding:4px 0;cursor:pointer;">
+                    <input type="checkbox" class="<?php echo $uid; ?>-filter" data-category="service" data-keywords="leave" checked style="accent-color:#ef4444;width:13px;height:13px;">
+                    <span style="width:8px;height:8px;border-radius:50%;background:#ef4444;flex-shrink:0;"></span> Leave Days
+                </label>
+                <div style="height:1px;background:#f1f5f9;margin:8px 0 6px;"></div>
+                <p style="font-size:10px;font-weight:700;text-transform:uppercase;color:#94a3b8;letter-spacing:.08em;margin:0 0 6px;">By Status</p>
+                <label class="<?php echo $uid; ?>-filter-label" style="display:flex;align-items:center;gap:8px;font-size:12px;font-weight:500;color:#374151;padding:4px 0;cursor:pointer;">
+                    <input type="checkbox" class="<?php echo $uid; ?>-filter" data-category="status" data-keywords="pending" checked style="accent-color:#f97316;width:13px;height:13px;">
+                    <span style="width:8px;height:8px;border-radius:50%;background:#f97316;flex-shrink:0;"></span> Pending
+                </label>
+                <label class="<?php echo $uid; ?>-filter-label" style="display:flex;align-items:center;gap:8px;font-size:12px;font-weight:500;color:#374151;padding:4px 0;cursor:pointer;">
+                    <input type="checkbox" class="<?php echo $uid; ?>-filter" data-category="status" data-keywords="approved,checked in,in progress,reschedule" checked style="accent-color:#3b82f6;width:13px;height:13px;">
+                    <span style="width:8px;height:8px;border-radius:50%;background:#3b82f6;flex-shrink:0;"></span> Approved / In Clinic
+                </label>
+                <label class="<?php echo $uid; ?>-filter-label" style="display:flex;align-items:center;gap:8px;font-size:12px;font-weight:500;color:#374151;padding:4px 0;cursor:pointer;">
+                    <input type="checkbox" class="<?php echo $uid; ?>-filter" data-category="status" data-keywords="completed" checked style="accent-color:#10b981;width:13px;height:13px;">
+                    <span style="width:8px;height:8px;border-radius:50%;background:#10b981;flex-shrink:0;"></span> Completed
+                </label>
+                <label class="<?php echo $uid; ?>-filter-label" style="display:flex;align-items:center;gap:8px;font-size:12px;font-weight:500;color:#374151;padding:4px 0;cursor:pointer;">
+                    <input type="checkbox" class="<?php echo $uid; ?>-filter" data-category="status" data-keywords="cancelled,rejected,no show" checked style="accent-color:#ef4444;width:13px;height:13px;">
+                    <span style="width:8px;height:8px;border-radius:50%;background:#ef4444;flex-shrink:0;"></span> Cancelled / No Show
+                </label>
+            </div>
+
+            <!-- Dynamic Widgets -->
+            <div style="flex:1;overflow-y:auto;padding:4px 20px 20px;scrollbar-width:thin;scrollbar-color:#e2e8f0 transparent;">
+                <div style="height:1px;background:#f1f5f9;margin:8px 0 14px;"></div>
+                <?php echo $sidebarHTML; ?>
+            </div>
+        </div>
+        <?php endif; ?>
+
+        <!-- ── MAIN CALENDAR ─────────────────────────────────────────────── -->
+        <div style="flex:1;display:flex;flex-direction:column;background:#f8fafc;overflow:hidden;overflow-x:hidden;min-width:0;">
+
+            <!-- Header -->
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 22px;background:#fff;border-bottom:1px solid #e2e8f0;flex-shrink:0;">
+                <div>
+                    <h2 id="<?php echo $uid; ?>-title" style="margin:0;font-size:1.3rem;font-weight:800;color:#0f172a;letter-spacing:-.5px;"></h2>
+                    <?php if($role==='client'): ?>
+                    <p style="margin:2px 0 0;font-size:11px;color:#64748b;">My Pets &amp; Scheduling Dashboard</p>
+                    <?php endif; ?>
+                </div>
+                <!-- Month Nav -->
+                <div style="display:flex;align-items:center;gap:6px;">
+                    <button id="<?php echo $uid; ?>-prev" style="width:32px;height:32px;border-radius:50%;border:1px solid #e2e8f0;background:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;color:#64748b;transition:background .15s;" onmouseover="this.style.background='#f1f5f9'" onmouseout="this.style.background='#fff'">
+                        <i class="fa fa-chevron-left" style="font-size:11px;pointer-events:none;"></i>
+                    </button>
+                    <button id="<?php echo $uid; ?>-today" style="padding:0 14px;height:32px;border-radius:20px;border:1px solid #e2e8f0;background:#fff;cursor:pointer;font-size:11px;font-weight:700;color:#374151;transition:background .15s;" onmouseover="this.style.background='#f1f5f9'" onmouseout="this.style.background='#fff'">Today</button>
+                    <button id="<?php echo $uid; ?>-next" style="width:32px;height:32px;border-radius:50%;border:1px solid #e2e8f0;background:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;color:#64748b;transition:background .15s;" onmouseover="this.style.background='#f1f5f9'" onmouseout="this.style.background='#fff'">
+                        <i class="fa fa-chevron-right" style="font-size:11px;pointer-events:none;"></i>
+                    </button>
+                </div>
+            </div>
+
+            <?php if ($role === 'admin' || $role === 'doctor' || $role === 'staff'): ?>
+            <!-- Stats Bar -->
+            <div style="display:flex;gap:10px;padding:10px 22px;background:#fff;border-bottom:1px solid #e2e8f0;flex-shrink:0;">
+                <div style="flex:1;background:#eff6ff;border:1px solid #bfdbfe;border-radius:9px;padding:8px 12px;display:flex;align-items:center;gap:8px;">
+                    <i class="fa fa-calendar-alt" style="color:#2563eb;"></i>
+                    <div>
+                        <div style="font-size:9px;font-weight:700;text-transform:uppercase;color:#64748b;letter-spacing:.05em;">Total</div>
+                        <div id="<?php echo $uid; ?>-stat-total" style="font-size:18px;font-weight:900;color:#1e40af;"><?php echo $total_count; ?></div>
+                    </div>
+                </div>
+                <div style="flex:1;background:#fff7ed;border:1px solid #fed7aa;border-radius:9px;padding:8px 12px;display:flex;align-items:center;gap:8px;">
+                    <i class="fa fa-hourglass-half" style="color:#ea580c;"></i>
+                    <div>
+                        <div style="font-size:9px;font-weight:700;text-transform:uppercase;color:#64748b;letter-spacing:.05em;">Pending</div>
+                        <div id="<?php echo $uid; ?>-stat-pending" style="font-size:18px;font-weight:900;color:#c2410c;"><?php echo $pending_count; ?></div>
+                    </div>
+                </div>
+                <div style="flex:1;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:9px;padding:8px 12px;display:flex;align-items:center;gap:8px;">
+                    <i class="fa fa-sun" style="color:#059669;"></i>
+                    <div>
+                        <div style="font-size:9px;font-weight:700;text-transform:uppercase;color:#64748b;letter-spacing:.05em;">Today</div>
+                        <div id="<?php echo $uid; ?>-stat-today" style="font-size:18px;font-weight:900;color:#047857;">0</div>
+                    </div>
+                </div>
+            </div>
+            <?php endif; ?>
+
+            <!-- Day-of-week header -->
+            <div style="display:grid;grid-template-columns:repeat(7,1fr);background:#f8fafc;border-bottom:1px solid #e2e8f0;flex-shrink:0;border-left:1px solid #e2e8f0;">
+                <?php foreach(['Sun','Mon','Tue','Wed','Thu','Fri','Sat'] as $dw): ?>
+                <div style="padding:10px 4px;text-align:center;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:<?php echo $dw === 'Sun' ? '#cbd5e1' : '#64748b'; ?>;border-right:1px solid #e2e8f0;"><?php echo $dw; ?></div>
+                <?php endforeach; ?>
+            </div>
+
+            <!-- Calendar Grid (rendered by JS) -->
+            <div id="<?php echo $uid; ?>-grid"
+                 style="display:grid;grid-template-columns:repeat(7,1fr);grid-template-rows:repeat(6,1fr);flex:1;overflow:hidden;border-left:1px solid #e2e8f0;">
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Embedded Event Data & JS Engine ───────────────────────────────── -->
+    <script>
+    (function() {
+        'use strict';
+        var UID       = <?php echo json_encode($uid); ?>;
+        var ROLE      = <?php echo json_encode($role); ?>;
+        var ALL_EVENTS= <?php echo $js_events; ?>;
+
+        var state = {
+            year:  new Date().getFullYear(),
+            month: new Date().getMonth() // 0-indexed
+        };
+
+        var MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+        var DAYS   = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+
+        // Color palette per color token
+        var COLORS = {
+            green:  {bg:'#ecfdf5', text:'#047857', border:'#6ee7b7'},
+            blue:   {bg:'#eff6ff', text:'#1d4ed8', border:'#93c5fd'},
+            orange: {bg:'#fff7ed', text:'#c2410c', border:'#fdba74'},
+            purple: {bg:'#faf5ff', text:'#7e22ce', border:'#c4b5fd'},
+            cyan:   {bg:'#ecfeff', text:'#0e7490', border:'#67e8f9'},
+            red:    {bg:'#fef2f2', text:'#b91c1c', border:'#fca5a5'},
+            gray:   {bg:'#E6EEF8', text:'#475569', border:'#cbd5e1'}
+        };
+        function getColor(c) { return COLORS[c] || COLORS.gray; }
+
+        // ── Filtering ──────────────────────────────────────────────────────
+        // Returns { serviceKeywords: [...], statusKeywords: [...] }
+        function getActiveFilters() {
+            var serviceKW = [], statusKW = [];
+            document.querySelectorAll('.' + UID + '-filter').forEach(function(box) {
+                if (!box.checked) return;
+                var cat  = box.getAttribute('data-category') || 'service';
+                var keys = (box.getAttribute('data-keywords') || '').split(',');
+                keys.forEach(function(k) {
+                    var kk = k.trim().toLowerCase();
+                    if (!kk) return;
+                    if (cat === 'status') statusKW.push(kk);
+                    else                  serviceKW.push(kk);
+                });
+            });
+            return { service: serviceKW, status: statusKW };
+        }
+
+        function eventMatchesFilter(ev, filters) {
+            var evType   = (ev.type   || '').toLowerCase();
+            var evStatus = (ev.status || '').toLowerCase();
+
+            // === Leave events: match service filter only ("leave" keyword) ===
+            if (evStatus === 'leave' || evType === 'leave') {
+                return filters.service.indexOf('leave') !== -1;
+            }
+
+            // === Status gate: event must match an active STATUS filter ===
+            var statusAllowed = filters.status.length === 0 ||
+                filters.status.some(function(s) { return evStatus.indexOf(s) !== -1; });
+            if (!statusAllowed) return false;
+
+            // === Service gate: event must match an active SERVICE filter ===
+            // If no non-leave service filters active, show all service types
+            var nonLeaveService = filters.service.filter(function(s){ return s !== 'leave'; });
+            if (nonLeaveService.length === 0) return true;
+
+            return nonLeaveService.some(function(kw) {
+                return evType.indexOf(kw) !== -1;
+            });
+        }
+
+        // ── Grid Rendering ─────────────────────────────────────────────────
+        function render() {
+            var y = state.year, m = state.month;
+            var today = new Date(); today.setHours(0,0,0,0);
+            var todayStr = today.getFullYear() + '-' +
+                           String(today.getMonth()+1).padStart(2,'0') + '-' +
+                           String(today.getDate()).padStart(2,'0');
+
+            // Update title
+            var titleEl = document.getElementById(UID + '-title');
+            if (titleEl) titleEl.textContent = MONTHS[m] + ' ' + y;
+
+            // Active filters (two-axis: service type + status)
+            var filters = getActiveFilters();
+
+            // Filter events to current month + active filters
+            var monthStr = y + '-' + String(m+1).padStart(2,'0');
+            var visibleEvents = ALL_EVENTS.filter(function(ev) {
+                return (ev.raw_date || '').startsWith(monthStr) && eventMatchesFilter(ev, filters);
+            });
+
+            // Build grid cells
+            var firstDay    = new Date(y, m, 1);
+            var daysInMonth = new Date(y, m+1, 0).getDate();
+            var startDow    = firstDay.getDay(); // 0=Sun
+            var prevMonth   = new Date(y, m, 0);
+            var cells       = [];
+
+            // Prev month padding
+            for (var i = 0; i < startDow; i++) {
+                cells.push({day: prevMonth.getDate() - startDow + i + 1, current: false, dateStr: null});
+            }
+            // Current month
+            for (var d = 1; d <= daysInMonth; d++) {
+                var ds = y + '-' + String(m+1).padStart(2,'0') + '-' + String(d).padStart(2,'0');
+                cells.push({day: d, current: true, dateStr: ds});
+            }
+            // Next month padding (fill to 42)
+            var rest = 42 - cells.length;
+            for (var n = 1; n <= rest; n++) {
+                cells.push({day: n, current: false, dateStr: null});
+            }
+
+            // Update stats
+            var statTotal   = document.getElementById(UID + '-stat-total');
+            var statPending = document.getElementById(UID + '-stat-pending');
+            if (statTotal)   statTotal.textContent   = visibleEvents.length;
+            if (statPending) statPending.textContent = visibleEvents.filter(function(e){ return (e.status||'').toLowerCase() === 'pending'; }).length;
+            var statToday = document.getElementById(UID + '-stat-today');
+            if (statToday) statToday.textContent = ALL_EVENTS.filter(function(e){ return e.raw_date === todayStr && e.appt_id && eventMatchesFilter(e, filters); }).length;
+
+            // Render cells
+            var grid = document.getElementById(UID + '-grid');
+            if (!grid) return;
+            grid.innerHTML = '';
+
+            cells.forEach(function(cell) {
+                var cellDiv = document.createElement('div');
+                var isToday = cell.current && cell.dateStr === todayStr;
+                var isSun   = cell.current && new Date(cell.dateStr + 'T12:00:00').getDay() === 0;
+                var cellBg  = !cell.current ? '#f8fafc' : (isToday ? '#f5f9ff' : (isSun ? '#fcfcfd' : '#fff'));
+
+                cellDiv.style.cssText = 'background:' + cellBg + ';border-right:1px solid #eef2f6;border-bottom:1px solid #eef2f6;padding:6px 6px 8px;display:flex;flex-direction:column;box-sizing:border-box;transition:background .15s, box-shadow .15s;overflow:hidden;min-height:0;'
+                    + (isToday ? 'box-shadow:inset 0 0 0 2px #93c5fd;' : '');
+                if (cell.current) {
+                    cellDiv.onmouseenter = function(){ if (!isToday) this.style.background = '#f8fbff'; };
+                    cellDiv.onmouseleave = (function(bg){ return function(){ this.style.background = bg; }; })(cellBg);
+                }
+
+                // Day number
+                var numWrap = document.createElement('div');
+                numWrap.style.cssText = 'display:flex;justify-content:flex-end;margin-bottom:4px;';
+                var numSpan = document.createElement('span');
+                numSpan.style.cssText = 'width:22px;height:22px;display:flex;align-items:center;justify-content:center;border-radius:50%;font-size:11px;font-weight:700;' +
+                    (isToday ? 'background:#2563eb;color:#fff;box-shadow:0 2px 6px rgba(37,99,235,.35);' : (cell.current ? (isSun ? 'color:#94a3b8;' : 'color:#1e293b;') : 'color:#cbd5e1;'));
+                numSpan.textContent = cell.day;
+                numWrap.appendChild(numSpan);
+                cellDiv.appendChild(numWrap);
+
+                // Optional page hook (e.g. doctor weekly schedule shading days off)
+                if (cell.current && typeof window.SAAS_CAL_DAY_DECORATOR === 'function') {
+                    window.SAAS_CAL_DAY_DECORATOR(cellDiv, cell);
+                }
+
+                // Events for this day
+                if (cell.current && cell.dateStr) {
+                    var dayEvts = visibleEvents.filter(function(e){ return e.raw_date === cell.dateStr; });
+                    var maxShow = (ROLE === 'client') ? 4 : 3;
+                    var pillsWrap = document.createElement('div');
+                    pillsWrap.style.cssText = 'display:flex;flex-direction:column;gap:2px;overflow:hidden;flex:1;';
+
+                    dayEvts.slice(0, maxShow).forEach(function(ev) {
+                        var pal = getColor(ev.color);
+                        var label = (ROLE === 'client')
+                            ? (ev.time + ' · ' + ev.pet)
+                            : (ev.time + ' ' + ev.pet + ' · ' + (ev.owner||'').substring(0,8));
+                        
+                        var tooltip = label;
+                        var ariaLabel = '';
+
+                        if ((ev.status||'').toLowerCase() === 'leave') {
+                            var docNameParts = (ev.doctor || '').trim().split(' ');
+                            var lastName = docNameParts[docNameParts.length - 1] || 'Doctor';
+                            label = 'Dr. ' + lastName + ' – On Leave';
+                            tooltip = 'Dr. ' + (ev.doctor || 'Doctor') + ' – On Leave';
+                            ariaLabel = 'Dr. ' + (ev.doctor || 'Doctor') + ' is on leave on ' + (ev.raw_date || '');
+                            pal = {bg:'#fef2f2', text:'#991b1b', border:'#fca5a5'};
+                        }
+
+                        var pill = document.createElement('div');
+                        pill.title = tooltip;
+                        if (ariaLabel) pill.setAttribute('aria-label', ariaLabel);
+                        pill.setAttribute('data-pill', '1');
+                        pill.style.cssText = 'background:' + pal.bg + ';color:' + pal.text + ';border:1px solid ' + pal.border + ';border-left:3px solid ' + pal.text + ';border-radius:6px;padding:3px 6px;font-size:10.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;display:flex;align-items:center;gap:5px;transition:transform .1s, box-shadow .1s;';
+                        pill.onmouseover = function(){ this.style.transform='translateY(-1px)'; this.style.boxShadow='0 2px 6px rgba(15,23,42,.08)'; };
+                        pill.onmouseout  = function(){ this.style.transform='none'; this.style.boxShadow='none'; };
+
+                        var txt = document.createElement('span');
+                        txt.style.cssText = 'overflow:hidden;text-overflow:ellipsis;';
+                        if ((ev.status||'').toLowerCase() !== 'leave' && ev.time) {
+                            var tm = document.createElement('b');
+                            tm.style.cssText = 'font-weight:800;margin-right:4px;';
+                            tm.textContent = String(ev.time).replace(/^0/, '').replace(':00 ', ' ');
+                            txt.appendChild(tm);
+                            txt.appendChild(document.createTextNode(label.replace(ev.time, '').replace(/^\s*·?\s*/, '')));
+                        } else {
+                            txt.textContent = label;
+                        }
+                        pill.appendChild(txt);
+
+                        if (ev.appt_id && typeof triggerModal === 'function') {
+                            pill.addEventListener('click', (function(e){
+                                return function(clickEv) {
+                                    clickEv.stopPropagation();
+                                    triggerModal(e.appt_id, e.title, e.owner, e.pet, e.type, e.time, e.status, '', '', e.raw_date);
+                                };
+                            })(ev));
+                        }
+                        pillsWrap.appendChild(pill);
+                    });
+
+                    if (dayEvts.length > maxShow) {
+                        var more = document.createElement('div');
+                        more.style.cssText = 'font-size:10px;font-weight:700;color:#2563eb;padding:1px 4px;';
+                        more.textContent = '+' + (dayEvts.length - maxShow) + ' more';
+                        pillsWrap.appendChild(more);
+                    }
+                cellDiv.appendChild(pillsWrap);
+                }
+
+                // ── Click on day cell → open day detail popup ───────────────
+                if (cell.current && cell.dateStr) {
+                    var allDayEvts = ALL_EVENTS.filter(function(e){ return e.raw_date === cell.dateStr; });
+                    cellDiv.style.cursor = 'pointer';
+                    cellDiv.addEventListener('click', (function(ds, evts) {
+                        return function(e) {
+                            // Don't double-fire if a pill was clicked
+                            if (e.target.closest && e.target.closest('[data-pill]')) return;
+                            openDayModal(ds, evts);
+                        };
+                    })(cell.dateStr, allDayEvts));
+                }
+
+                grid.appendChild(cellDiv);
+            });
+        }
+
+        // ── Navigation ─────────────────────────────────────────────────────
+        function navigate(delta) {
+            state.month += delta;
+            if (state.month > 11) { state.month = 0;  state.year++; }
+            if (state.month < 0)  { state.month = 11; state.year--; }
+            render();
+        }
+
+        // ── Day Detail Modal ────────────────────────────────────────────────
+        function openDayModal(dateStr, evts) {
+            var MONTHS_S = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+            var d = new Date(dateStr + 'T00:00:00');
+            var title = MONTHS_S[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear();
+
+            var modal = document.getElementById(UID + '-day-modal');
+            if (!modal) return;
+
+            modal.querySelector('#' + UID + '-day-title').textContent = title;
+
+            // Hide the detail panel when opening new day
+            var detailPanel = modal.querySelector('#' + UID + '-detail-panel');
+            if (detailPanel) { detailPanel.style.display = 'none'; }
+
+            var body = modal.querySelector('#' + UID + '-day-body');
+            body.innerHTML = '';
+
+            if (evts.length === 0) {
+                body.innerHTML = '<div style="text-align:center;color:#94a3b8;padding:32px 0;"><i class="fa fa-calendar-times" style="font-size:36px;margin-bottom:12px;display:block;opacity:.4;"></i><div style="font-weight:600;font-size:14px;">No appointments on this date.</div></div>';
+            } else {
+                evts.forEach(function(ev) {
+                    // Status-based palette matching the design exactly
+                    var statusKey = (ev.status || '').toLowerCase();
+                    var pal;
+                    if (statusKey === 'cancelled' || statusKey === 'rejected') {
+                        pal = { bg: '#fff1f2', text: '#be123c', border: '#fecdd3', badge_bg: '#fde8ec', badge_text: '#be123c' };
+                    } else if (statusKey === 'completed') {
+                        pal = { bg: '#f0fdf4', text: '#15803d', border: '#bbf7d0', badge_bg: '#dcfce7', badge_text: '#15803d' };
+                    } else if (statusKey === 'approved') {
+                        pal = { bg: '#eff6ff', text: '#1d4ed8', border: '#bfdbfe', badge_bg: '#dbeafe', badge_text: '#1d4ed8' };
+                    } else if (statusKey === 'pending') {
+                        pal = { bg: '#fff7ed', text: '#c2410c', border: '#fed7aa', badge_bg: '#ffedd5', badge_text: '#c2410c' };
+                    } else if (statusKey === 'checked in') {
+                        pal = { bg: '#ecfeff', text: '#0e7490', border: '#a5f3fc', badge_bg: '#cffafe', badge_text: '#0e7490' };
+                    } else if (statusKey === 'in progress') {
+                        pal = { bg: '#faf5ff', text: '#7e22ce', border: '#e9d5ff', badge_bg: '#f3e8ff', badge_text: '#7e22ce' };
+                    } else if (statusKey === 'no show') {
+                        pal = { bg: '#fff1f2', text: '#9f1239', border: '#fecdd3', badge_bg: '#ffe4e6', badge_text: '#9f1239' };
+                    } else {
+                        pal = { bg: '#E6EEF8', text: '#475569', border: '#e2e8f0', badge_bg: '#f1f5f9', badge_text: '#475569' };
+                    }
+
+                    var card = document.createElement('div');
+                    card.style.cssText = 'border:1px solid ' + pal.border + ';background:' + pal.bg + ';border-radius:12px;padding:16px;margin-bottom:12px;';
+
+                    function fmtDate(s) { if(!s) return '-'; var p=s.split('-'); if(p.length<3) return s; var ms=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']; return ms[parseInt(p[1])-1]+' '+parseInt(p[2])+', '+p[0]; }
+                    function fmtDT(s) { if(!s||s.length<10) return '-'; return fmtDate(s.substring(0,10)) + (s.length>10 ? ' ' + new Date(s).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}) : ''); }
+
+                    var actionForms = '';
+                    if (ROLE === 'doctor' && ev.appt_id) {
+                        // Veterinarian: approvals, check-in and completing are done by the vet staff; the vet records the consultation
+                        var vBtn = 'width:100%;padding:10px;border:none;border-radius:10px;font-weight:700;font-size:13px;display:flex;align-items:center;justify-content:center;gap:8px;text-decoration:none;';
+                        var vNote = function (ic, t) { return '<div style="display:flex;gap:8px;align-items:flex-start;font-size:12.5px;color:#475569;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;margin-bottom:8px;"><i class="fa ' + ic + '" style="margin-top:2px;color:#2563eb;"></i><span>' + t + '</span></div>'; };
+                        actionForms = '<div style="margin-top:16px;padding-top:16px;border-top:1px dashed ' + pal.border + ';">'
+                            + '<div style="font-size:11px;font-weight:800;text-transform:uppercase;color:#64748b;letter-spacing:.06em;margin-bottom:12px;">Next step</div>';
+                        if (statusKey === 'pending' || statusKey.indexOf('reschedule') === 0) {
+                            actionForms += vNote('fa-hourglass-half', 'Waiting for the vet staff to confirm this appointment.');
+                        } else if (statusKey === 'approved') {
+                            actionForms += vNote('fa-door-closed', 'Not checked in yet. The vet staff check the patient in when they arrive.')
+                                + '<a href="doctor_consultations.php" style="' + vBtn + 'background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;"><i class="fa fa-notes-medical"></i> Open Consultations</a>';
+                        } else if (statusKey === 'checked in' || statusKey === 'in progress') {
+                            actionForms += vNote('fa-stethoscope', 'The patient is in the clinic. Record the consultation so the vet staff can complete the visit and bill it.')
+                                + '<a href="doctor_consultations.php" style="' + vBtn + 'background:#2563eb;color:#fff;box-shadow:0 2px 8px rgba(37,99,235,.25);"><i class="fa fa-notes-medical"></i> Record Consultation</a>';
+                        } else if (statusKey === 'completed') {
+                            actionForms += '<a href="doctor_patients.php" style="' + vBtn + 'background:#f0fdf4;color:#15803d;border:1px solid #bbf7d0;"><i class="fa fa-folder-open"></i> View Patient Records</a>';
+                        } else {
+                            actionForms += vNote('fa-circle-info', 'No action needed for this appointment.');
+                        }
+                        actionForms += '</div>';
+                    } else if (ROLE === 'staff' && ev.appt_id) {
+                        var btnStyle = 'width:100%;padding:10px;border:none;border-radius:10px;font-weight:700;font-size:13px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;transition:.2s;';
+                        var inpStyle = 'width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:8px;font-family:inherit;font-size:13px;outline:none;background:#fff;';
+                        
+                        actionForms = '<div style="margin-top:16px;padding-top:16px;border-top:1px dashed ' + pal.border + ';">'
+                            + '<div style="font-size:11px;font-weight:800;text-transform:uppercase;color:#64748b;letter-spacing:.06em;margin-bottom:14px;">Staff Actions</div>';
+
+                        // ── STAFF & ADMIN triage actions ──────────────────────────────
+                        if (statusKey === 'pending') {
+                            actionForms += '<form method="POST" style="margin-bottom:8px;">'
+                                + '<input type="hidden" name="action" value="accept_appointment">'
+                                + '<input type="hidden" name="apt_id" value="' + escHtml(ev.appt_id) + '">'
+                                + '<input type="hidden" name="redirect_tab" value="calendar">'
+                                + '<button type="submit" style="'+btnStyle+'background:#16a34a;color:#fff;box-shadow:0 2px 8px rgba(22,163,74,.25);" onmouseover="this.style.opacity=\'0.9\'" onmouseout="this.style.opacity=\'1\'" onclick="return confirm(\'Accept and confirm this appointment?\');"><i class="fa fa-check-circle"></i> Accept & Confirm Appointment</button>'
+                                + '</form>';
+                            actionForms += '<div id="staffRejectToggle_' + escHtml(ev.appt_id) + '" style="margin-bottom:8px;">'
+                                + '<button type="button" onclick="this.parentNode.querySelector(\'.rejectExpand\').style.display=\'block\';this.style.display=\'none\';" style="'+btnStyle+'background:#fff1f2;color:#be123c;border:1px solid #fecdd3;" onmouseover="this.style.background=\'#ffe4e6\'" onmouseout="this.style.background=\'#fff1f2\'"><i class="fa fa-times"></i> Decline / Cancel</button>'
+                                + '<div class="rejectExpand" style="display:none;">'
+                                + '<form method="POST">'
+                                + '<input type="hidden" name="action" value="reject_appointment">'
+                                + '<input type="hidden" name="apt_id" value="' + escHtml(ev.appt_id) + '">'
+                                + '<input type="hidden" name="redirect_tab" value="calendar">'
+                                + '<input type="text" name="reject_reason" style="'+inpStyle+'margin-bottom:8px;" placeholder="Reason for decline..." required>'
+                                + '<button type="submit" style="'+btnStyle+'background:#be123c;color:#fff;" onclick="return confirm(\'Confirm rejection?\')"><i class="fa fa-ban"></i> Confirm Rejection</button>'
+                                + '</form>'
+                                + '</div></div>';
+                        }
+
+                        if (statusKey === 'approved') {
+                            actionForms += '<form method="POST" style="margin-bottom:8px;">'
+                                + '<input type="hidden" name="action" value="update_status">'
+                                + '<input type="hidden" name="apt_id" value="' + escHtml(ev.appt_id) + '">'
+                                + '<input type="hidden" name="new_status" value="Checked In">'
+                                + '<input type="hidden" name="redirect_tab" value="calendar">'
+                                + '<button type="submit" style="'+btnStyle+'background:#2563eb;color:#fff;box-shadow:0 2px 8px rgba(37,99,235,.25);" onclick="return confirm(\'Check in this patient?\');"><i class="fa fa-door-open"></i> Check In Patient (Arrived)</button>'
+                                + '</form>';
+                        }
+
+                        if (statusKey === 'checked in' && ROLE === 'staff') {
+                            actionForms += '<a href="staff_dashboard.php?tab=appointments&filter=all&open=' + escHtml(ev.appt_id) + '" style="'+btnStyle+'background:#059669;color:#fff;text-decoration:none;margin-bottom:8px;"><i class="fa fa-file-invoice-dollar"></i> List Services, Issue Invoice &amp; Complete</a>';
+                        } else if (statusKey === 'checked in') {
+                            actionForms += '<form method="POST" style="margin-bottom:8px;">'
+                                + '<input type="hidden" name="action" value="update_status">'
+                                + '<input type="hidden" name="apt_id" value="' + escHtml(ev.appt_id) + '">'
+                                + '<input type="hidden" name="new_status" value="In Progress">'
+                                + '<input type="hidden" name="redirect_tab" value="calendar">'
+                                + '<button type="submit" style="'+btnStyle+'background:#7c3aed;color:#fff;" onclick="return confirm(\'Send to exam room?\');"><i class="fa fa-stethoscope"></i> Send to Exam Room (In Consultation)</button>'
+                                + '</form>';
+                        }
+
+                        if (statusKey === 'in progress' && ROLE === 'staff') {
+                            // Staff complete via Appointment Requests: list services availed and issue the invoice
+                            actionForms += '<a href="staff_dashboard.php?tab=appointments&filter=all&open=' + escHtml(ev.appt_id) + '" style="'+btnStyle+'background:#059669;color:#fff;text-decoration:none;margin-bottom:8px;"><i class="fa fa-file-invoice-dollar"></i> List Services, Issue Invoice &amp; Complete</a>';
+                        } else if (statusKey === 'in progress') {
+                            actionForms += '<form method="POST" style="margin-bottom:8px;">'
+                                + '<input type="hidden" name="action" value="update_status">'
+                                + '<input type="hidden" name="apt_id" value="' + escHtml(ev.appt_id) + '">'
+                                + '<input type="hidden" name="new_status" value="Completed">'
+                                + '<input type="hidden" name="redirect_tab" value="calendar">'
+                                + '<button type="submit" style="'+btnStyle+'background:#059669;color:#fff;" onclick="return confirm(\'Mark consultation as completed?\');"><i class="fa fa-flag-checkered"></i> Mark Consultation Completed</button>'
+                                + '</form>';
+                        }
+
+                        // No-show (staff + admin, any non-final status)
+                        if (ROLE === 'staff' || ROLE === 'admin') {
+                            if (statusKey !== 'completed' && statusKey !== 'cancelled' && statusKey !== 'no show') {
+                                actionForms += '<form method="POST" style="margin-top:4px;" onsubmit="return confirm(\'Mark as No Show?\');">'
+                                    + '<input type="hidden" name="action" value="update_status">'
+                                    + '<input type="hidden" name="apt_id" value="' + escHtml(ev.appt_id) + '">'
+                                    + '<input type="hidden" name="new_status" value="No Show">'
+                                    + '<input type="hidden" name="redirect_tab" value="calendar">'
+                                    + '<button type="submit" style="'+btnStyle+'background:#f1f5f9;color:#64748b;border:1px solid #e2e8f0;" onmouseover="this.style.background=\'#e2e8f0\'" onmouseout="this.style.background=\'#f1f5f9\'"><i class="fa fa-user-slash"></i> Mark No Show</button>'
+                                    + '</form>';
+                            }
+                        }
+
+                        // Doctor approve (original doctor portal action)
+                        if (ROLE === 'doctor' && statusKey === 'pending') {
+                            actionForms += '<form method="POST" style="margin-bottom:8px;">'
+                                + '<input type="hidden" name="apt_id" value="' + escHtml(ev.appt_id) + '">'
+                                + '<button type="submit" name="action" value="approve" style="'+btnStyle+'background:#1d4ed8;color:#fff;box-shadow:0 2px 8px rgba(29,78,216,.25);" onmouseover="this.style.opacity=\'0.9\'" onmouseout="this.style.opacity=\'1\'" onclick="return confirm(\'Approve this appointment?\');"><i class="fa fa-check-circle"></i> Approve Appointment</button>'
+                                + '</form>';
+                        }
+
+                        if (statusKey === 'approved' && ROLE === 'admin') {
+                            actionForms += '<form method="POST" style="margin-bottom:12px;">'
+                                + '<input type="hidden" name="apt_id" value="' + escHtml(ev.appt_id) + '">'
+                                + '<button type="submit" name="admin_manage_appt" value="complete" style="'+btnStyle+'background:#15803d;color:#fff;box-shadow:0 2px 8px rgba(21,128,61,.25);" onmouseover="this.style.opacity=\'0.9\'" onmouseout="this.style.opacity=\'1\'" onclick="return confirm(\'Mark as completed?\');"><i class="fa fa-check-circle"></i> Mark as Completed</button>'
+                                + '</form>';
+                        }
+
+                        if (ROLE === 'admin' && (statusKey === 'pending' || statusKey === 'approved' || statusKey === 'reschedule proposed')) {
+                            actionForms += '<form method="POST" style="display:flex;flex-direction:column;gap:12px;">'
+                                + '<input type="hidden" name="apt_id" value="' + escHtml(ev.appt_id) + '">'
+                                + '<div><label style="font-size:11px;font-weight:700;color:#64748b;margin-bottom:6px;display:block;">Reason / Message to Client</label><textarea name="admin_message" rows="2" style="'+inpStyle+'resize:none;" required placeholder="Explain cancellation or reschedule proposal..."></textarea></div>'
+                                + '<div style="display:flex;gap:10px;">'
+                                + '<input type="text" name="new_date" class="saas-flatpickr-shifted-date" style="'+inpStyle+'flex:1;" placeholder="Select new Date & Time...">'
+                                + '<button type="submit" name="admin_manage_appt" value="reschedule" style="padding:10px 16px;background:#E6EEF8;color:#334155;border:1px solid #cbd5e1;border-radius:8px;font-weight:700;font-size:13px;cursor:pointer;white-space:nowrap;transition:.2s;" onmouseover="this.style.background=\'#f1f5f9\'" onmouseout="this.style.background=\'#E6EEF8\'" onclick="return confirm(\'Propose this reschedule?\');">Shift Date</button>'
+                                + '</div>'
+                                + '<button type="submit" name="admin_manage_appt" value="cancel" style="'+btnStyle+'background:#fff1f2;color:#be123c;border:1px solid #fecdd3;" onmouseover="this.style.background=\'#ffe4e6\'" onmouseout="this.style.background=\'#fff1f2\'" onclick="return confirm(\'Permanently cancel appointment?\');"><i class="fa fa-times"></i> Cancel / Reject</button>'
+                                + '</form>';
+                        }
+
+                        actionForms += '</div>';
+                    }
+
+                    card.innerHTML =
+                        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">'
+                        + '<span style="font-size:15px;font-weight:800;color:' + pal.text + ';">' + escHtml(ev.type || 'General Checkup') + '</span>'
+                        + '<span style="font-size:11px;font-weight:800;color:' + pal.badge_text + ';background:' + pal.badge_bg + ';padding:3px 12px;border-radius:20px;border:1px solid ' + pal.border + ';">' + escHtml(ev.status) + '</span>'
+                        + '</div>'
+                        + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">'
+                        + '<div><div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:2px;"><i class="fa fa-calendar-alt me-1"></i>Date</div><div style="font-size:13px;color:#1e293b;font-weight:600;">' + fmtDate(ev.raw_date) + '</div></div>'
+                        + '<div><div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:2px;"><i class="fa fa-clock me-1"></i>Time</div><div style="font-size:13px;color:#1e293b;font-weight:600;">' + escHtml(ev.time || '-') + '</div></div>'
+                        + '<div><div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:2px;"><i class="fa fa-paw me-1"></i>Pet</div><div style="font-size:13px;color:#1e293b;font-weight:600;">' + escHtml(ev.pet || '-') + '</div></div>'
+                        + (ROLE !== 'client' ? '<div><div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:2px;"><i class="fa fa-user me-1"></i>Client</div><div style="font-size:13px;color:#1e293b;font-weight:600;">' + escHtml(ev.owner || '-') + '</div></div>' : '')
+                        + '<div><div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:2px;"><i class="fa fa-user-md me-1"></i>Doctor</div><div style="font-size:13px;color:#1e293b;font-weight:600;">' + escHtml(ev.doctor || 'Unassigned') + '</div></div>'
+                        + '<div><div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:2px;"><i class="fa fa-map-marker-alt me-1"></i>Location</div><div style="font-size:13px;color:#1e293b;font-weight:600;">' + escHtml(ev.location || 'Clinic') + '</div></div>'
+                        + '</div>'
+                        + (ev.notes ? '<div style="margin-bottom:12px;"><div style="font-size:10px;font-weight:700;text-transform:uppercase;color:#94a3b8;margin-bottom:4px;"><i class="fa fa-sticky-note" style="margin-right:4px;"></i>Notes</div><div style="background:#fff;border:1px solid ' + pal.border + ';border-radius:8px;padding:10px 12px;font-size:13px;color:#334155;">' + escHtml(ev.notes) + '</div></div>' : '')
+                        + (ev.created_at ? '<div style="font-size:11px;color:#94a3b8;"><i class="fa fa-clock" style="margin-right:4px;"></i>Booked on: ' + fmtDT(ev.created_at) + '</div>' : '')
+                        + actionForms;
+
+                    body.appendChild(card);
+                });
+            }
+
+            modal.style.display = 'flex';
+            modal.style.opacity = '0';
+            setTimeout(function() { modal.style.opacity = '1'; }, 10);
+            
+            if (typeof flatpickr !== 'undefined') {
+                flatpickr('.saas-flatpickr-shifted-date', {
+                    enableTime: true,
+                    dateFormat: "Y-m-d H:i",
+                    minDate: "today"
+                });
+            }
+        }
+
+
+
+        function detailField(icon, label, value) {
+            return '<div style="background:#E6EEF8;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;">'
+                + '<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:4px;"><i class="fa ' + icon + '" style="margin-right:4px;"></i>' + label + '</div>'
+                + '<div style="font-size:13px;font-weight:600;color:#1e293b;">' + escHtml(value) + '</div>'
+                + '</div>';
+        }
+
+        function closeDayModal() {
+            var modal = document.getElementById(UID + '-day-modal');
+            if (modal) {
+                modal.style.opacity = '0';
+                setTimeout(function() { modal.style.display = 'none'; }, 180);
+            }
+        }
+
+        function escHtml(str) {
+            if (!str) return '-';
+            return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        }
+
+        // ── Expose Global triggerModal for legacy integration ────────────────
+        window.triggerModal = function(id, title, client, pet, service, time, status, created, approved, dateStr) {
+            if (typeof bootstrap !== 'undefined') {
+                var listModalEl = document.getElementById('viewAllPendingModal');
+                if (listModalEl) {
+                    var listModal = bootstrap.Modal.getInstance(listModalEl) || new bootstrap.Modal(listModalEl);
+                    listModal.hide();
+                }
+            }
+            var syntheticEv = {
+                appt_id: id,
+                type: service,
+                status: status,
+                time: time,
+                owner: client,
+                pet: pet,
+                doctor: 'Unassigned',
+                raw_date: dateStr,
+                created_at: created
+            };
+            var dayModal = document.getElementById(UID + '-day-modal');
+            if (dayModal) {
+                dayModal.style.display = 'flex';
+                // Trigger reflow
+                void dayModal.offsetWidth;
+                dayModal.style.opacity = '1';
+                
+                // Clear Day Modal Body and Inject Synthetic Event
+                var body = dayModal.querySelector('#' + UID + '-day-body');
+                body.innerHTML = '';
+                
+                var pal = { bg: '#E6EEF8', text: '#475569', border: '#e2e8f0', badge_bg: '#f1f5f9', badge_text: '#475569' };
+                if ((syntheticEv.status || '').toLowerCase() === 'pending') {
+                    pal = { bg: '#fff7ed', text: '#c2410c', border: '#fed7aa', badge_bg: '#ffedd5', badge_text: '#c2410c' };
+                }
+                
+                var card = document.createElement('div');
+                card.style.cssText = 'border:1px solid ' + pal.border + ';background:' + pal.bg + ';border-radius:12px;padding:16px;margin-bottom:12px;';
+                card.innerHTML =
+                        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">'
+                        + '<span style="font-size:15px;font-weight:800;color:' + pal.text + ';">' + escHtml(syntheticEv.type || 'General Checkup') + '</span>'
+                        + '<span style="font-size:11px;font-weight:800;color:' + pal.badge_text + ';background:' + pal.badge_bg + ';padding:3px 12px;border-radius:20px;border:1px solid ' + pal.border + ';">' + escHtml(syntheticEv.status) + '</span>'
+                        + '</div>'
+                        + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">'
+                        + '<div><div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:2px;"><i class="fa fa-calendar-alt me-1"></i>Date</div><div style="font-size:13px;color:#1e293b;font-weight:600;">' + (syntheticEv.raw_date || '-') + '</div></div>'
+                        + '<div><div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:2px;"><i class="fa fa-clock me-1"></i>Time</div><div style="font-size:13px;color:#1e293b;font-weight:600;">' + escHtml(syntheticEv.time || '-') + '</div></div>'
+                        + '<div><div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:2px;"><i class="fa fa-paw me-1"></i>Pet</div><div style="font-size:13px;color:#1e293b;font-weight:600;">' + escHtml(syntheticEv.pet || '-') + '</div></div>'
+                        + '<div><div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:2px;"><i class="fa fa-user me-1"></i>Client</div><div style="font-size:13px;color:#1e293b;font-weight:600;">' + escHtml(syntheticEv.owner || '-') + '</div></div>'
+                        + '</div>';
+                
+                body.appendChild(card);
+            }
+        };
+
+        // ── Boot ───────────────────────────────────────────────────────────
+        function boot() {
+            var prevBtn  = document.getElementById(UID + '-prev');
+            var nextBtn  = document.getElementById(UID + '-next');
+            var todayBtn = document.getElementById(UID + '-today');
+
+            if (prevBtn)  prevBtn.addEventListener('click',  function(){ navigate(-1); });
+            if (nextBtn)  nextBtn.addEventListener('click',  function(){ navigate(1); });
+            if (todayBtn) todayBtn.addEventListener('click', function(){
+                var now = new Date();
+                state.year = now.getFullYear();
+                state.month = now.getMonth();
+                render();
+            });
+
+            // Filter checkboxes
+            document.querySelectorAll('.' + UID + '-filter').forEach(function(box){
+                box.addEventListener('change', render);
+            });
+
+            // Day modal close on backdrop click
+            var dayModal = document.getElementById(UID + '-day-modal');
+            if (dayModal) {
+                dayModal.addEventListener('click', function(e) {
+                    if (e.target === dayModal) closeDayModal();
+                });
+                var closeBtn = dayModal.querySelector('.' + UID + '-day-close');
+                if (closeBtn) closeBtn.addEventListener('click', closeDayModal);
+            }
+
+            render();
+        }
+
+        // Wait for DOM
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', boot);
+        } else {
+            boot();
+        }
+    })();
+    </script>
+
+    <!-- Day Detail Modal -->
+    <div id="<?php echo $uid; ?>-day-modal"
+         style="display:none;position:fixed;inset:0;background:rgba(15,23,42,.50);z-index:99999;align-items:center;justify-content:center;opacity:0;transition:opacity .18s;padding:16px;">
+        <div style="background:#fff;border-radius:18px;width:100%;max-width:540px;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 24px 64px rgba(0,0,0,.20);overflow:hidden;position:relative;">
+            <!-- Modal header -->
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:20px 24px;border-bottom:1px solid #e2e8f0;flex-shrink:0;">
+                <div style="display:flex;align-items:center;gap:12px;">
+                    <div style="width:38px;height:38px;border-radius:10px;background:#eff6ff;display:flex;align-items:center;justify-content:center;">
+                        <i class="fa fa-calendar-day" style="color:#2563eb;font-size:17px;"></i>
+                    </div>
+                    <div>
+                        <div style="font-size:15px;font-weight:800;color:#0f172a;" id="<?php echo $uid; ?>-day-title"></div>
+                        <div style="font-size:12px;color:#64748b;">Appointments for this day</div>
+                    </div>
+                </div>
+                <button class="<?php echo $uid; ?>-day-close" style="width:34px;height:34px;border-radius:50%;border:1px solid #e2e8f0;background:#E6EEF8;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:18px;color:#64748b;flex-shrink:0;">&#x2715;</button>
+            </div>
+            <!-- Modal body (appointment card list) -->
+            <div id="<?php echo $uid; ?>-day-body"
+                 style="overflow-y:auto;padding:18px 20px;flex:1;scrollbar-width:thin;scrollbar-color:#e2e8f0 transparent;">
+            </div>
+        </div>
+    </div>
+
+    <?php
+    return ob_get_clean();
+}
+?>

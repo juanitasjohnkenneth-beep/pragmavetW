@@ -1,0 +1,1147 @@
+<?php
+session_start();
+include("dbconnection.php");
+
+// Auth guard - Admin and Owner (Reports & Analytics)
+$user_role = $_SESSION['role'] ?? '';
+$is_admin = ($user_role === 'admin');
+$is_owner = ($user_role === 'clinic_owner' || $user_role === 'owner');
+
+if (!isset($_SESSION['user_id']) || (!$is_admin && !$is_owner)) {
+    if ($user_role === 'doctor') {
+        header("Location: doctor.php");
+    } elseif ($user_role === 'staff') {
+        header("Location: staff_dashboard.php");
+    } else {
+        header("Location: index.php");
+    }
+    exit();
+}
+
+// 1. EXPORT TO CSV
+if (isset($_POST['export_csv'])) {
+    if (ob_get_length()) ob_end_clean();
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="pragmavet_revenue_report_' . date('Y-m-d') . '.csv"');
+    $output = fopen('php://output', 'w');
+    fputcsv($output, array('Invoice #', 'Client Name', 'Pet Name', 'Service Category', 'Total Amount (PHP)', 'Payment Status', 'Payment Method', 'Date Created'));
+
+    $q = $conn->query("
+        SELECT 
+            b.id,
+            b.invoice_no,
+            COALESCE(NULLIF(TRIM(b.client_name), ''), u.fullname, 'Walk-in Client') AS client_name,
+            COALESCE(NULLIF(TRIM(b.pet_name), ''), a.pet_name, br.pet_name, 'General Pet') AS pet_name,
+            CASE WHEN b.is_boarding = 1 THEN 'Boarding' ELSE 'Clinic' END as category,
+            b.total_amount,
+            b.payment_status,
+            b.payment_method,
+            b.created_at
+        FROM billing b
+        LEFT JOIN users u ON b.user_id = u.id
+        LEFT JOIN appointments a ON b.appointment_id = a.id
+        LEFT JOIN boarding_reservations br ON b.boarding_res_id = br.id
+        ORDER BY b.created_at DESC
+    ");
+    while ($row = $q->fetch_assoc()) {
+        $inv_code = !empty($row['invoice_no']) ? $row['invoice_no'] : ('INV-' . str_pad($row['id'], 5, '0', STR_PAD_LEFT));
+        fputcsv($output, array(
+            $inv_code,
+            $row['client_name'],
+            $row['pet_name'],
+            $row['category'],
+            number_format($row['total_amount'], 2),
+            $row['payment_status'],
+            $row['payment_method'],
+            $row['created_at']
+        ));
+    }
+    fclose($output);
+    exit();
+}
+
+// 2. SEND MANUAL NOTIFICATION / RECALL ALERT
+if (isset($_POST['send_alert'])) {
+    $client_id = (int)$_POST['client_id'];
+    $type = trim($_POST['type'] ?? 'General Notice');
+    $message = trim($_POST['message'] ?? '');
+    
+    if ($client_id > 0 && !empty($message)) {
+        // Notifications Log
+        $stmt = $conn->prepare("INSERT INTO notifications_log(user_id, message, type, status) VALUES(?,?,?,'Sent')");
+        $stmt->bind_param("iss", $client_id, $message, $type);
+        $stmt->execute();
+
+        // Client Notifications
+        $stmt2 = $conn->prepare("INSERT INTO notifications(user_id, message) VALUES(?,?)");
+        $stmt2->bind_param("is", $client_id, $message);
+        $stmt2->execute();
+
+        $_SESSION['message'] = "$type Alert sent successfully to client.";
+        $_SESSION['msg_type'] = "success";
+    } else {
+        $_SESSION['message'] = "Please select a client and provide alert text.";
+        $_SESSION['msg_type'] = "danger";
+    }
+    header("Location: admin.php");
+    exit();
+}
+
+// 3. ANALYTICS & BILLING AGGREGATES ACROSS ALL TRANSACTIONS
+$billing_stats = $conn->query("
+    SELECT 
+        IFNULL(SUM(total_amount), 0) as total_billed,
+        IFNULL(SUM(CASE 
+            WHEN payment_status='Paid' THEN (CASE WHEN amount_paid > 0 THEN amount_paid ELSE total_amount END)
+            WHEN downpayment_status='Paid' THEN (CASE WHEN amount_paid > 0 THEN amount_paid ELSE downpayment_amount END)
+            ELSE 0 
+        END), 0) as total_collected,
+        IFNULL(SUM(CASE 
+            WHEN payment_status='Paid' THEN 0
+            WHEN downpayment_status='Paid' THEN GREATEST(0, total_amount - (CASE WHEN amount_paid > 0 THEN amount_paid ELSE downpayment_amount END))
+            ELSE total_amount 
+        END), 0) as outstanding_balance,
+        COUNT(*) as total_invoices
+    FROM billing
+")->fetch_assoc();
+
+$total_billed = (float)$billing_stats['total_billed'];
+$total_collected = (float)$billing_stats['total_collected'];
+$outstanding_balance = (float)$billing_stats['outstanding_balance'];
+$total_invoices_cnt = (int)$billing_stats['total_invoices'];
+
+// Avg Rating
+$avg_rating_res = $conn->query("SELECT IFNULL(AVG(rating), 0) as a, COUNT(*) as c FROM feedbacks")->fetch_assoc();
+$avg_rating = (float)$avg_rating_res['a'];
+$feedback_count = (int)$avg_rating_res['c'];
+
+// Mini stats
+$today_count     = (int)($conn->query("SELECT COUNT(*) as c FROM appointments WHERE appointment_date='" . date('Y-m-d') . "' AND status IN ('Approved','Checked In','In Progress')")->fetch_assoc()['c'] ?? 0);
+$checkin_count   = (int)($conn->query("SELECT COUNT(*) as c FROM appointments WHERE status IN ('Checked In','In Progress')")->fetch_assoc()['c'] ?? 0);
+$completed_count = (int)($conn->query("SELECT COUNT(*) as c FROM appointments WHERE status='Completed'")->fetch_assoc()['c'] ?? 0);
+$noshow_count    = (int)($conn->query("SELECT COUNT(*) as c FROM appointments WHERE status='No Show'")->fetch_assoc()['c'] ?? 0);
+
+// Prescriptive Alerts
+$pending_appts_cnt    = (int)($conn->query("SELECT COUNT(*) as c FROM appointments WHERE status IN ('Reschedule Requested', 'Reschedule Proposed')")->fetch_assoc()['c'] ?? 0);
+$due_vaccines_cnt     = (int)($conn->query("SELECT COUNT(*) as c FROM pets WHERE next_vaccination IS NOT NULL AND next_vaccination <= DATE_ADD(CURDATE(), INTERVAL 7 DAY)")->fetch_assoc()['c'] ?? 0);
+$pending_boarding_cnt = (int)($conn->query("SELECT COUNT(*) as c FROM boarding_reservations WHERE status IN ('Pending', 'Reschedule Proposed')")->fetch_assoc()['c'] ?? 0);
+
+// Boarding occupancy
+$occ_count = (int)($conn->query("SELECT COUNT(DISTINCT cage_number) as occ FROM boarding_reservations WHERE status='Approved' AND appointment_date <= CURDATE() AND end_date >= CURDATE()")->fetch_assoc()['occ'] ?? 0);
+$total_cages_q = $conn->query("SELECT setting_value FROM clinic_settings WHERE setting_key = 'boarding_cage_count'");
+$total_cages = ($total_cages_q && $total_cages_q->num_rows > 0) ? (int)$total_cages_q->fetch_assoc()['setting_value'] : 5;
+
+// Recent feedback & users
+$recent_feedback = $conn->query("SELECT f.*, u.fullname as client_name FROM feedbacks f JOIN users u ON f.user_id = u.id ORDER BY f.created_at DESC LIMIT 6");
+$client_users_q = $conn->query("SELECT id, fullname, email, contact_number FROM users WHERE role IN ('user','client') ORDER BY fullname ASC");
+
+// Rating distribution (1 to 5)
+$rating_dist = [];
+for ($i = 1; $i <= 5; $i++) {
+    $r = $conn->query("SELECT COUNT(*) as cnt FROM feedbacks WHERE rating = $i")->fetch_assoc();
+    $rating_dist[$i] = (int)$r['cnt'];
+}
+$max_rating_count = max(array_values($rating_dist)) ?: 1;
+$total_responses  = array_sum($rating_dist);
+$computed_avg     = $total_responses > 0
+    ? array_sum(array_map(fn($r, $c) => $r * $c, array_keys($rating_dist), $rating_dist)) / $total_responses
+    : 0;
+
+// Monthly comparisons (Current year vs Previous year)
+$current_year = date('Y');
+$prev_year = $current_year - 1;
+$monthly_current = array_fill(1, 12, 0);
+$monthly_prev = array_fill(1, 12, 0);
+
+$rev_q = $conn->query("
+    SELECT YEAR(b.created_at) as y, MONTH(b.created_at) as m, 
+           SUM(b.total_amount) as amt 
+    FROM billing b
+    GROUP BY YEAR(b.created_at), MONTH(b.created_at)
+");
+if($rev_q) {
+    while($r = $rev_q->fetch_assoc()){
+        if($r['y'] == $current_year) $monthly_current[(int)$r['m']] = (float)$r['amt'];
+        if($r['y'] == $prev_year) $monthly_prev[(int)$r['m']] = (float)$r['amt'];
+    }
+}
+
+// Weekly comparisons (Last 5 weeks)
+$weekly_labels = [];
+$weekly_current = [];
+$weekly_prev = [];
+for($i=4; $i>=0; $i--) {
+    $start_date = date('Y-m-d', strtotime("-$i weeks sunday"));
+    $end_date = date('Y-m-d', strtotime($start_date . " +6 days"));
+    $weekly_labels[] = "Wk of " . date('M d', strtotime($start_date));
+    
+    $cw_q = $conn->query("SELECT SUM(b.total_amount) as amt FROM billing b WHERE DATE(b.created_at) BETWEEN '$start_date' AND '$end_date'")->fetch_assoc();
+    $weekly_current[] = (float)($cw_q['amt'] ?? 0);
+    
+    $p_start = date('Y-m-d', strtotime($start_date . " -1 year"));
+    $p_end = date('Y-m-d', strtotime($end_date . " -1 year"));
+    $pw_q = $conn->query("SELECT SUM(b.total_amount) as amt FROM billing b WHERE DATE(b.created_at) BETWEEN '$p_start' AND '$p_end'")->fetch_assoc();
+    $weekly_prev[] = (float)($pw_q['amt'] ?? 0);
+}
+
+// Appointment breakdown
+$services_q = $conn->query("SELECT IFNULL(service_type, 'General Checkup') as type, COUNT(*) as cnt FROM appointments GROUP BY IFNULL(service_type, 'General Checkup')");
+$appt_labels = [];
+$appt_data = [];
+$has_data = false;
+if($services_q) {
+    while($row = $services_q->fetch_assoc()){
+        $appt_labels[] = $row['type'];
+        $appt_data[] = (int)$row['cnt'];
+        $has_data = true;
+    }
+}
+$boarding_cnt = $conn->query("SELECT COUNT(*) as c FROM boarding_reservations")->fetch_assoc()['c'];
+if($boarding_cnt > 0) {
+    $appt_labels[] = 'Pet Boarding';
+    $appt_data[] = (int)$boarding_cnt;
+    $has_data = true;
+}
+if(!$has_data) {
+    $appt_labels = ['No Data Yet'];
+    $appt_data = [1];
+}
+
+// 30-day appointment trend
+$trend_data = array_fill(0, 30, 0);
+$trend_labels = [];
+for ($i = 29; $i >= 0; $i--) {
+    $trend_labels[] = date('M j', strtotime("-$i days"));
+}
+$tq = $conn->query("SELECT DATE(appointment_date) as d, COUNT(*) as c FROM appointments WHERE appointment_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY) GROUP BY d");
+if ($tq) while ($t = $tq->fetch_assoc()) {
+    $idx = 29 - (int)((strtotime(date('Y-m-d')) - strtotime($t['d'])) / 86400);
+    if ($idx >= 0 && $idx < 30) $trend_data[$idx] = (int)$t['c'];
+}
+
+// Peak hours
+$peak_hours = array_fill(0, 24, 0);
+$phq = $conn->query("SELECT HOUR(appointment_time) as h, COUNT(*) as c FROM appointments WHERE appointment_date >= DATE_SUB(CURDATE(), INTERVAL 90 DAY) GROUP BY h");
+if ($phq) while ($ph = $phq->fetch_assoc()) $peak_hours[(int)$ph['h']] = (int)$ph['c'];
+?>
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <script src="theme.js?v=<?= time() ?>"></script>
+    <link rel="stylesheet" href="theme.css?v=<?= time() ?>">
+    <title>Admin Dashboard | Reports & Analytics - PragmaVet</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <style>
+        @keyframes sweepRight {
+            from { clip-path: inset(0 100% 0 0); }
+            to { clip-path: inset(0 0 0 0); }
+        }
+
+        .chart-swipe {
+            animation: sweepRight 1.2s ease-in-out forwards;
+        }
+
+        :root {
+            --primary: #2563eb;
+            --secondary: #3b82f6;
+            --dark: #1e40af;
+            --light-bg: #F4F9FB;
+            --sidebar-width: 260px;
+        }
+
+        body {
+            background: var(--light-bg);
+            font-family: 'Inter', sans-serif;
+            color: #2D3748;
+            overflow-x: hidden;
+        }
+
+        .main-content {
+            margin-left: var(--sidebar-width) !important;
+            width: calc(100% - var(--sidebar-width)) !important;
+            max-width: calc(100% - var(--sidebar-width)) !important;
+            padding: 24px 28px !important;
+            min-height: 100vh;
+            box-sizing: border-box !important;
+        }
+
+        .card-premium {
+            background: white;
+            border: none;
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.02);
+            margin-bottom: 24px;
+        }
+
+        /* Summary Cards */
+        .sum-card {
+            background: #fff;
+            border-radius: 16px;
+            padding: 20px 22px;
+            box-shadow: 0 4px 16px rgba(0,0,0,.04);
+            border: 1px solid #e2e8f0;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            transition: transform 0.2s, box-shadow 0.2s;
+            text-decoration: none !important;
+            height: 100%;
+        }
+        .sum-card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 24px rgba(0,0,0,.08);
+            border-color: #cbd5e1;
+        }
+        .sum-icon {
+            width: 50px;
+            height: 50px;
+            border-radius: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            flex-shrink: 0;
+        }
+        .sum-value {
+            font-size: 22px;
+            font-weight: 800;
+            line-height: 1.1;
+            margin-bottom: 3px;
+            color: #0f172a;
+        }
+        .sum-label {
+            font-size: 11.5px;
+            color: #64748b;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: .4px;
+        }
+
+        /* ====== WHITE SIDEBAR THEME ====== */
+        .sidebar {
+            background: #ffffff !important;
+            width: var(--sidebar-width, 260px) !important;
+            height: 100vh !important;
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            padding: 28px 20px 24px !important;
+            z-index: 1000 !important;
+            display: flex !important;
+            flex-direction: column !important;
+            border-right: 1px solid #eef2f6 !important;
+            box-shadow: none !important;
+            overflow-y: auto !important;
+        }
+
+        .sidebar-brand {
+            display: flex !important;
+            align-items: center !important;
+            gap: 12px !important;
+            margin-bottom: 24px !important;
+            padding: 0 4px !important;
+            text-decoration: none !important;
+        }
+
+        .sidebar-brand-icon {
+            width: 44px !important;
+            height: 44px !important;
+            min-width: 44px !important;
+            border-radius: 13px !important;
+            background: #2563eb !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            color: #ffffff !important;
+            font-size: 20px !important;
+            flex-shrink: 0 !important;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+        }
+
+        .sidebar-brand span {
+            font-weight: 800 !important;
+            color: #182032 !important;
+            font-size: 22px !important;
+            letter-spacing: -0.4px !important;
+        }
+
+        .sidebar-user {
+            margin-bottom: 24px !important;
+            padding: 15px 18px !important;
+            border-radius: 14px !important;
+            background: #f8fafc !important;
+            border: 1px solid #eef2f6 !important;
+        }
+
+        .sidebar-user .welcome {
+            font-size: 13px !important;
+            color: #64748b !important;
+            font-weight: 500 !important;
+            line-height: 1.3 !important;
+        }
+
+        .sidebar-user .uname {
+            font-weight: 700 !important;
+            color: #0f172a !important;
+            font-size: 15.5px !important;
+            margin-top: 3px !important;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+        }
+
+        .sidebar a {
+            display: flex !important;
+            align-items: center !important;
+            gap: 14px !important;
+            padding: 12px 16px !important;
+            border-radius: 12px !important;
+            color: #334155 !important;
+            text-decoration: none !important;
+            margin-bottom: 4px !important;
+            font-weight: 600 !important;
+            font-size: 14.5px !important;
+            transition: all 0.2s ease !important;
+            letter-spacing: -0.1px !important;
+        }
+
+        .sidebar a i {
+            width: 22px !important;
+            text-align: center !important;
+            font-size: 16px !important;
+            color: #64748b !important;
+            transition: color 0.2s !important;
+            flex-shrink: 0 !important;
+        }
+
+        .sidebar a:hover {
+            background: #f8fafc !important;
+            color: #0f172a !important;
+        }
+
+        .sidebar a:hover i {
+            color: #2563eb !important;
+        }
+
+        .sidebar a.active {
+            background: #2563eb !important;
+            color: #ffffff !important;
+            font-weight: 700 !important;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+        }
+
+        .sidebar a.active i {
+            color: #ffffff !important;
+        }
+
+        .sidebar .sidebar-logout {
+            margin-top: auto !important;
+            padding-top: 20px !important;
+            border-top: 1px solid #f1f5f9 !important;
+        }
+
+        .sidebar .sidebar-logout a {
+            color: #dc2626 !important;
+            font-weight: 600 !important;
+            margin-bottom: 0 !important;
+        }
+
+        .sidebar .sidebar-logout a:hover {
+            background: #fef2f2 !important;
+            color: #b91c1c !important;
+        }
+
+        .sidebar::-webkit-scrollbar { width: 5px; }
+        .sidebar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.06); border-radius: 10px; }
+        .sidebar::-webkit-scrollbar-track { background: transparent; }
+
+        /* ============ PRINT STYLES - HIDE DASHBOARD, SHOW MEDICAL REPORT ============ */
+        @media print {
+            body { background: white !important; font-family: 'Inter', Arial, sans-serif; color: #1A2332; }
+            @page { margin: 20mm 15mm; }
+            * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+            
+            .sidebar, .no-print, .btn, .btn-primary, .btn-success,
+            .alert-container, .alert, .position-fixed,
+            .main-content > .row, .main-content > div:not(#print-reports-section),
+            .main-content > .d-flex,
+            .sum-card, .card-premium, .chart-swipe,
+            #timeFilter, #revenueChart, #typeChart,
+            .fb-bar-val, .feedback-bar,
+            #performanceSummary, #appointmentSummary, #feedbackSummary,
+            .chart-container, canvas,
+            svg:not(.print-keep) { display: none !important; }
+
+            .main-content { margin-left: 0 !important; width: 100% !important; max-width: 100% !important; padding: 0 !important; }
+            #print-reports-section { display: block !important; }
+            
+            .doc-header { text-align: center; border-bottom: 3px double #0E5A6B; padding-bottom: 15px; margin-bottom: 20px; }
+            .doc-header h1 { font-size: 22px; color: #0E5A6B; margin: 0 0 5px; text-transform: uppercase; letter-spacing: 1px; }
+            .doc-header p { margin: 2px 0; color: #475569; font-size: 12px; }
+            .doc-ref { float: right; background: #f1f5f9; padding: 8px 14px; border: 1px solid #e2e8f0; font-size: 11px; }
+            .doc-ref strong { color: #0E5A6B; font-size: 14px; }
+            .doc-title { text-align: center; font-size: 18px; font-weight: 800; color: #0E5A6B; margin: 15px 0 5px; border: 2px solid #0E5A6B; display: inline-block; padding: 8px 30px; }
+            .doc-title-wrapper { text-align: center; margin-bottom: 20px; }
+
+            .patient-summary { border: 1px solid #cbd5e1; padding: 12px 16px; margin-bottom: 18px; page-break-inside: avoid; }
+            .patient-summary table { width: 100%; border-collapse: collapse; font-size: 12px; }
+            .patient-summary td { padding: 4px 10px; vertical-align: top; }
+            .patient-summary .label { color: #64748B; font-weight: 600; width: 18%; }
+            .patient-summary .value { color: #1A2332; font-weight: 500; }
+
+            .record-entry { border: 1px solid #e2e8f0; margin-bottom: 14px; page-break-inside: avoid; }
+            .record-header { background: #0E5A6B !important; color: white !important; padding: 8px 14px; font-size: 13px; font-weight: 700; display: flex; justify-content: space-between; }
+            .record-body { padding: 10px 14px; font-size: 11.5px; line-height: 1.6; }
+            .record-body table { width: 100%; border-collapse: collapse; }
+            .record-body td { padding: 3px 8px; vertical-align: top; }
+            .record-body .field-label { color: #64748B; font-weight: 600; width: 20%; }
+            .record-body .field-value { color: #1A2332; }
+            .record-divider { border: none; border-top: 1px dashed #d1d5db; margin: 8px 0; }
+
+            .med-table { width: 100%; border-collapse: collapse; font-size: 11px; margin: 8px 0; }
+            .med-table th { background: #0E5A6B !important; color: white !important; padding: 6px 10px; text-align: left; font-weight: 600; }
+            .med-table td { padding: 5px 10px; border-bottom: 1px solid #e2e8f0; }
+            .med-table tr:nth-child(even) { background: #f8fafc !important; }
+
+            .sec-title { font-size: 15px; font-weight: 800; color: #0E5A6B; margin: 22px 0 8px; border-bottom: 2px solid #0E5A6B; padding-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+            .doc-footer { margin-top: 30px; border-top: 1px solid #cbd5e1; padding-top: 12px; font-size: 10px; color: #94a3b8; text-align: center; }
+            .signature-area { display: flex; justify-content: space-between; margin-top: 25px; font-size: 11px; }
+            .signature-box { text-align: center; width: 30%; }
+            .signature-line { border-top: 1px solid #1A2332; padding-top: 4px; margin-top: 30px; font-weight: 600; color: #1A2332; }
+
+            .status-completed { color: #059669; font-weight: 700; }
+            .status-pending { color: #d97706; font-weight: 700; }
+            .status-approved { color: #2563eb; font-weight: 700; }
+        }
+        #print-reports-section { display: none; }
+    </style>
+    <link rel="stylesheet" href="assets/pragmavet.css">
+    <link href="assets/global-style.css" rel="stylesheet">
+</head>
+
+<body>
+
+    <?php if (isset($_SESSION['message'])): ?>
+        <div class="position-fixed top-0 end-0 p-3" style="z-index: 9999">
+            <div class="alert alert-<?php echo $_SESSION['msg_type']; ?> alert-dismissible fade show shadow-sm">
+                <?php echo $_SESSION['message'];
+                unset($_SESSION['message'], $_SESSION['msg_type']); ?>
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+        </div>
+    <?php endif; ?>
+
+    <!-- SIDEBAR -->
+    <?php include("includes/admin_sidebar.php"); ?>
+
+    <!-- MAIN CONTENT -->
+    <div class="main-content">
+        <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-3">
+            <div>
+                <h2 class="fw-bold m-0 text-dark">Admin Reports & Analytics Dashboard</h2>
+                <p class="text-muted small mb-0">Unified clinical intelligence, billing performance, and client alert center</p>
+            </div>
+            <div class="d-flex gap-2 align-items-center no-print flex-wrap">
+                <!-- Comprehensive Reports Hub -->
+                <a href="admin_reports.php" class="btn btn-outline-secondary rounded-pill shadow-sm fw-bold px-3 py-2">
+                    <i class="fa fa-chart-pie me-1.5"></i> Comprehensive Reports
+                </a>
+                <!-- Send Alert Trigger -->
+                <button type="button" class="btn btn-outline-primary rounded-pill shadow-sm fw-bold px-3 py-2" data-bs-toggle="modal" data-bs-target="#alertModal">
+                    <i class="fa fa-paper-plane me-1.5"></i> Dispatch Client Alert
+                </button>
+                <!-- Export CSV Form -->
+                <form method="POST" action="admin.php" class="d-inline">
+                    <button type="submit" name="export_csv" class="btn btn-outline-success rounded-pill shadow-sm fw-bold px-3 py-2">
+                        <i class="fa fa-file-excel me-1.5"></i> Export CSV
+                    </button>
+                </form>
+                <!-- Print Report Trigger -->
+                <button onclick="window.print()" class="btn btn-primary rounded-pill shadow-sm fw-bold px-4 py-2">
+                    <i class="fa fa-print me-1.5"></i> Print Reports
+                </button>
+            </div>
+        </div>
+
+        <!-- ── SMART PRESCRIPTIVE ALERTS ──────────────────────────────────────── -->
+        <?php if ($pending_appts_cnt > 0 || $due_vaccines_cnt > 0 || $pending_boarding_cnt > 0): ?>
+        <div class="row g-3 mb-4">
+            <?php if ($pending_appts_cnt > 0): ?>
+                <div class="col-md-6">
+                    <div class="p-3 rounded-4 border d-flex align-items-center justify-content-between" style="background: #faf5ff; border-color: #e9d5ff !important;">
+                        <div class="d-flex align-items-center gap-3">
+                            <i class="fa fa-clock-rotate-left fs-4" style="color: #7c3aed;"></i>
+                            <div>
+                                <div class="fw-bold text-dark" style="font-size: 14px;"><?= $pending_appts_cnt ?> Reschedule Proposal(s) Pending</div>
+                                <div class="text-muted small" style="font-size: 12px;">Pet owners requested revised consultation schedules</div>
+                            </div>
+                        </div>
+                        <a href="admin_list.php" class="btn btn-sm btn-primary rounded-pill px-3 fw-bold" style="background:#7c3aed; border:none; font-size: 12px;">Review Requests</a>
+                    </div>
+                </div>
+            <?php endif; ?>
+
+            <?php if ($due_vaccines_cnt > 0): ?>
+                <div class="col-md-6">
+                    <div class="p-3 rounded-4 border d-flex align-items-center justify-content-between" style="background: #fffbeb; border-color: #fde68a !important;">
+                        <div class="d-flex align-items-center gap-3">
+                            <i class="fa fa-bell text-warning fs-4"></i>
+                            <div>
+                                <div class="fw-bold text-dark" style="font-size: 14px;"><?= $due_vaccines_cnt ?> Vaccine Booster Reminder(s) Needed</div>
+                                <div class="text-muted small" style="font-size: 12px;">Registered pets due for immunization within 7 days</div>
+                            </div>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-warning text-dark rounded-pill px-3 fw-bold" data-bs-toggle="modal" data-bs-target="#alertModal" style="font-size: 12px;">Send Alert</button>
+                    </div>
+                </div>
+            <?php endif; ?>
+        </div>
+        <?php endif; ?>
+
+        <!-- ── APPOINTMENT MINI STATS ───────────────────────────────────────── -->
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px;">
+            <?php
+            $mini_stats = [
+                ["Today's Appts", 'fa-calendar-day', '#2563eb', '#eff6ff', $today_count],
+                ['Active Now',    'fa-spinner',       '#0e7490', '#ecfeff', $checkin_count],
+                ['Completed',     'fa-check-double',  '#15803d', '#f0fdf4', $completed_count],
+                ['No Shows',      'fa-user-slash',    '#be123c', '#fff1f2', $noshow_count],
+            ];
+            foreach ($mini_stats as $ms): ?>
+            <div style="background:#fff;border-radius:14px;padding:16px 18px;border:1px solid #e2e8f0;box-shadow:0 2px 8px rgba(0,0,0,.04);display:flex;align-items:center;gap:14px;">
+                <div style="width:42px;height:42px;border-radius:12px;background:<?=$ms[3]?>;display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+                    <i class="fa <?=$ms[1]?>" style="color:<?=$ms[2]?>;font-size:17px;"></i>
+                </div>
+                <div>
+                    <div style="font-size:22px;font-weight:800;color:#0f172a;line-height:1;"><?=(int)$ms[4]?></div>
+                    <div style="font-size:11px;color:#64748b;font-weight:600;margin-top:3px;"><?=htmlspecialchars($ms[0])?></div>
+                </div>
+            </div>
+            <?php endforeach; ?>
+        </div>
+
+        <!-- ── REVENUE & RATING SUMMARY CARDS ──────────────────────────────── -->
+        <div class="row g-4 mb-4">
+            <!-- 1. GROSS REVENUE -->
+            <div class="col-xl-3 col-md-6">
+                <a href="admin_billing.php" class="sum-card">
+                    <div class="sum-icon" style="background:#ecfdf5;color:#059669;"><i class="fa fa-file-invoice-dollar"></i></div>
+                    <div>
+                        <div class="sum-value text-success">₱<?php echo number_format($total_billed, 2); ?></div>
+                        <div class="sum-label">Gross Revenue</div>
+                    </div>
+                </a>
+            </div>
+            <!-- 2. TOTAL COLLECTED -->
+            <div class="col-xl-3 col-md-6">
+                <div class="sum-card">
+                    <div class="sum-icon" style="background:#f0fdf4;color:#16a34a;"><i class="fa fa-circle-check"></i></div>
+                    <div>
+                        <div class="sum-value" style="color:#16a34a;">₱<?php echo number_format($total_collected, 2); ?></div>
+                        <div class="sum-label">Total Collected</div>
+                    </div>
+                </div>
+            </div>
+            <!-- 3. OUTSTANDING BALANCE -->
+            <div class="col-xl-3 col-md-6">
+                <div class="sum-card">
+                    <div class="sum-icon" style="background:#fffbeb;color:#d97706;"><i class="fa fa-hourglass-half"></i></div>
+                    <div>
+                        <div class="sum-value" style="color:#d97706;">₱<?php echo number_format($outstanding_balance, 2); ?></div>
+                        <div class="sum-label">Outstanding Balance</div>
+                    </div>
+                </div>
+            </div>
+            <!-- 4. AVG CLINIC RATING -->
+            <div class="col-xl-3 col-md-6">
+                <div class="sum-card">
+                    <div class="sum-icon" style="background:#eff6ff;color:#2563eb;"><i class="fa fa-star"></i></div>
+                    <div>
+                        <div class="sum-value text-primary"><?php echo number_format($avg_rating, 1); ?> / 5.0</div>
+                        <div class="sum-label"><?= $feedback_count ?> Client Review<?= $feedback_count !== 1 ? 's' : '' ?></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── REVENUE CHART & SERVICE BREAKDOWN ────────────────────────────── -->
+        <div class="row">
+            <!-- Billing Summary Chart -->
+            <div class="col-xl-6">
+                <div class="card-premium h-100">
+                    <div class="d-flex justify-content-between align-items-center mb-4">
+                        <h5 class="fw-bold m-0"><i class="fa fa-file-invoice-dollar text-primary me-2"></i> Billing Summary Trend</h5>
+                        <select id="timeFilter" class="form-select form-select-sm shadow-sm" style="width: auto; font-weight: bold;">
+                            <option value="month" selected>Per Month</option>
+                            <option value="week">Per Week</option>
+                        </select>
+                    </div>
+                    <div style="position: relative; height: 300px; width: 100%;">
+                        <div class="chart-swipe" style="width: 100%; height: 100%;"><canvas id="revenueChart"></canvas></div>
+                    </div>
+                    <div style="margin-top:16px;padding-top:14px;border-top:1px solid #f1f5f9;display:flex;align-items:flex-start;gap:8px;">
+                        <svg width="15" height="15" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin-top:2px;flex-shrink:0;">
+                            <circle cx="10" cy="10" r="9" stroke="#22c55e" stroke-width="1.5"/>
+                            <path d="M10 9v5" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round"/>
+                            <circle cx="10" cy="6.5" r=".75" fill="#22c55e"/>
+                        </svg>
+                        <p id="performanceSummary" style="font-size:.75rem;color:#64748b;line-height:1.6;font-style:italic;margin:0;"></p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Appointment Distribution -->
+            <div class="col-xl-6">
+                <div class="card-premium h-100">
+                    <h5 class="fw-bold mb-4"><i class="fa fa-chart-pie text-secondary me-2"></i> Service Volume Breakdown</h5>
+                    <div class="d-flex justify-content-center" style="position: relative; height: 300px; width: 100%;">
+                        <canvas id="typeChart"></canvas>
+                    </div>
+                    <div style="margin-top:16px;padding-top:14px;border-top:1px solid #f1f5f9;display:flex;align-items:flex-start;gap:8px;">
+                        <svg width="15" height="15" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin-top:2px;flex-shrink:0;">
+                            <circle cx="10" cy="10" r="9" stroke="#22c55e" stroke-width="1.5"/>
+                            <path d="M10 9v5" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round"/>
+                            <circle cx="10" cy="6.5" r=".75" fill="#22c55e"/>
+                        </svg>
+                        <p id="appointmentSummary" style="font-size:.75rem;color:#64748b;line-height:1.6;font-style:italic;margin:0;"></p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── CLIENT FEEDBACK & RATING DISTRIBUTION ───────────────────────── -->
+        <div class="row mt-4">
+            <!-- Client Feedback Stream -->
+            <div class="col-xl-6">
+                <div class="card-premium h-100">
+                    <h5 class="fw-bold mb-4"><i class="fa fa-comments text-primary me-2"></i> Client Feedback Stream</h5>
+                    <?php if ($recent_feedback && $recent_feedback->num_rows > 0): ?>
+                        <div class="list-group list-group-flush">
+                            <?php while ($row = $recent_feedback->fetch_assoc()): ?>
+                                <div class="list-group-item bg-transparent px-0 py-3 border-bottom">
+                                    <div class="d-flex justify-content-between">
+                                        <strong class="text-dark"><?php echo htmlspecialchars($row['client_name']); ?></strong>
+                                        <span class="bg-warning text-dark px-2 py-1 rounded small fw-bold"><i class="fa fa-star"></i> <?php echo $row['rating']; ?>.0</span>
+                                    </div>
+                                    <p class="text-muted small mb-0 mt-2">"<?php echo htmlspecialchars($row['comments']); ?>"</p>
+                                </div>
+                            <?php endwhile; ?>
+                        </div>
+                    <?php else: ?>
+                        <p class="text-muted text-center py-4">No reviews recorded yet.</p>
+                    <?php endif; ?>
+                </div>
+            </div>
+
+            <!-- Feedback Rating Distribution -->
+            <div class="col-xl-6">
+                <div class="card-premium h-100">
+                    <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
+                        <h5 class="fw-bold m-0"><i class="fa fa-bar-chart text-primary me-2"></i> Feedback Rating Distribution</h5>
+                        <div style="background:#f0fdf4;border:1.5px solid #bbf7d0;border-radius:50px;padding:5px 14px;display:inline-flex;align-items:center;gap:8px;">
+                            <span style="width:20px;height:20px;background:#22c55e;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;">
+                                <svg width="12" height="12" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                    <polyline points="2,7 5.5,10.5 12,3.5" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+                                </svg>
+                            </span>
+                            <span style="font-size:.82rem;font-weight:600;color:#15803d;">
+                                <?php echo number_format($computed_avg, 1); ?> / 5 &nbsp;<span style="color:#86efac;">·</span>&nbsp;
+                                <?php
+                                    if ($computed_avg >= 4.5)      echo 'Excellent';
+                                    elseif ($computed_avg >= 3.5)  echo 'Very Satisfactory';
+                                    elseif ($computed_avg >= 2.5)  echo 'Satisfactory';
+                                    elseif ($computed_avg >= 1.5)  echo 'Fair';
+                                    else                           echo 'Poor';
+                                ?>
+                            </span>
+                        </div>
+                    </div>
+
+                    <!-- Color legend -->
+                    <div class="d-flex flex-wrap gap-2 mb-3" style="font-size:.72rem;font-weight:600;color:#64748b;">
+                        <?php
+                        $legend2 = [1=>['#ef4444','Poor'],2=>['#f97316','Fair'],3=>['#f59e0b','Good'],4=>['#22c55e','Very Good'],5=>['#15803d','Excellent']];
+                        foreach ($legend2 as $n2 => [$clr, $lbl2]):
+                        ?>
+                        <span style="display:inline-flex;align-items:center;gap:5px;">
+                            <span style="width:8px;height:8px;background:<?php echo $clr;?>;border-radius:50%;display:inline-block;"></span>
+                            <?php echo $lbl2; ?>
+                        </span>
+                        <?php endforeach; ?>
+                    </div>
+
+                    <!-- Chart body -->
+                    <div style="display:flex;align-items:stretch;gap:0;">
+                        <div style="writing-mode:vertical-rl;transform:rotate(180deg);font-size:.65rem;font-weight:600;color:#94a3b8;letter-spacing:.06em;text-transform:uppercase;white-space:nowrap;margin-right:12px;align-self:center;">Responses</div>
+                        <div style="flex:1;">
+                            <div style="display:flex;align-items:flex-end;justify-content:space-around;height:220px;padding:0 8px;border-bottom:2px solid #e2e8f0;">
+                                <?php
+                                $bc2 = [1=>['#f87171','#ef4444'],2=>['#fb923c','#f97316'],3=>['#fbbf24','#f59e0b'],4=>['#4ade80','#22c55e'],5=>['#16a34a','#15803d']];
+                                $blbl  = [1=>'Poor',2=>'Fair',3=>'Good',4=>'Very Good',5=>'Excellent'];
+                                foreach ($rating_dist as $brat => $bcnt):
+                                    $bpct = $bcnt / $max_rating_count;
+                                    $bpx  = max(6, round(220 * $bpct));
+                                    [$bc1,$bc2c] = $bc2[$brat];
+                                ?>
+                                <div style="display:flex;flex-direction:column;align-items:center;gap:6px;flex:1;height:100%;justify-content:flex-end;">
+                                    <span style="font-size:.78rem;font-weight:700;color:#475569;"><?php echo $bcnt; ?></span>
+                                    <div style="width:40px;border-radius:8px 8px 3px 3px;background:linear-gradient(180deg,<?php echo $bc1;?> 0%,<?php echo $bc2c;?> 100%);height:<?php echo $bpx; ?>px;position:relative;overflow:hidden;">
+                                        <span style="position:absolute;inset:0;background:linear-gradient(180deg,rgba(255,255,255,.2) 0%,rgba(255,255,255,0) 60%);"></span>
+                                    </div>
+                                </div>
+                                <?php endforeach; ?>
+                            </div>
+                            <!-- X-axis -->
+                            <div style="display:flex;justify-content:space-around;padding:10px 8px 0;">
+                                <?php foreach ($blbl as $bn => $bl): ?>
+                                <div style="flex:1;text-align:center;">
+                                    <span style="font-size:.82rem;font-weight:700;color:#334155;display:block;margin-bottom:1px;"><?php echo $bn; ?></span>
+                                    <span style="font-size:.62rem;font-weight:500;color:#94a3b8;display:block;text-transform:uppercase;letter-spacing:.03em;"><?php echo $bl; ?></span>
+                                </div>
+                                <?php endforeach; ?>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Footer -->
+                    <div style="margin-top:16px;padding-top:14px;border-top:1px solid #f1f5f9;display:flex;align-items:flex-start;gap:8px;">
+                        <svg width="15" height="15" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin-top:2px;flex-shrink:0;">
+                            <circle cx="10" cy="10" r="9" stroke="#22c55e" stroke-width="1.5"/>
+                            <path d="M10 9v5" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round"/>
+                            <circle cx="10" cy="6.5" r=".75" fill="#22c55e"/>
+                        </svg>
+                        <p id="feedbackSummary" style="font-size:.75rem;color:#64748b;line-height:1.6;font-style:italic;margin:0;"></p>
+                    </div>
+
+                </div>
+            </div>
+        </div>
+
+        <!-- ── BOTTOM CHARTS: 30-DAY TREND & PEAK HOURS ─────────────────────── -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:24px;">
+            <div style="background:#fff;border-radius:16px;padding:24px;border:1px solid #e2e8f0;box-shadow:0 2px 8px rgba(0,0,0,.04);">
+                <div style="font-size:13px;font-weight:700;color:#0f172a;margin-bottom:16px;"><i class="fa fa-chart-line me-2" style="color:#2563eb;"></i>30-Day Appointment Volume Trend</div>
+                <canvas id="trendChart" height="90"></canvas>
+            </div>
+            <div style="background:#fff;border-radius:16px;padding:24px;border:1px solid #e2e8f0;box-shadow:0 2px 8px rgba(0,0,0,.04);">
+                <div style="font-size:13px;font-weight:700;color:#0f172a;margin-bottom:16px;"><i class="fa fa-clock me-2" style="color:#ea580c;"></i>Peak Appointment Hours</div>
+                <canvas id="peakChart" height="90"></canvas>
+            </div>
+        </div>
+
+        <!-- ============ VETERINARY MEDICAL DOCUMENT (SHOWS ONLY WHEN PRINTING) ============ -->
+        <div id="print-reports-section">
+            <div class="doc-header">
+                <div style="float:left; width:60px; height:60px; background:#0E5A6B; border-radius:50%; display:flex; align-items:center; justify-content:center; color:white; font-size:28px; margin-right:15px;">
+                    <i class="fa fa-paw"></i>
+                </div>
+                <div class="doc-ref">
+                    Report No: <strong>VET-<?php echo date('Ymd-His'); ?></strong><br>
+                    Date: <?php echo date('F d, Y'); ?>
+                </div>
+                <h1>PragmaVet Animal Clinic</h1>
+                <p>0234 Unit B Palico St, Palico 4, Imus, Cavite, Philippines</p>
+                <p>Tel: 046-8851-221 &bull; 0954-285-3053 &bull; Email: pragmavet@gmail.com</p>
+            </div>
+            <div class="doc-title-wrapper">
+                <div class="doc-title">VETERINARY CLINICAL & FINANCIAL REPORT</div>
+                <p style="font-size:12px; color:#64748b; margin-top:5px;">Executive Practice Summary & Consultation History</p>
+            </div>
+
+            <!-- Financial Summary Statement -->
+            <div class="sec-title">I. Revenue & Financial Summary</div>
+            <div style="page-break-inside:avoid;margin-bottom:22px;">
+                <table style="width:100%;border-collapse:collapse;font-size:11px;font-family:'Courier New',monospace;">
+                    <tr>
+                        <td style="padding:5px 10px;border-bottom:1px solid #e2e8f0;width:60%;font-weight:600;color:#475569;">Gross Invoiced Revenue (All Time)</td>
+                        <td style="padding:5px 10px;border-bottom:1px solid #e2e8f0;text-align:right;font-weight:700;font-size:13px;">₱ <?php echo number_format($total_billed,2);?></td>
+                    </tr>
+                    <tr>
+                        <td style="padding:5px 10px;border-bottom:1px solid #e2e8f0;font-weight:600;color:#059669;">Total Amount Collected (Cash & Digital)</td>
+                        <td style="padding:5px 10px;border-bottom:1px solid #e2e8f0;text-align:right;font-weight:700;color:#059669;">₱ <?php echo number_format($total_collected,2);?></td>
+                    </tr>
+                    <tr>
+                        <td style="padding:5px 10px;border-bottom:2px solid #1A2332;font-weight:600;color:#d97706;">Outstanding Accounts Receivable (Unpaid)</td>
+                        <td style="padding:5px 10px;border-bottom:2px solid #1A2332;text-align:right;font-weight:700;color:#d97706;">₱ <?php echo number_format($outstanding_balance,2);?></td>
+                    </tr>
+                </table>
+                <div style="display:flex;justify-content:space-between;margin-top:5px;font-size:9px;color:#94a3b8;padding:0 10px;">
+                    <span><?php echo $total_invoices_cnt; ?> total invoice(s) issued</span>
+                </div>
+            </div>
+
+            <!-- Client Feedback Section in Print -->
+            <div class="sec-title">II. Client Satisfaction & Ratings</div>
+            <?php $pf = $conn->query("SELECT f.*, u.fullname as client_name FROM feedbacks f JOIN users u ON f.user_id = u.id ORDER BY f.created_at DESC LIMIT 10"); ?>
+            <?php if ($pf && $pf->num_rows > 0): ?>
+            <table class="med-table"><thead><tr><th>Client</th><th>Rating</th><th>Comment</th><th>Date</th></tr></thead><tbody>
+            <?php while($fb = $pf->fetch_assoc()): ?>
+            <tr><td><strong><?php echo htmlspecialchars($fb['client_name']); ?></strong></td><td><span style="background:<?php echo $fb['rating']>=4?'#059669':($fb['rating']>=3?'#d97706':'#dc2626');?>;color:white;padding:1px 8px;border-radius:10px;font-weight:700;font-size:11px;"><?php echo $fb['rating'];?>.0</span></td><td style="font-style:italic;"><?php echo $fb['comments']?'"'.htmlspecialchars($fb['comments']).'"':'<span style="color:#94a3b8;">—</span>';?></td><td><?php echo date('M d, Y', strtotime($fb['created_at']));?></td></tr>
+            <?php endwhile; ?>
+            </tbody></table>
+            <?php endif; ?>
+
+            <div class="doc-footer">
+                <div class="signature-area">
+                    <div class="signature-box"><div class="signature-line">Attending Veterinarian</div><p style="font-size:10px;color:#64748b;margin-top:4px;">License No.: ______________</p></div>
+                    <div class="signature-box"><div class="signature-line">Clinic Administrator</div><p style="font-size:10px;color:#64748b;margin-top:4px;">Authorized Signature</p></div>
+                    <div class="signature-box"><div class="signature-line">Date Issued</div><p style="font-size:11px;color:#1A2332;margin-top:4px;"><?php echo date('F d, Y'); ?></p></div>
+                </div>
+                <p style="margin-top:15px;"><strong>PragmaVet Veterinary Management System</strong> — Report VET-<?php echo date('Ymd-His'); ?> | <?php echo date('F d, Y \a\t h:i A'); ?></p>
+                <p>&copy; <?php echo date('Y'); ?> PragmaVet Animal Clinic. All rights reserved.</p>
+            </div>
+        </div>
+
+    </div><!-- /main-content -->
+
+    <!-- DISPATCH ALERT / RECALL NOTICE MODAL -->
+    <div class="modal fade" id="alertModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content border-0 shadow-lg rounded-4">
+                <form method="POST" action="admin.php">
+                    <div class="modal-header border-0 pb-0">
+                        <h5 class="modal-title fw-bold text-dark"><i class="fa fa-bell text-warning me-2"></i> Dispatch Client Alert</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body p-4">
+                        <div class="mb-3">
+                            <label class="form-label small fw-bold text-muted">Select Target Client</label>
+                            <select name="client_id" class="form-select" required>
+                                <option value="">-- Choose Client --</option>
+                                <?php if ($client_users_q && $client_users_q->num_rows > 0): ?>
+                                    <?php while ($c_user = $client_users_q->fetch_assoc()): ?>
+                                        <option value="<?= $c_user['id'] ?>">
+                                            <?= htmlspecialchars($c_user['fullname']) ?> (<?= htmlspecialchars($c_user['email']) ?>)
+                                        </option>
+                                    <?php endwhile; ?>
+                                <?php endif; ?>
+                            </select>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label small fw-bold text-muted">Alert Notification Type</label>
+                            <select name="type" class="form-select" required>
+                                <option value="Vaccination Booster Reminder">Vaccination Booster Reminder</option>
+                                <option value="Appointment Follow-Up">Appointment Follow-Up Notice</option>
+                                <option value="Medication Refill">Medication Refill Alert</option>
+                                <option value="General Clinic Notice">General Clinic Notice</option>
+                            </select>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label small fw-bold text-muted">Message Content</label>
+                            <textarea name="message" class="form-control" rows="4" placeholder="Enter message text sent directly to client portal..." required></textarea>
+                        </div>
+                    </div>
+                    <div class="modal-footer border-0 pt-0 d-flex justify-content-between">
+                        <button type="button" class="btn btn-light rounded-pill px-4" data-bs-dismiss="modal">Cancel</button>
+                        <button type="submit" name="send_alert" class="btn btn-primary rounded-pill px-4 shadow-sm">
+                            <i class="fa fa-paper-plane me-1.5"></i> Send Notice
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Chart JS Implementation -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        const monthlyLabels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        const monthlyCurrent = <?php echo json_encode(array_values($monthly_current)); ?>;
+        const monthlyPrevious = <?php echo json_encode(array_values($monthly_prev)); ?>;
+
+        const weeklyLabels = <?php echo json_encode($weekly_labels); ?>;
+        const weeklyCurrent = <?php echo json_encode($weekly_current); ?>;
+        const weeklyPrevious = <?php echo json_encode($weekly_prev); ?>;
+
+        function generateChartExplanation(data) {
+            const sum = data.reduce((a, b) => a + b, 0);
+            if (!data || sum === 0) return "No billing data recorded for this timeframe.";
+            
+            const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+            const maxVal = Math.max(...data);
+            const maxMonth = months[data.indexOf(maxVal)];
+            
+            return `Monthly revenue shows active billing with a peak of ₱${maxVal.toLocaleString(undefined, {minimumFractionDigits: 2})} recorded in ${maxMonth}.`;
+        }
+
+        function generateDistributionExplanation(labels, data, context) {
+            if (!data || data.length === 0) return "Insufficient data.";
+            let total = data.reduce((a, b) => a + b, 0);
+            if (total === 0) return "No activity recorded.";
+            
+            let maxVal = Math.max(...data);
+            let topIndex = data.indexOf(maxVal);
+            let topLabel = labels[topIndex];
+            let topPercent = Math.round((maxVal / total) * 100);
+
+            if (context === 'feedback') {
+                return `Client feedback is centered in '${topLabel}' (${topPercent}% of reviews), reflecting client satisfaction.`;
+            } else {
+                return `'${topLabel}' represents ${topPercent}% of clinical volume.`;
+            }
+        }
+
+        const apptLabels = <?php echo json_encode($appt_labels); ?>;
+        const apptData = <?php echo json_encode($appt_data); ?>;
+
+        const feedbackLabels = ['Poor', 'Fair', 'Good', 'Very Good', 'Excellent'];
+        const feedbackData = <?php echo json_encode(array_values($rating_dist)); ?>;
+
+        window.addEventListener('DOMContentLoaded', () => {
+            const summaryElem = document.getElementById('performanceSummary');
+            if(summaryElem) summaryElem.innerText = generateChartExplanation(monthlyCurrent);
+
+            const apptElem = document.getElementById('appointmentSummary');
+            if(apptElem) apptElem.innerText = generateDistributionExplanation(apptLabels, apptData, 'appointments');
+
+            const feedElem = document.getElementById('feedbackSummary');
+            if(feedElem) feedElem.innerText = generateDistributionExplanation(feedbackLabels, feedbackData, 'feedback');
+        });
+
+        // Revenue Area Chart
+        const ctx = document.getElementById('revenueChart').getContext('2d');
+        let revenueChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: monthlyLabels,
+                datasets: [
+                    {
+                        label: 'Total Billed (Monthly)',
+                        data: monthlyCurrent,
+                        borderColor: '#2563eb',
+                        backgroundColor: 'rgba(37, 99, 235, 0.1)',
+                        borderWidth: 3,
+                        tension: 0.4,
+                        fill: true,
+                        pointBackgroundColor: '#2563eb',
+                        pointBorderColor: '#fff',
+                        pointBorderWidth: 2,
+                        pointRadius: 4
+                    },
+                    {
+                        label: 'Previous Year',
+                        data: monthlyPrevious,
+                        borderColor: '#A0AEC0',
+                        borderDash: [5, 5],
+                        backgroundColor: 'transparent',
+                        borderWidth: 2,
+                        tension: 0.4,
+                        fill: false,
+                        pointRadius: 0
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        ticks: { callback: v => '₱' + Number(v).toLocaleString() }
+                    }
+                }
+            }
+        });
+
+        // Toggle Month / Week
+        document.getElementById('timeFilter').addEventListener('change', function() {
+            if (this.value === 'week') {
+                revenueChart.data.labels = weeklyLabels;
+                revenueChart.data.datasets[0].data = weeklyCurrent;
+                revenueChart.data.datasets[0].label = 'Total Billed (Weekly)';
+                revenueChart.data.datasets[1].data = weeklyPrevious;
+            } else {
+                revenueChart.data.labels = monthlyLabels;
+                revenueChart.data.datasets[0].data = monthlyCurrent;
+                revenueChart.data.datasets[0].label = 'Total Billed (Monthly)';
+                revenueChart.data.datasets[1].data = monthlyPrevious;
+            }
+            revenueChart.update();
+        });
+
+        // Appointment Doughnut
+        new Chart(document.getElementById('typeChart'), {
+            type: 'doughnut',
+            data: {
+                labels: apptLabels,
+                datasets: [{
+                    data: apptData,
+                    backgroundColor: ['#2563eb','#7c3aed','#0891b2','#ea580c','#15803d','#be123c','#d97706','#4f46e5'],
+                    borderWidth: 2,
+                    borderColor: '#ffffff'
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                cutout: '65%'
+            }
+        });
+
+        // 30-Day Trend
+        const TREND_LABELS = <?=json_encode($trend_labels)?>;
+        const TREND_DATA   = <?=json_encode(array_values($trend_data))?>;
+        new Chart(document.getElementById('trendChart'), {
+            type: 'line',
+            data: {
+                labels: TREND_LABELS,
+                datasets:[{
+                    label:'Appointments',
+                    data: TREND_DATA,
+                    borderColor:'#2563eb',
+                    backgroundColor:'rgba(37,99,235,.08)',
+                    fill:true,
+                    tension:.4,
+                    pointRadius:2,
+                    borderWidth:2
+                }]
+            },
+            options:{
+                responsive:true,
+                scales:{
+                    x:{ticks:{font:{size:9},maxTicksLimit:8},grid:{display:false}},
+                    y:{ticks:{font:{size:10},stepSize:1,precision:0},grid:{color:'rgba(0,0,0,.04)'}}
+                }
+            }
+        });
+
+        // Peak Hours Bar
+        const PEAK_DATA = <?=json_encode(array_values($peak_hours))?>;
+        const peakLabels = [], peakVals = [];
+        for (let h=7; h<=19; h++) {
+            peakLabels.push(h<12?h+'am':(h===12?'12pm':(h-12)+'pm'));
+            peakVals.push(PEAK_DATA[h]||0);
+        }
+        new Chart(document.getElementById('peakChart'), {
+            type: 'bar',
+            data:{
+                labels: peakLabels,
+                datasets:[{
+                    label:'Visits',
+                    data: peakVals,
+                    backgroundColor: peakVals.map(v => v===Math.max(...peakVals)?'#ea580c':'rgba(234,88,12,.25)'),
+                    borderRadius:6
+                }]
+            },
+            options:{
+                responsive:true,
+                plugins:{legend:{display:false}},
+                scales:{
+                    x:{ticks:{font:{size:9}},grid:{display:false}},
+                    y:{ticks:{font:{size:10},stepSize:1,precision:0},grid:{color:'rgba(0,0,0,.04)'}}
+                }
+            }
+        });
+    </script>
+</body>
+
+</html>

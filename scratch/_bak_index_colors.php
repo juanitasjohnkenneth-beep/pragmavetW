@@ -1,0 +1,3679 @@
+﻿<?php
+session_start();
+include("dbconnection.php");
+
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\Exception;
+require 'PHPMailer/src/Exception.php';
+require 'PHPMailer/src/PHPMailer.php';
+require 'PHPMailer/src/SMTP.php';
+
+
+// Handle Login
+if (isset($_POST['login'])) {
+    $email = $_POST['email'];
+    $password = $_POST['password'];
+
+    $stmt = $conn->prepare("SELECT * FROM users WHERE email=?");
+    $stmt->bind_param("s", $email);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    if ($result->num_rows > 0) {
+        $row = $result->fetch_assoc();
+
+        // Check Lockout Status First
+        if ($row['locked_until'] !== null && strtotime($row['locked_until']) > time()) {
+            $_SESSION['message'] = "Account locked due to multiple failed attempts. Please wait or use 'Forgot Password'.";
+            $_SESSION['msg_type'] = "danger";
+            $_SESSION['show_modal'] = 'login';
+            $_SESSION['login_email'] = $email;
+            header("Location: index.php");
+            exit();
+        }
+
+        if (password_verify($password, $row['password'])) {
+            // --- 2FA VERIFICATION GUARD (only after the password is correct) ---
+            if ($row['is_verified'] == 0) {
+                session_regenerate_id(true);
+                $_SESSION['otp_email'] = $email; // the OTP page only works for the account that just proved its password
+                header("Location: otp.php?email=" . urlencode($email));
+                exit();
+            }
+
+            // Reset attempts on successful login
+            $conn->query("UPDATE users SET failed_attempts=0, locked_until=NULL WHERE id=" . $row['id']);
+            session_regenerate_id(true); // new session ID on login (prevents session fixation)
+
+            $_SESSION['user_id'] = $row['id'];
+            $_SESSION['user'] = $row['fullname'];
+            $_SESSION['role'] = $row['role'];
+            $_SESSION['user_role'] = $row['role'];
+
+            $updateStmt = $conn->prepare("UPDATE users SET last_login = NOW() WHERE id=?");
+            $updateStmt->bind_param("i", $row['id']);
+            $updateStmt->execute();
+
+            if ($row['force_password_change'] == 1) {
+                header("Location: force_change.php");
+                exit();
+            }
+
+            if ($row['role'] == 'admin') {
+                header("Location: admin.php");
+            } elseif ($row['role'] == 'doctor') {
+                header("Location: doctor.php");
+            } elseif ($row['role'] == 'clinic_owner' || $row['role'] == 'owner') {
+                header("Location: owner_dashboard.php");
+            } elseif ($row['role'] == 'staff') {
+                header("Location: staff_dashboard.php");
+            } else {
+                header("Location: dashboard.php");
+            }
+            exit();
+        } else {
+            // Failed Login - Increment attempts
+            $new_attempts = intval($row['failed_attempts']) + 1;
+            if ($new_attempts >= 5) {
+                // Lock for 15 minutes
+                $conn->query("UPDATE users SET failed_attempts=5, locked_until=DATE_ADD(NOW(), INTERVAL 15 MINUTE) WHERE id=" . $row['id']);
+                $_SESSION['message'] = "Account locked due to 5 failed login attempts. Try again in 15 minutes.";
+            } else {
+                $rem = 5 - $new_attempts;
+                $conn->query("UPDATE users SET failed_attempts=$new_attempts WHERE id=" . $row['id']);
+                $_SESSION['message'] = "Invalid Password! $rem attempt(s) remaining before lockout.";
+            }
+            $_SESSION['msg_type'] = "danger";
+            $_SESSION['show_modal'] = 'login';
+            $_SESSION['login_email'] = $email;
+        }
+    } else {
+        $_SESSION['message'] = "Email not found!";
+        $_SESSION['msg_type'] = "danger";
+        $_SESSION['show_modal'] = 'login';
+        $_SESSION['login_email'] = $email;
+    }
+    header("Location: index.php");
+    exit();
+}
+
+// ==================== FORGOT PASSWORD (AJAX-HANDLED) ====================
+// Step is managed client-side via AJAX; session is used on the server side
+$fp_step    = $_SESSION['fp_step'] ?? 1;
+
+// Fetch Active Public Announcements
+$active_announcements = $conn->query("SELECT * FROM announcements WHERE is_active=1 ORDER BY created_at DESC");
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>PragmaVet | Secure Veterinary Management</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+
+    <style>
+        /* ============ ROOT VARIABLES ============ */
+        :root {
+            --primary: #0E5A6B;
+            --primary-dark: #083D4A;
+            --primary-light: #1E7FA8;
+            --accent: #5EC4E6;
+            --accent-light: #8FD8F0;
+            --dark: #1A2332;
+            --gray-100: #F8FAFC;
+            --gray-200: #F1F5F9;
+            --gray-300: #E2E8F0;
+            --gray-400: #94A3B8;
+            --gray-500: #64748B;
+            --gray-600: #475569;
+            --radius-sm: 12px;
+            --radius-md: 20px;
+            --radius-lg: 24px;
+            --radius-xl: 32px;
+            --shadow-sm: 0 4px 6px -1px rgba(0, 0, 0, 0.06), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+            --shadow-md: 0 10px 25px -5px rgba(0, 0, 0, 0.08), 0 8px 10px -6px rgba(0, 0, 0, 0.02);
+            --shadow-lg: 0 20px 45px -10px rgba(14, 90, 107, 0.15);
+            --shadow-xl: 0 30px 60px -10px rgba(14, 90, 107, 0.2);
+            --shadow-glow: 0 0 25px rgba(94, 196, 230, 0.3);
+            --gradient-primary: linear-gradient(135deg, #0E5A6B 0%, #1E7FA8 50%, #5EC4E6 100%);
+            --gradient-dark: linear-gradient(135deg, #1A2332 0%, #0E5A6B 100%);
+            --gradient-accent: linear-gradient(135deg, #5EC4E6 0%, #1E7FA8 100%);
+            --gradient-section: linear-gradient(135deg, #F8FAFC 0%, #E8F4F8 100%);
+            --gradient-hero: linear-gradient(135deg, #0E5A6B 0%, #1E7FA8 50%, #0E5A6B 100%);
+            --transition: all 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+            --transition-fast: all 0.2s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+            --transition-slow: all 0.6s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+        }
+
+        /* ============ BASE ============ */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html {
+            scroll-behavior: smooth;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--gray-100);
+            color: var(--dark);
+            overflow-x: hidden;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        ::selection {
+            background: var(--accent);
+            color: var(--primary-dark);
+        }
+
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--gray-200);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--primary-light);
+            border-radius: 10px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--primary);
+        }
+
+        /* ============ SCROLL REVEAL ANIMATIONS ============ */
+        .reveal {
+            opacity: 0;
+            transform: translateY(40px);
+            transition: opacity 0.8s cubic-bezier(0.25, 0.46, 0.45, 0.94), transform 0.8s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+        }
+
+        .reveal.visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .reveal-left {
+            opacity: 0;
+            transform: translateX(-50px);
+            transition: opacity 0.8s ease, transform 0.8s ease;
+        }
+
+        .reveal-left.visible {
+            opacity: 1;
+            transform: translateX(0);
+        }
+
+        .reveal-right {
+            opacity: 0;
+            transform: translateX(50px);
+            transition: opacity 0.8s ease, transform 0.8s ease;
+        }
+
+        .reveal-right.visible {
+            opacity: 1;
+            transform: translateX(0);
+        }
+
+        .reveal-scale {
+            opacity: 0;
+            transform: scale(0.9);
+            transition: opacity 0.8s ease, transform 0.8s ease;
+        }
+
+        .reveal-scale.visible {
+            opacity: 1;
+            transform: scale(1);
+        }
+
+        .reveal-stagger>* {
+            opacity: 0;
+            transform: translateY(30px);
+            transition: opacity 0.6s ease, transform 0.6s ease;
+        }
+
+        .reveal-stagger.visible>*:nth-child(1) {
+            opacity: 1;
+            transform: translateY(0);
+            transition-delay: 0.1s;
+        }
+        .reveal-stagger.visible>*:nth-child(2) {
+            opacity: 1;
+            transform: translateY(0);
+            transition-delay: 0.2s;
+        }
+        .reveal-stagger.visible>*:nth-child(3) {
+            opacity: 1;
+            transform: translateY(0);
+            transition-delay: 0.3s;
+        }
+        .reveal-stagger.visible>*:nth-child(4) {
+            opacity: 1;
+            transform: translateY(0);
+            transition-delay: 0.4s;
+        }
+        .reveal-stagger.visible>*:nth-child(5) {
+            opacity: 1;
+            transform: translateY(0);
+            transition-delay: 0.5s;
+        }
+        .reveal-stagger.visible>*:nth-child(6) {
+            opacity: 1;
+            transform: translateY(0);
+            transition-delay: 0.6s;
+        }
+
+        /* ============ SCROLL PROGRESS BAR ============ */
+        #scroll-progress {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 3px;
+            background: var(--gradient-accent);
+            z-index: 10000;
+            width: 0%;
+            transition: width 0.1s linear;
+            box-shadow: 0 0 10px rgba(94, 196, 230, 0.5);
+        }
+
+        /* ============ BACK TO TOP ============ */
+        #back-to-top {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            background: var(--gradient-accent);
+            color: white;
+            border: none;
+            font-size: 20px;
+            cursor: pointer;
+            opacity: 0;
+            transform: translateY(20px) scale(0.8);
+            transition: var(--transition);
+            box-shadow: var(--shadow-glow);
+            z-index: 9999;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        #back-to-top.visible {
+            opacity: 1;
+            transform: translateY(0) scale(1);
+        }
+
+        #back-to-top:hover {
+            transform: translateY(-5px) scale(1.1);
+            box-shadow: 0 0 40px rgba(94, 196, 230, 0.5);
+        }
+
+        /* ============ CURSOR PAW TRAIL ============ */
+        .paw-trail {
+            position: fixed;
+            pointer-events: none;
+            z-index: 99999;
+            font-size: 18px;
+            animation: pawFade 1.2s ease-out forwards;
+        }
+
+        @keyframes pawFade {
+            0% {
+                opacity: 1;
+                transform: translate(0, 0) scale(1) rotate(0deg);
+            }
+            50% {
+                opacity: 0.7;
+                transform: translate(10px, -20px) scale(0.8) rotate(15deg);
+            }
+            100% {
+                opacity: 0;
+                transform: translate(20px, -40px) scale(0.4) rotate(30deg);
+            }
+        }
+
+        /* ============ TOP BAR ============ */
+        .top-bar {
+            background: var(--dark);
+            color: rgba(255, 255, 255, 0.9);
+            font-size: 13px;
+            padding: 10px 0;
+            font-weight: 500;
+            position: relative;
+            z-index: 1031;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .top-bar i {
+            color: var(--accent) !important;
+        }
+
+        .top-bar strong {
+            color: white;
+            font-weight: 700;
+        }
+
+        /* ============ NAVBAR ============ */
+        .navbar {
+            background: rgba(255, 255, 255, 0.85) !important;
+            backdrop-filter: blur(20px) saturate(180%);
+            -webkit-backdrop-filter: blur(20px) saturate(180%);
+            box-shadow: none;
+            padding: 12px 0;
+            transition: var(--transition);
+            border-bottom: 1px solid transparent;
+        }
+
+        .navbar.scrolled {
+            background: rgba(255, 255, 255, 0.95) !important;
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.08);
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(226, 232, 240, 0.5);
+        }
+
+        .navbar-brand {
+            background: var(--gradient-accent);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            font-weight: 900;
+            font-size: 26px;
+            letter-spacing: -0.8px;
+            position: relative;
+            transition: var(--transition);
+        }
+
+        .navbar-brand i {
+            -webkit-text-fill-color: initial;
+            background: var(--gradient-accent);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            margin-right: 4px;
+        }
+
+        .navbar-brand:hover {
+            transform: scale(1.02);
+        }
+
+        .nav-link {
+            color: var(--gray-600) !important;
+            font-weight: 600;
+            font-size: 14.5px;
+            margin: 0 8px;
+            padding: 8px 12px !important;
+            position: relative;
+            transition: var(--transition);
+            border-radius: 8px;
+        }
+
+        .nav-link::before {
+            content: '';
+            position: absolute;
+            bottom: 2px;
+            left: 50%;
+            width: 0;
+            height: 3px;
+            background: var(--gradient-accent);
+            border-radius: 3px;
+            transform: translateX(-50%);
+            transition: var(--transition);
+        }
+
+        .nav-link:hover {
+            color: var(--primary) !important;
+            background: rgba(94, 196, 230, 0.06);
+        }
+
+        .nav-link:hover::before {
+            width: 60%;
+        }
+
+        .nav-link.active {
+            color: var(--primary) !important;
+        }
+
+        .nav-link.active::before {
+            width: 60%;
+        }
+
+        .btn-login-nav {
+            background: var(--gradient-accent);
+            color: white !important;
+            border: none;
+            padding: 10px 28px !important;
+            border-radius: 50px;
+            font-weight: 700;
+            font-size: 14px;
+            transition: var(--transition);
+            box-shadow: 0 4px 15px rgba(94, 196, 230, 0.3);
+            margin-left: 12px;
+        }
+
+        .btn-login-nav:hover {
+            transform: translateY(-2px) scale(1.02);
+            box-shadow: 0 8px 25px rgba(94, 196, 230, 0.45);
+            background: var(--gradient-accent) !important;
+            color: white !important;
+        }
+
+        .btn-login-nav::before {
+            display: none;
+        }
+
+        .btn-outline-dashboard {
+            border: 2px solid var(--primary-light);
+            color: var(--primary) !important;
+            border-radius: 50px;
+            padding: 8px 22px !important;
+            font-weight: 700;
+            font-size: 14px;
+            transition: var(--transition);
+        }
+
+        .btn-outline-dashboard:hover {
+            background: var(--primary);
+            color: white !important;
+            border-color: var(--primary);
+            transform: translateY(-2px);
+        }
+
+        .btn-outline-dashboard::before {
+            display: none;
+        }
+
+        /* ============ FLOATING DECORATIVE SHAPES ============ */
+        .floating-shape {
+            position: absolute;
+            border-radius: 50%;
+            pointer-events: none;
+            opacity: 0.15;
+            z-index: 0;
+        }
+
+        @keyframes float1 {
+            0%,
+            100% {
+                transform: translate(0, 0) scale(1);
+            }
+            33% {
+                transform: translate(30px, -30px) scale(1.05);
+            }
+            66% {
+                transform: translate(-20px, 20px) scale(0.95);
+            }
+        }
+
+        @keyframes float2 {
+            0%,
+            100% {
+                transform: translate(0, 0) scale(1);
+            }
+            33% {
+                transform: translate(-25px, -20px) scale(1.03);
+            }
+            66% {
+                transform: translate(20px, 25px) scale(0.97);
+            }
+        }
+
+        @keyframes float3 {
+            0%,
+            100% {
+                transform: translate(0, 0) rotate(0deg);
+            }
+            50% {
+                transform: translate(15px, -15px) rotate(5deg);
+            }
+        }
+
+        /* ============ HERO ============ */
+        .hero {
+            position: relative;
+            padding: 160px 0 120px;
+            background: var(--gradient-hero);
+            background-size: 300% 300%;
+            animation: gradientShift 10s ease infinite;
+            color: white;
+            text-align: center;
+            overflow: hidden;
+            min-height: 85vh;
+            display: flex;
+            align-items: center;
+        }
+
+        @keyframes gradientShift {
+            0% {
+                background-position: 0% 50%;
+            }
+            50% {
+                background-position: 100% 50%;
+            }
+            100% {
+                background-position: 0% 50%;
+            }
+        }
+
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background:
+                radial-gradient(ellipse at 20% 50%, rgba(94, 196, 230, 0.15) 0%, transparent 60%),
+                radial-gradient(ellipse at 80% 20%, rgba(30, 127, 168, 0.2) 0%, transparent 50%),
+                radial-gradient(ellipse at 50% 100%, rgba(14, 90, 107, 0.3) 0%, transparent 50%);
+            pointer-events: none;
+        }
+
+        .hero::after {
+            content: '';
+            position: absolute;
+            bottom: -2px;
+            left: 0;
+            right: 0;
+            height: 120px;
+            background: linear-gradient(to top, var(--gray-100), transparent);
+            pointer-events: none;
+            z-index: 1;
+        }
+
+        /* Floating decorative circles */
+        .hero-floating-1 {
+            position: absolute;
+            width: 500px;
+            height: 500px;
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(94, 196, 230, 0.1), transparent 70%);
+            top: -100px;
+            right: -100px;
+            animation: float1 12s ease-in-out infinite;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .hero-floating-2 {
+            position: absolute;
+            width: 400px;
+            height: 400px;
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(30, 127, 168, 0.12), transparent 70%);
+            bottom: -50px;
+            left: -150px;
+            animation: float2 15s ease-in-out infinite;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .hero-floating-3 {
+            position: absolute;
+            width: 200px;
+            height: 200px;
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(94, 196, 230, 0.08), transparent 70%);
+            top: 30%;
+            left: 10%;
+            animation: float3 8s ease-in-out infinite;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .hero .container {
+            position: relative;
+            z-index: 2;
+        }
+
+        .hero h1 {
+            font-weight: 900;
+            font-size: 4rem;
+            letter-spacing: -1.5px;
+            margin-bottom: 20px;
+            line-height: 1.1;
+            background: linear-gradient(to right, #ffffff, var(--accent-light));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .hero p {
+            font-size: 1.2rem;
+            font-weight: 400;
+            opacity: 0.85;
+            max-width: 600px;
+            margin: 0 auto 35px;
+            line-height: 1.7;
+        }
+
+        .hero-badge {
+            display: inline-block;
+            background: rgba(255, 255, 255, 0.12);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            padding: 8px 24px;
+            border-radius: 50px;
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--accent-light);
+            margin-bottom: 25px;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+
+        .hero-icons {
+            display: flex;
+            justify-content: center;
+            gap: 40px;
+            margin-top: 40px;
+        }
+
+        .hero-icon-item {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+            opacity: 0.7;
+            transition: var(--transition);
+            cursor: default;
+        }
+
+        .hero-icon-item:hover {
+            opacity: 1;
+            transform: translateY(-5px);
+        }
+
+        .hero-icon-item i {
+            font-size: 32px;
+            color: var(--accent);
+        }
+
+        .hero-icon-item span {
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        /* ============ BUTTONS ============ */
+        .btn-gradient {
+            background: var(--gradient-accent);
+            color: white;
+            border: none;
+            padding: 16px 40px;
+            font-weight: 700;
+            border-radius: 50px;
+            font-size: 16px;
+            transition: var(--transition);
+            box-shadow: 0 8px 25px rgba(94, 196, 230, 0.35);
+            position: relative;
+            overflow: hidden;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            text-decoration: none;
+        }
+
+        .btn-gradient::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+            transition: left 0.6s;
+        }
+
+        .btn-gradient:hover::before {
+            left: 100%;
+        }
+
+        .btn-gradient:hover {
+            transform: translateY(-3px) scale(1.02);
+            box-shadow: 0 12px 35px rgba(94, 196, 230, 0.5);
+            color: white;
+        }
+
+        .btn-gradient:active {
+            transform: translateY(0) scale(0.98);
+        }
+
+        .btn-gradient-sm {
+            padding: 12px 28px;
+            font-size: 14px;
+        }
+
+        .btn-outline-light-custom {
+            background: transparent;
+            color: white;
+            border: 2px solid rgba(255, 255, 255, 0.4);
+            padding: 14px 36px;
+            font-weight: 700;
+            border-radius: 50px;
+            font-size: 16px;
+            transition: var(--transition);
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            text-decoration: none;
+        }
+
+        .btn-outline-light-custom:hover {
+            background: rgba(255, 255, 255, 0.12);
+            border-color: rgba(255, 255, 255, 0.7);
+            transform: translateY(-3px);
+            box-shadow: 0 8px 25px rgba(255, 255, 255, 0.1);
+            color: white;
+        }
+
+        /* Ripple Effect */
+        .ripple {
+            position: relative;
+            overflow: hidden;
+        }
+
+        .ripple-effect {
+            position: absolute;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.4);
+            transform: scale(0);
+            animation: rippleAnim 0.6s linear;
+            pointer-events: none;
+        }
+
+        @keyframes rippleAnim {
+            to {
+                transform: scale(4);
+                opacity: 0;
+            }
+        }
+
+        /* ============ SECTION STYLES ============ */
+        section {
+            position: relative;
+        }
+
+        .section-label {
+            display: inline-block;
+            background: rgba(94, 196, 230, 0.1);
+            color: var(--primary-light);
+            padding: 6px 20px;
+            border-radius: 50px;
+            font-size: 13px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            margin-bottom: 16px;
+            border: 1px solid rgba(94, 196, 230, 0.15);
+        }
+
+        .section-title {
+            font-weight: 800;
+            font-size: 2.5rem;
+            letter-spacing: -0.5px;
+            margin-bottom: 16px;
+            color: var(--dark);
+        }
+
+        .section-subtitle {
+            color: var(--gray-500);
+            font-size: 1.1rem;
+            max-width: 600px;
+            line-height: 1.7;
+        }
+
+        /* ============ ANNOUNCEMENTS TICKER ============ */
+        .announcement-ticker {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 50px;
+            padding: 6px 6px 6px 20px;
+            border: 1px solid rgba(226, 232, 240, 0.5);
+            box-shadow: var(--shadow-md);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            max-width: 1000px;
+            margin: 0 auto;
+            position: relative;
+            top: -30px;
+            z-index: 10;
+        }
+
+        .announcement-badge {
+            background: var(--gradient-accent);
+            color: white;
+            padding: 8px 20px;
+            border-radius: 50px;
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            white-space: nowrap;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-shrink: 0;
+        }
+
+        .announcement-marquee {
+            overflow: hidden;
+            white-space: nowrap;
+            flex: 1;
+            padding: 8px 0;
+            position: relative;
+        }
+
+        .announcement-marquee-inner {
+            display: inline-block;
+            animation: marqueeScroll 25s linear infinite;
+            white-space: nowrap;
+        }
+
+        .announcement-marquee-inner:hover {
+            animation-play-state: paused;
+        }
+
+        @keyframes marqueeScroll {
+            0% {
+                transform: translateX(0);
+            }
+            100% {
+                transform: translateX(-50%);
+            }
+        }
+
+        .announcement-item {
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            margin-right: 40px;
+            font-size: 14px;
+            color: var(--gray-600);
+        }
+
+        .announcement-item strong {
+            color: var(--primary);
+        }
+
+        .announcement-date {
+            background: var(--gray-200);
+            padding: 2px 12px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--gray-500);
+        }
+
+        /* ============ FEATURE CARDS ============ */
+        .feature-card {
+            background: white;
+            border-radius: var(--radius-md);
+            padding: 40px 32px;
+            box-shadow: var(--shadow-sm);
+            border: 1px solid var(--gray-200);
+            transition: var(--transition);
+            height: 100%;
+            text-align: center;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .feature-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: var(--gradient-accent);
+            transform: scaleX(0);
+            transform-origin: left;
+            transition: transform 0.6s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+        }
+
+        .feature-card:hover::before {
+            transform: scaleX(1);
+        }
+
+        .feature-card:hover {
+            transform: translateY(-12px);
+            box-shadow: var(--shadow-lg);
+            border-color: rgba(94, 196, 230, 0.2);
+        }
+
+        .feature-icon {
+            width: 80px;
+            height: 80px;
+            background: linear-gradient(135deg, rgba(94, 196, 230, 0.1), rgba(30, 127, 168, 0.05));
+            color: var(--primary-light);
+            border-radius: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 34px;
+            margin: 0 auto 24px;
+            transition: var(--transition);
+            position: relative;
+        }
+
+        .feature-icon::after {
+            content: '';
+            position: absolute;
+            inset: -3px;
+            border-radius: 23px;
+            border: 2px solid transparent;
+            background: var(--gradient-accent) border-box;
+            -webkit-mask: linear-gradient(#fff 0 0) padding-box, linear-gradient(#fff 0 0);
+            mask: linear-gradient(#fff 0 0) padding-box, linear-gradient(#fff 0 0);
+            -webkit-mask-composite: xor;
+            mask-composite: exclude;
+            opacity: 0;
+            transition: var(--transition);
+        }
+
+        .feature-card:hover .feature-icon::after {
+            opacity: 1;
+        }
+
+        .feature-card:hover .feature-icon {
+            background: var(--gradient-accent);
+            color: white;
+            transform: scale(1.1) rotate(-3deg);
+            box-shadow: var(--shadow-glow);
+        }
+
+        .feature-card h5 {
+            font-weight: 700;
+            margin-bottom: 14px;
+            font-size: 1.2rem;
+            color: var(--dark);
+        }
+
+        .feature-card p {
+            color: var(--gray-500);
+            font-size: 15px;
+            line-height: 1.7;
+            margin-bottom: 0;
+        }
+
+        /* ============ HOW IT WORKS (STEPS) ============ */
+        .step-card {
+            padding: 40px 30px;
+            text-align: center;
+            position: relative;
+            background: white;
+            border-radius: var(--radius-md);
+            box-shadow: var(--shadow-sm);
+            border: 1px solid var(--gray-200);
+            transition: var(--transition);
+            height: 100%;
+        }
+
+        .step-card:hover {
+            transform: translateY(-8px);
+            box-shadow: var(--shadow-lg);
+            border-color: rgba(94, 196, 230, 0.2);
+        }
+
+        .step-circle {
+            width: 70px;
+            height: 70px;
+            background: var(--gradient-accent);
+            color: white;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 28px;
+            font-weight: 900;
+            margin: 0 auto 24px;
+            box-shadow: 0 10px 25px rgba(94, 196, 230, 0.3);
+            position: relative;
+            z-index: 2;
+            transition: var(--transition);
+        }
+
+        .step-card:hover .step-circle {
+            transform: scale(1.1);
+            box-shadow: 0 15px 35px rgba(94, 196, 230, 0.4);
+        }
+
+        .step-card h5 {
+            font-weight: 700;
+            color: var(--dark);
+            font-size: 1.15rem;
+            margin-bottom: 12px;
+        }
+
+        .step-card p {
+            color: var(--gray-500);
+            font-size: 15px;
+            line-height: 1.7;
+        }
+
+        /* Step connector line */
+        .step-connector {
+            display: none;
+        }
+
+        @media (min-width: 768px) {
+            .step-connector {
+                display: block;
+                position: absolute;
+                top: 35px;
+                right: -30px;
+                width: 60px;
+                height: 2px;
+                background: linear-gradient(90deg, var(--accent), transparent);
+                z-index: 1;
+            }
+        }
+
+        /* ============ DOCTOR CARDS ============ */
+        .doctor-card {
+            background: white;
+            border-radius: var(--radius-md);
+            overflow: hidden;
+            box-shadow: var(--shadow-sm);
+            transition: var(--transition);
+            text-align: center;
+            height: 100%;
+            border: 1px solid var(--gray-200);
+            position: relative;
+        }
+
+        .doctor-card:hover {
+            transform: translateY(-12px);
+            box-shadow: var(--shadow-xl);
+            border-color: rgba(94, 196, 230, 0.3);
+        }
+
+        .doctor-img-wrapper {
+            overflow: hidden;
+            aspect-ratio: 1 / 1;
+            position: relative;
+        }
+
+        .doctor-img-wrapper::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(to top, rgba(14, 90, 107, 0.4), transparent 50%);
+            opacity: 0;
+            transition: var(--transition);
+        }
+
+        .doctor-card:hover .doctor-img-wrapper::after {
+            opacity: 1;
+        }
+
+        .doctor-img-wrapper img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            object-position: center 15%;
+            transition: transform 0.8s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+        }
+
+        .doctor-card:hover .doctor-img-wrapper img {
+            transform: scale(1.1);
+        }
+
+        .doctor-specialization-badge {
+            position: absolute;
+            top: 16px;
+            left: 16px;
+            background: rgba(255, 255, 255, 0.92);
+            backdrop-filter: blur(10px);
+            padding: 6px 16px;
+            border-radius: 50px;
+            font-size: 11px;
+            font-weight: 700;
+            color: var(--primary);
+            z-index: 2;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .doctor-socials {
+            position: absolute;
+            bottom: 16px;
+            right: 16px;
+            display: flex;
+            gap: 8px;
+            z-index: 2;
+            opacity: 0;
+            transform: translateY(10px);
+            transition: var(--transition);
+        }
+
+        .doctor-card:hover .doctor-socials {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .doctor-socials a {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.9);
+            backdrop-filter: blur(5px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--primary);
+            font-size: 15px;
+            transition: var(--transition);
+            text-decoration: none;
+        }
+
+        .doctor-socials a:hover {
+            background: var(--gradient-accent);
+            color: white;
+            transform: scale(1.15);
+        }
+
+        .doctor-info {
+            padding: 28px 20px 24px;
+        }
+
+        .doctor-info h5 {
+            font-weight: 700;
+            color: var(--dark);
+            margin-bottom: 4px;
+            font-size: 1.15rem;
+            transition: var(--transition);
+        }
+
+        .doctor-card:hover .doctor-info h5 {
+            color: var(--primary-light);
+        }
+
+        .doctor-info .doctor-title {
+            color: var(--gray-500);
+            margin-bottom: 18px;
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+
+        .btn-profile {
+            opacity: 0;
+            transform: translateY(10px);
+            transition: var(--transition);
+            background: linear-gradient(135deg, rgba(94, 196, 230, 0.1), rgba(30, 127, 168, 0.05));
+            color: var(--primary-light);
+            font-weight: 700;
+            border-radius: 50px;
+            padding: 10px 28px;
+            font-size: 14px;
+            border: 1px solid rgba(94, 196, 230, 0.2);
+            cursor: pointer;
+            width: auto;
+        }
+
+        .doctor-card:hover .btn-profile {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .btn-profile:hover {
+            background: var(--gradient-accent);
+            color: white;
+            box-shadow: var(--shadow-glow);
+            border-color: transparent;
+        }
+
+        /* ============ GALLERY ============ */
+        .gallery-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 24px;
+        }
+
+        .gallery-item {
+            border-radius: var(--radius-md);
+            overflow: hidden;
+            height: 300px;
+            box-shadow: var(--shadow-sm);
+            position: relative;
+            cursor: pointer;
+            transition: var(--transition);
+        }
+
+        .gallery-item:hover {
+            box-shadow: var(--shadow-lg);
+            transform: translateY(-4px);
+        }
+
+        .gallery-item img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transition: transform 0.8s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+        }
+
+        .gallery-item:hover img {
+            transform: scale(1.1);
+        }
+
+        .gallery-overlay {
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(to top, rgba(14, 90, 107, 0.7), transparent 60%);
+            display: flex;
+            align-items: flex-end;
+            padding: 24px;
+            opacity: 0;
+            transition: var(--transition);
+        }
+
+        .gallery-item:hover .gallery-overlay {
+            opacity: 1;
+        }
+
+        .gallery-overlay span {
+            color: white;
+            font-weight: 700;
+            font-size: 16px;
+            background: rgba(255, 255, 255, 0.15);
+            backdrop-filter: blur(5px);
+            padding: 8px 20px;
+            border-radius: 50px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .gallery-expand-icon {
+            position: absolute;
+            top: 16px;
+            right: 16px;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.9);
+            backdrop-filter: blur(5px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--primary);
+            font-size: 16px;
+            opacity: 0;
+            transform: scale(0.8);
+            transition: var(--transition);
+        }
+
+        .gallery-item:hover .gallery-expand-icon {
+            opacity: 1;
+            transform: scale(1);
+        }
+
+        /* ============ LIGHTBOX ============ */
+        .lightbox {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.92);
+            backdrop-filter: blur(10px);
+            z-index: 99999;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            padding: 40px;
+        }
+
+        .lightbox.active {
+            display: flex;
+        }
+
+        .lightbox img {
+            max-width: 90vw;
+            max-height: 85vh;
+            border-radius: var(--radius-md);
+            box-shadow: 0 30px 80px rgba(0, 0, 0, 0.5);
+            transform: scale(0.9);
+            transition: transform 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+            object-fit: contain;
+        }
+
+        .lightbox.active img {
+            transform: scale(1);
+        }
+
+        .lightbox-close {
+            position: absolute;
+            top: 30px;
+            right: 30px;
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            color: white;
+            font-size: 22px;
+            cursor: pointer;
+            transition: var(--transition);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .lightbox-close:hover {
+            background: rgba(255, 255, 255, 0.2);
+            transform: rotate(90deg);
+        }
+
+        /* ============ LOCATION SECTION ============ */
+        .location-card {
+            background: white;
+            border-radius: var(--radius-md);
+            padding: 32px;
+            box-shadow: var(--shadow-sm);
+            border: 1px solid var(--gray-200);
+            height: 100%;
+            transition: var(--transition);
+        }
+
+        .location-card:hover {
+            box-shadow: var(--shadow-lg);
+            transform: translateY(-4px);
+        }
+
+        .location-card h3 {
+            font-weight: 800;
+            font-size: 1.4rem;
+            color: var(--dark);
+        }
+
+        .location-badge {
+            background: rgba(94, 196, 230, 0.1);
+            color: var(--primary-light);
+            padding: 6px 18px;
+            border-radius: 50px;
+            font-size: 12px;
+            font-weight: 700;
+            display: inline-block;
+        }
+
+        .location-info-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 14px;
+            margin-bottom: 18px;
+        }
+
+        .location-info-item i {
+            width: 36px;
+            height: 36px;
+            border-radius: 10px;
+            background: rgba(94, 196, 230, 0.1);
+            color: var(--primary-light);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+            flex-shrink: 0;
+        }
+
+        .location-info-item h6 {
+            font-weight: 700;
+            font-size: 0.85rem;
+            margin-bottom: 2px;
+            color: var(--dark);
+        }
+
+        .location-info-item p {
+            color: var(--gray-500);
+            font-size: 0.9rem;
+            margin: 0;
+            line-height: 1.5;
+        }
+
+        .btn-call {
+            background: var(--gradient-accent);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: var(--radius-sm);
+            font-weight: 700;
+            transition: var(--transition);
+            width: 100%;
+            text-decoration: none;
+            display: inline-block;
+            text-align: center;
+        }
+
+        .btn-call:hover {
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-glow);
+            color: white;
+        }
+
+        .btn-directions {
+            background: transparent;
+            color: var(--primary-light);
+            border: 2px solid var(--primary-light);
+            padding: 12px 24px;
+            border-radius: var(--radius-sm);
+            font-weight: 700;
+            transition: var(--transition);
+            width: 100%;
+            text-decoration: none;
+            display: inline-block;
+            text-align: center;
+        }
+
+        .btn-directions:hover {
+            background: var(--primary-light);
+            color: white;
+            transform: translateY(-2px);
+        }
+
+        .map-container {
+            border-radius: var(--radius-md);
+            overflow: hidden;
+            box-shadow: var(--shadow-sm);
+            border: 1px solid var(--gray-200);
+            height: 100%;
+            min-height: 400px;
+            transition: var(--transition);
+        }
+
+        .map-container:hover {
+            box-shadow: var(--shadow-lg);
+        }
+
+        .map-container iframe {
+            width: 100%;
+            height: 100%;
+            min-height: 400px;
+            border: 0;
+            display: block;
+        }
+
+        /* ============ CTA SECTION ============ */
+        .cta-section {
+            background: var(--gradient-dark);
+            position: relative;
+            overflow: hidden;
+            padding: 80px 0;
+        }
+
+        .cta-section::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background:
+                radial-gradient(ellipse at 20% 80%, rgba(94, 196, 230, 0.1) 0%, transparent 60%),
+                radial-gradient(ellipse at 80% 20%, rgba(30, 127, 168, 0.08) 0%, transparent 50%);
+            pointer-events: none;
+        }
+
+        .cta-section .container {
+            position: relative;
+            z-index: 2;
+        }
+
+        /* CTA paw prints floating */
+        .cta-paw {
+            position: absolute;
+            opacity: 0.04;
+            font-size: 60px;
+            color: white;
+            pointer-events: none;
+        }
+
+        /* ============ FOOTER ============ */
+        .footer {
+            background: var(--dark);
+            color: rgba(255, 255, 255, 0.85);
+            padding: 70px 0 30px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .footer::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: var(--gradient-accent);
+        }
+
+        .footer h4 {
+            font-weight: 800;
+            margin-bottom: 20px;
+            color: white;
+            font-size: 1.5rem;
+        }
+
+        .footer h5 {
+            font-weight: 700;
+            margin-bottom: 20px;
+            color: white;
+            font-size: 1.05rem;
+        }
+
+        .footer p {
+            color: rgba(255, 255, 255, 0.6);
+            font-size: 0.95rem;
+            line-height: 1.7;
+        }
+
+        .footer-link {
+            color: rgba(255, 255, 255, 0.6);
+            text-decoration: none;
+            transition: var(--transition);
+            display: block;
+            margin-bottom: 10px;
+            font-size: 0.95rem;
+            padding: 2px 0;
+            position: relative;
+            width: fit-content;
+        }
+
+        .footer-link::before {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            width: 0;
+            height: 2px;
+            background: var(--gradient-accent);
+            transition: var(--transition);
+        }
+
+        .footer-link:hover {
+            color: white;
+            padding-left: 5px;
+        }
+
+        .footer-link:hover::before {
+            width: 100%;
+        }
+
+        .footer-contact-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 14px;
+            color: rgba(255, 255, 255, 0.6);
+            font-size: 0.95rem;
+        }
+
+        .footer-contact-item i {
+            width: 34px;
+            height: 34px;
+            border-radius: 10px;
+            background: rgba(94, 196, 230, 0.1);
+            color: var(--accent);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            flex-shrink: 0;
+        }
+
+        .footer-social {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+        }
+
+        .footer-social a {
+            width: 42px;
+            height: 42px;
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.06);
+            color: rgba(255, 255, 255, 0.6);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            transition: var(--transition);
+            text-decoration: none;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .footer-social a:hover {
+            background: var(--gradient-accent);
+            color: white;
+            transform: translateY(-4px) scale(1.05);
+            box-shadow: var(--shadow-glow);
+            border-color: transparent;
+        }
+
+        .footer-divider {
+            border: none;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+            margin: 30px 0;
+        }
+
+        .footer-bottom {
+            text-align: center;
+            color: rgba(255, 255, 255, 0.4);
+            font-size: 0.85rem;
+        }
+
+        /* ============ MODAL DESIGN ============ */
+        .modal-content {
+            border-radius: var(--radius-lg);
+            border: none;
+            padding: 0;
+            box-shadow: 0 30px 80px rgba(0, 0, 0, 0.2);
+            overflow: hidden;
+        }
+
+        .modal-header-saas {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            padding: 30px 35px 10px;
+        }
+
+        .modal-header-saas .icon-box {
+            width: 50px;
+            height: 50px;
+            border-radius: 14px;
+            background: linear-gradient(135deg, rgba(94, 196, 230, 0.1), rgba(30, 127, 168, 0.05));
+            color: var(--primary-light);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+            border: 1px solid rgba(94, 196, 230, 0.1);
+        }
+
+        .modal-header-saas h4 {
+            font-weight: 800;
+            color: var(--dark);
+            margin: 0;
+        }
+
+        .modal-header-saas p {
+            color: var(--gray-500);
+            margin: 0;
+            font-size: 14px;
+        }
+
+        .modal-body-saas {
+            padding: 10px 35px 35px;
+        }
+
+        .saas-label {
+            font-size: 11px;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--gray-400);
+            margin-bottom: 6px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .form-control {
+            border-radius: var(--radius-sm);
+            padding: 14px 20px;
+            border: 1px solid var(--gray-300);
+            font-size: 15px;
+            background: white;
+            transition: var(--transition);
+            font-family: 'Inter', sans-serif;
+        }
+
+        .form-control:focus {
+            box-shadow: 0 0 0 4px rgba(94, 196, 230, 0.12);
+            border-color: var(--accent);
+            background: white;
+        }
+
+        .btn-modal-primary {
+            background: var(--gradient-accent);
+            color: white;
+            border: none;
+            padding: 16px;
+            border-radius: var(--radius-sm);
+            font-weight: 700;
+            font-size: 15px;
+            transition: var(--transition);
+            width: 100%;
+            cursor: pointer;
+        }
+
+        .btn-modal-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-glow);
+            color: white;
+        }
+
+        .btn-modal-primary:active {
+            transform: translateY(0);
+        }
+
+        /* ============ DOCTOR MODAL ============ */
+        .doctor-modal-img {
+            width: 110px;
+            height: 110px;
+            border-radius: 50%;
+            object-fit: cover;
+            box-shadow: var(--shadow-md);
+            border: 4px solid rgba(94, 196, 230, 0.2);
+            transition: var(--transition);
+        }
+
+        .doctor-modal-img:hover {
+            transform: scale(1.05);
+            border-color: var(--accent);
+        }
+
+        .doctor-modal-name {
+            font-weight: 800;
+            color: var(--dark);
+            font-size: 1.4rem;
+        }
+
+        .doctor-modal-title {
+            color: var(--primary-light);
+            font-weight: 700;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .doctor-modal-info-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+
+        .doctor-modal-info-item {
+            background: var(--gray-200);
+            border: 1px solid var(--gray-300);
+            border-radius: var(--radius-sm);
+            padding: 14px;
+        }
+
+        .doctor-modal-info-item.full-width {
+            grid-column: span 2;
+        }
+
+        .doctor-modal-info-item .label {
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--gray-400);
+            margin-bottom: 4px;
+        }
+
+        .doctor-modal-info-item .value {
+            font-size: 14px;
+            font-weight: 700;
+            color: var(--dark);
+        }
+
+        /* ============ ALERT ============ */
+        .alert-container {
+            position: fixed;
+            top: 100px;
+            right: 20px;
+            z-index: 9999;
+            min-width: 340px;
+            animation: slideInRight 0.5s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+        }
+
+        @keyframes slideInRight {
+            from {
+                opacity: 0;
+                transform: translateX(50px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        .alert-custom {
+            border-radius: var(--radius-sm);
+            border: none;
+            box-shadow: var(--shadow-lg) !important;
+            padding: 16px 20px;
+            font-size: 14px;
+        }
+
+        /* ============ RESPONSIVE ============ */
+        @media (max-width: 991px) {
+            html { overflow-x: hidden; } /* slide-in animations wait off-screen; never let the page pan sideways */
+            .hero h1 {
+                font-size: 2.8rem;
+            }
+            .hero {
+                padding: 130px 0 80px;
+                min-height: auto;
+            }
+            .section-title {
+                font-size: 2rem;
+            }
+            .announcement-ticker {
+                border-radius: 20px;
+                top: -20px;
+                flex-wrap: wrap;
+                padding: 12px;
+            }
+            .announcement-badge {
+                width: 100%;
+                justify-content: center;
+            }
+            .navbar-brand {
+                font-size: 22px;
+            }
+            .navbar-collapse {
+                background: rgba(255, 255, 255, 0.98);
+                backdrop-filter: blur(20px);
+                border-radius: var(--radius-md);
+                padding: 16px;
+                margin-top: 12px;
+                box-shadow: var(--shadow-lg);
+            }
+            .btn-login-nav {
+                margin-left: 0;
+                margin-top: 8px;
+                width: 100%;
+                text-align: center;
+            }
+            .hero-icons {
+                gap: 24px;
+                flex-wrap: wrap;
+            }
+        }
+
+        @media (max-width: 767px) {
+            .hero h1 {
+                font-size: 2.2rem;
+            }
+            .hero p {
+                font-size: 1rem;
+            }
+            .section-title {
+                font-size: 1.7rem;
+            }
+            .hero {
+                padding: 110px 0 60px;
+            }
+            .btn-gradient {
+                padding: 14px 30px;
+                font-size: 14px;
+            }
+            .gallery-grid {
+                grid-template-columns: 1fr 1fr;
+            }
+            .gallery-item {
+                height: 220px;
+            }
+            .hero-icons {
+                gap: 16px;
+            }
+            .hero-icon-item i {
+                font-size: 24px;
+            }
+            .hero-icon-item span {
+                font-size: 10px;
+            }
+            .modal-body-saas {
+                padding: 10px 20px 25px;
+            }
+            .modal-header-saas {
+                padding: 20px 20px 10px;
+            }
+            #back-to-top {
+                width: 42px;
+                height: 42px;
+                font-size: 16px;
+                bottom: 20px;
+                right: 20px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .gallery-grid {
+                grid-template-columns: 1fr;
+            }
+            .hero h1 {
+                font-size: 1.8rem;
+            }
+            .doctor-modal-info-grid {
+                grid-template-columns: 1fr;
+            }
+            .doctor-modal-info-item.full-width {
+                grid-column: span 1;
+            }
+        }
+
+        /* ============ COUNTER ANIMATION ============ */
+        .counter-number {
+            font-size: 2.5rem;
+            font-weight: 900;
+            background: var(--gradient-accent);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            line-height: 1;
+        }
+
+        .counter-label {
+            font-size: 0.9rem;
+            color: var(--gray-500);
+            font-weight: 500;
+            margin-top: 4px;
+        }
+
+        /* ============ GLASSMORPHISM EXTRA ============ */
+        .glass-card {
+            background: rgba(255, 255, 255, 0.7);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: var(--radius-md);
+        }
+
+        /* ============ IMAGE TILT ============ */
+        .tilt-image {
+            transition: transform 0.15s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+            will-change: transform;
+        }
+
+        /* ============ LOADING ANIMATION ============ */
+        .skeleton-loading {
+            background: linear-gradient(90deg, var(--gray-200) 25%, var(--gray-100) 50%, var(--gray-200) 75%);
+            background-size: 200% 100%;
+            animation: shimmer 1.5s infinite;
+            border-radius: var(--radius-sm);
+        }
+
+        @keyframes shimmer {
+            0% {
+                background-position: 200% 0;
+            }
+            100% {
+                background-position: -200% 0;
+            }
+        }
+    </style>
+    <link rel="stylesheet" href="assets/pragmavet.css">
+    <link href="assets/global-style.css" rel="stylesheet">
+    <link href="assets/landing.css?v=2" rel="stylesheet">
+</head>
+
+<body>
+
+    <!-- SCROLL PROGRESS BAR -->
+    <div id="scroll-progress"></div>
+
+    <!-- BACK TO TOP -->
+    <button id="back-to-top" aria-label="Back to top">
+        <i class="fa fa-arrow-up"></i>
+    </button>
+
+    <!-- LIGHTBOX -->
+    <div class="lightbox" id="lightbox">
+        <button class="lightbox-close" id="lightboxClose"><i class="fa fa-times"></i></button>
+        <img id="lightboxImg" src="" alt="Expanded view">
+    </div>
+
+    <?php if (isset($_SESSION['message']) && !isset($_SESSION['show_modal'])): ?>
+        <div class="alert-container">
+            <div class="alert alert-<?php echo $_SESSION['msg_type']; ?> alert-dismissible fade show alert-custom"
+                role="alert">
+                <strong><?php echo $_SESSION['msg_type'] == 'success' ? '<i class="fa fa-check-circle"></i> Success!' : '<i class="fa fa-exclamation-circle"></i> Error!'; ?></strong>
+                <?php echo $_SESSION['message']; ?>
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+        </div>
+        <?php
+        unset($_SESSION['message']);
+        unset($_SESSION['msg_type']);
+    endif;
+    ?>
+
+    <!-- TOP BAR -->
+    <div class="top-bar d-none d-md-block">
+        <div class="container d-flex justify-content-between align-items-center">
+            <div><i class="fa fa-envelope me-2"></i> pragmavet@gmail.com</div>
+            <div><i class="fa fa-phone-alt me-2"></i> 24/7 Emergency Clinic:
+                <strong>09542853053</strong>
+            </div>
+        </div>
+    </div>
+
+    <!-- NAVBAR -->
+    <nav class="navbar navbar-expand-lg sticky-top" id="mainNavbar">
+        <div class="container">
+            <a class="navbar-brand" href="#"><i class="fa fa-paw"></i> PragmaVet</a>
+
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navmenu">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+
+            <div class="collapse navbar-collapse" id="navmenu">
+                <ul class="navbar-nav ms-auto align-items-center">
+                    <li class="nav-item"><a class="nav-link active" href="#">Home</a></li>
+                    <li class="nav-item"><a class="nav-link" href="#features">Features</a></li>
+                    <li class="nav-item"><a class="nav-link" href="#how-it-works">How It Works</a></li>
+                    <li class="nav-item"><a class="nav-link" href="#team">Our Team</a></li>
+
+                    <?php if (isset($_SESSION['user_id'])): ?>
+                        <li class="nav-item ms-3 d-flex gap-2">
+                            <a href="dashboard.php" class="btn-outline-dashboard nav-link">
+                                <i class="fa fa-th-large me-1"></i> Dashboard
+                            </a>
+                            <a href="logout.php" class="btn-login-nav nav-link">
+                                <i class="fa fa-sign-out-alt"></i> Logout
+                            </a>
+                        </li>
+                    <?php else: ?>
+                        <li class="nav-item">
+                            <button class="btn-login-nav nav-link ripple" data-bs-toggle="modal" data-bs-target="#authModal">
+                                <i class="fa fa-lock me-1"></i> Login
+                            </button>
+                        </li>
+                    <?php endif; ?>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+   
+    <!-- HERO SECTION -->
+    <section class="hero lp-hero">
+        <div class="hero-floating-1"></div>
+        <div class="hero-floating-2"></div>
+        <div class="hero-floating-3"></div>
+
+        <div class="container position-relative" style="z-index: 2;">
+          <div class="row align-items-center g-5">
+           <div class="col-lg-6">
+            <div class="hero-badge reveal">
+                <i class="fa fa-shield-alt me-2"></i> Trusted Veterinary Platform
+            </div>
+            <h1 class="reveal">PragmaVet <span class="lp-grad">Animal Clinic</span></h1>
+            <p class="lp-lead reveal" style="transition-delay: 0.15s;">A premium cloud-based clinic management system crafted for modern veterinarians to streamline their practice seamlessly.</p>
+
+            <?php if (isset($_SESSION['user_id'])): ?>
+                <div class="reveal" style="transition-delay: 0.3s;">
+                    <a href="dashboard.php" class="btn-gradient">
+                        Go to Dashboard <i class="fa fa-arrow-right"></i>
+                    </a>
+                </div>
+            <?php else: ?>
+                <div class="reveal" style="transition-delay: 0.3s;">
+                    <button class="btn-gradient ripple" data-bs-toggle="modal" data-bs-target="#authModal">
+                        Get Started <i class="fa fa-arrow-right"></i>
+                    </button>
+                    <button class="btn-outline-light-custom ms-3 ripple" data-bs-toggle="modal" data-bs-target="#authModal">
+                        <i class="fa fa-sign-in-alt"></i> Login
+                    </button>
+                </div>
+            <?php endif; ?>
+
+            <div class="hero-icons reveal" style="transition-delay: 0.45s;">
+                <div class="hero-icon-item">
+                    <i class="fa fa-calendar-check"></i>
+                    <span>Smart Booking</span>
+                </div>
+                <div class="hero-icon-item">
+                    <i class="fa fa-heartbeat"></i>
+                    <span>Health Records</span>
+                </div>
+                <div class="hero-icon-item">
+                    <i class="fa fa-chart-pie"></i>
+                    <span>Analytics</span>
+                </div>
+                <div class="hero-icon-item">
+                    <i class="fa fa-shield-alt"></i>
+                    <span>Secure</span>
+                </div>
+            </div>
+           </div>
+
+           <div class="col-lg-6 reveal" style="transition-delay: 0.2s;">
+            <div class="lp-visual">
+                <div class="lp-blob"></div>
+                <div class="lp-photo">
+                    <img src="https://images.unsplash.com/photo-1583337130417-3346a1be7dee?q=80&w=1200&auto=format&fit=crop" alt="A happy dog at PragmaVet Animal Clinic" loading="eager">
+                </div>
+                <div class="lp-chip c1">
+                    <span class="ic" style="background:#e3f5fb;color:#1E7FA8;"><i class="fa fa-clock"></i></span>
+                    <span><b>24/7</b><small>Emergency care</small></span>
+                </div>
+                <div class="lp-chip c2">
+                    <span class="ic" style="background:#fff4e5;color:#f59e0b;"><i class="fa fa-star"></i></span>
+                    <span><b>98%</b><small>Client satisfaction</small></span>
+                </div>
+                <div class="lp-chip c3">
+                    <span class="ic" style="background:#e8f8ef;color:#16a34a;"><i class="fa fa-paw"></i></span>
+                    <span><b>5,000+</b><small>Happy pets treated</small></span>
+                </div>
+            </div>
+           </div>
+          </div>
+        </div>
+    </section>
+
+    <!-- FEATURES -->
+    <section id="features" class="py-5 bg-white" style="margin-top: -2px; position: relative; z-index: 3;">
+        <div class="container">
+            <div class="text-center mb-5">
+                <div class="section-label reveal">Why PragmaVet</div>
+                <h2 class="section-title reveal">Everything your pet's care needs</h2>
+                <p class="section-subtitle mx-auto reveal" style="transition-delay: 0.1s;">Booking, records and billing in one calm, connected place — for pet owners and the clinic team.</p>
+            </div>
+            <div class="row g-4">
+                <div class="col-md-4 reveal">
+                    <div class="feature-card">
+                        <div class="feature-icon">
+                            <i class="fa fa-calendar-alt"></i>
+                        </div>
+                        <h5>Smart Scheduling</h5>
+                        <p>Organize routine checkups seamlessly, avoid timezone conflicts, and manage daily client appointments efficiently with an intuitive UI.</p>
+                    </div>
+                </div>
+
+                <div class="col-md-4 reveal" style="transition-delay: 0.15s;">
+                    <div class="feature-card">
+                        <div class="feature-icon">
+                            <i class="fa fa-notes-medical"></i>
+                        </div>
+                        <h5>Digital Health Records</h5>
+                        <p>Maintain complete electronic health profiles, surgical histories, and vaccination logs securely in one centralized database.</p>
+                    </div>
+                </div>
+
+                <div class="col-md-4 reveal" style="transition-delay: 0.3s;">
+                    <div class="feature-card">
+                        <div class="feature-icon">
+                            <i class="fa fa-chart-line"></i>
+                        </div>
+                        <h5>Clinic Analytics</h5>
+                        <p>Automate your financial workflow and gain valuable insights into clinic performance with integrated real-time analytics dashboards.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- COUNTERS -->
+    <section class="py-5 lp-stats">
+        <div class="container">
+          <div class="lp-band">
+            <div class="row g-4 text-center">
+                <div class="col-md-3 col-6 reveal">
+                    <div class="counter-number" data-target="5000">0</div>
+                    <div class="counter-label">Happy Pets</div>
+                </div>
+                <div class="col-md-3 col-6 reveal" style="transition-delay: 0.1s;">
+                    <div class="counter-number" data-target="12">0</div>
+                    <div class="counter-label">Years Experience</div>
+                </div>
+                <div class="col-md-3 col-6 reveal" style="transition-delay: 0.2s;">
+                    <div class="counter-number" data-target="98">0%</div>
+                    <div class="counter-label">Client Satisfaction</div>
+                </div>
+                <div class="col-md-3 col-6 reveal" style="transition-delay: 0.3s;">
+                    <div class="counter-number" data-target="24">0/7</div>
+                    <div class="counter-label">Emergency Care</div>
+                </div>
+            </div>
+          </div>
+        </div>
+    </section>
+
+    <!-- HOW IT WORKS -->
+    <section id="how-it-works" class="py-5">
+        <div class="container">
+            <div class="text-center mb-5">
+                <div class="section-label reveal">Simple Process</div>
+                <h2 class="section-title reveal">How PragmaVet Works</h2>
+                <p class="section-subtitle mx-auto reveal" style="transition-delay: 0.1s;">Getting started with our platform is incredibly straightforward. Managing your pet's health has never been easier.</p>
+            </div>
+
+            <div class="row g-4 position-relative">
+                <div class="col-md-4 reveal" style="transition-delay: 0.1s;">
+                    <div class="step-card">
+                        <div class="step-circle">1</div>
+                        <div class="step-connector"></div>
+                        <h5>Create a Profile</h5>
+                        <p>Register a free secure account for yourself and input your beloved pet's vital details into our system.</p>
+                    </div>
+                </div>
+                <div class="col-md-4 reveal" style="transition-delay: 0.2s;">
+                    <div class="step-card">
+                        <div class="step-circle">2</div>
+                        <div class="step-connector"></div>
+                        <h5>Book a Session</h5>
+                        <p>Select an available time slot and book a specific service, from general checkups to surgery consults.</p>
+                    </div>
+                </div>
+                <div class="col-md-4 reveal" style="transition-delay: 0.3s;">
+                    <div class="step-card">
+                        <div class="step-circle">3</div>
+                        <h5>Track Progress</h5>
+                        <p>Wait for our veterinary staff to approve the appointment, and track medical statuses from your dashboard.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- MEET OUR DOCTORS -->
+    <section id="team" class="bg-white py-5">
+        <div class="container">
+            <div class="text-center mb-5">
+                <div class="section-label reveal">Expert Care</div>
+                <h2 class="section-title reveal">Meet Our Doctors</h2>
+                <p class="section-subtitle mx-auto reveal" style="transition-delay: 0.1s;">Our dedicated veterinary professionals are committed to the health and happiness of your pets.</p>
+            </div>
+            <div class="row g-4">
+                <!-- Doctor 1 -->
+                <div class="col-md-4 reveal" style="transition-delay: 0.1s;">
+                    <div class="doctor-card">
+                        <div class="doctor-img-wrapper">
+                            <img src="https://thumbs.dreamstime.com/b/veterinarian-17919171.jpg"
+                                onerror="this.src='https://plus.unsplash.com/premium_photo-1661766569106-1b4e058eb7db?q=80&w=1470&auto=format&fit=crop';"
+                                alt="Dr. Sarah Jenkins" class="tilt-image">
+                            <span class="doctor-specialization-badge">DVM</span>
+                            <div class="doctor-socials">
+                                <a href="#" aria-label="Facebook"><i class="fab fa-facebook-f"></i></a>
+                                <a href="#" aria-label="Twitter"><i class="fab fa-twitter"></i></a>
+                                <a href="#" aria-label="LinkedIn"><i class="fab fa-linkedin-in"></i></a>
+                            </div>
+                        </div>
+                        <div class="doctor-info">
+                            <h5>Dr. Sarah Jenkins</h5>
+                            <p class="doctor-title">Lead Veterinarian</p>
+                            <button class="btn-profile ripple" data-bs-toggle="modal" data-bs-target="#doctor1Modal">
+                                View Profile <i class="fa fa-arrow-right ms-1"></i>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                <!-- Doctor 2 -->
+                <div class="col-md-4 reveal" style="transition-delay: 0.2s;">
+                    <div class="doctor-card">
+                        <div class="doctor-img-wrapper">
+                            <img src="https://thumbs.dreamstime.com/b/male-veterinary-surgeon-holding-cat-surgery-26102483.jpg"
+                                alt="Dr. Michael Chang" class="tilt-image">
+                            <span class="doctor-specialization-badge">Surgery</span>
+                            <div class="doctor-socials">
+                                <a href="#" aria-label="Facebook"><i class="fab fa-facebook-f"></i></a>
+                                <a href="#" aria-label="Twitter"><i class="fab fa-twitter"></i></a>
+                                <a href="#" aria-label="LinkedIn"><i class="fab fa-linkedin-in"></i></a>
+                            </div>
+                        </div>
+                        <div class="doctor-info">
+                            <h5>Dr. Michael Chang</h5>
+                            <p class="doctor-title">Surgical Specialist</p>
+                            <button class="btn-profile ripple" data-bs-toggle="modal" data-bs-target="#doctor2Modal">
+                                View Profile <i class="fa fa-arrow-right ms-1"></i>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                <!-- Doctor 3 -->
+                <div class="col-md-4 reveal" style="transition-delay: 0.3s;">
+                    <div class="doctor-card">
+                        <div class="doctor-img-wrapper">
+                            <img src="https://img.freepik.com/free-photo/front-view-female-veterinarian-observing-little-dog-yellow-wall_179666-12493.jpg"
+                                alt="Dr. Emily Roberts" class="tilt-image">
+                            <span class="doctor-specialization-badge">Behavior</span>
+                            <div class="doctor-socials">
+                                <a href="#" aria-label="Facebook"><i class="fab fa-facebook-f"></i></a>
+                                <a href="#" aria-label="Twitter"><i class="fab fa-twitter"></i></a>
+                                <a href="#" aria-label="LinkedIn"><i class="fab fa-linkedin-in"></i></a>
+                            </div>
+                        </div>
+                        <div class="doctor-info">
+                            <h5>Dr. Emily Roberts</h5>
+                            <p class="doctor-title">Feline Behavioral Expert</p>
+                            <button class="btn-profile ripple" data-bs-toggle="modal" data-bs-target="#doctor3Modal">
+                                View Profile <i class="fa fa-arrow-right ms-1"></i>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- HAPPY PATIENTS (GALLERY) -->
+    <section id="gallery" class="py-5" style="background: var(--gradient-section);">
+        <div class="container">
+            <div class="text-center mb-5">
+                <div class="section-label reveal">Our Friends</div>
+                <h2 class="section-title reveal">Happy Patients</h2>
+                <p class="section-subtitle mx-auto reveal" style="transition-delay: 0.1s;">A glimpse into the joyful, healthy pets that make our clinic a brighter place every day.</p>
+            </div>
+            <div class="gallery-grid reveal-stagger">
+                <div class="gallery-item" onclick="openLightbox(this)">
+                    <img src="https://images.unsplash.com/photo-1583337130417-3346a1be7dee?q=80&w=1528&auto=format&fit=crop" alt="Happy Dog">
+                    <div class="gallery-overlay"><span>Happy Dog</span></div>
+                    <div class="gallery-expand-icon"><i class="fa fa-expand"></i></div>
+                </div>
+                <div class="gallery-item" onclick="openLightbox(this)">
+                    <img src="https://images.unsplash.com/photo-1514888286974-6c03e2ca1dba?q=80&w=1443&auto=format&fit=crop" alt="Cute Cat">
+                    <div class="gallery-overlay"><span>Cute Cat</span></div>
+                    <div class="gallery-expand-icon"><i class="fa fa-expand"></i></div>
+                </div>
+                <div class="gallery-item" onclick="openLightbox(this)">
+                    <img src="https://images.unsplash.com/photo-1543466835-00a7907e9de1?q=80&w=1374&auto=format&fit=crop" alt="Puppy">
+                    <div class="gallery-overlay"><span>Puppy</span></div>
+                    <div class="gallery-expand-icon"><i class="fa fa-expand"></i></div>
+                </div>
+                <div class="gallery-item" onclick="openLightbox(this)">
+                    <img src="https://images.unsplash.com/photo-1513360371669-4adf3dd7dff8?q=80&w=1470&auto=format&fit=crop" alt="Domestic Cat">
+                    <div class="gallery-overlay"><span>Domestic Cat</span></div>
+                    <div class="gallery-expand-icon"><i class="fa fa-expand"></i></div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- LOCATION -->
+    <section id="location" class="py-5 bg-white">
+        <div class="container">
+            <div class="text-center mb-5">
+                <div class="section-label reveal">Visit Us</div>
+                <h2 class="section-title reveal">
+                    <i class="fa fa-paw me-2" style="color: var(--accent);"></i> Where to Find Us <i class="fa fa-paw ms-2" style="color: var(--accent);"></i>
+                </h2>
+                <p class="section-subtitle mx-auto reveal" style="transition-delay: 0.1s;">Visit our clinic easily and get directions in seconds</p>
+            </div>
+
+            <div class="row align-items-stretch justify-content-center g-4 mx-auto" style="max-width: 1100px;">
+                <!-- Info Left -->
+                <div class="col-lg-5 d-flex reveal-left">
+                    <div class="location-card w-100">
+                        <div class="d-flex align-items-center justify-content-between mb-3">
+                            <h3 class="mb-0">Pragmavet Animal Clinic</h3>
+                            <span class="location-badge">Imus Branch</span>
+                        </div>
+
+                        <p class="mb-4" style="color: var(--gray-500); line-height: 1.6; font-size: 0.95rem;">
+                            Located in the heart of Cavite, our Imus facility provides a pragmatic, results-driven approach to veterinary medicine. We combine professional expertise with accessible service to keep your pets in peak condition.
+                        </p>
+
+                        <div class="location-info-item">
+                            <i class="fa fa-map-marker-alt"></i>
+                            <div>
+                                <h6>Address</h6>
+                                <p>0234 Unit B Palico St, Palico 4, Imus, Cavite, Philippines<br>
+                                <span style="font-style: italic;">(Conveniently located directly in front of Gasso)</span></p>
+                            </div>
+                        </div>
+
+                        <div class="location-info-item">
+                            <i class="fa fa-phone-alt"></i>
+                            <div>
+                                <h6>Contact</h6>
+                                <p>046-8851-221<br>0954-285-3053</p>
+                            </div>
+                        </div>
+
+                        <div class="mt-auto pt-2 d-flex gap-2">
+                            <a href="tel:09542853053" class="btn-call">
+                                <i class="fa fa-phone me-1"></i> Call Now
+                            </a>
+                            <a href="https://maps.app.goo.gl/6cxKJqNU7T1JBAL56" target="_blank" class="btn-directions">
+                                <i class="fa fa-location-arrow me-1"></i> Directions
+                            </a>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Map Right -->
+                <div class="col-lg-7 d-flex reveal-right">
+                    <div class="map-container w-100">
+                        <iframe
+                            src="https://www.google.com/maps/embed?pb=!1m18!1m12!1m3!1d3864.887204!2d120.9457249!3d14.4251111!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!3m3!1m2!1s0x3397d3003e419f85%3A0x1f03e9e02454980d!2sPRAGMAVET%20Animal%20Clinic%2024%2F7!5e0!3m2!1sen!2sph!4v1713783733000!5m2!1sen!2sph"
+                            allowfullscreen loading="lazy" referrerpolicy="no-referrer-when-downgrade">
+                        </iframe>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- CALL TO ACTION -->
+    <section class="cta-section lp-cta">
+      <div class="container">
+       <div class="lp-cta-card">
+        <div class="cta-paw" style="top: 20px; left: 10%;"><i class="fa fa-paw"></i></div>
+        <div class="cta-paw" style="bottom: 40px; right: 15%; font-size: 80px;"><i class="fa fa-paw"></i></div>
+        <div class="cta-paw" style="top: 50%; left: 60%; font-size: 40px;"><i class="fa fa-paw"></i></div>
+
+        <div class="text-center text-white py-2 position-relative">
+            <h2 class="fw-bold mb-3 reveal" style="font-size: 2.2rem;">Ready to give your pet the finest care?</h2>
+            <p class="mb-5 opacity-75 fs-5 mx-auto reveal" style="max-width: 600px; transition-delay: 0.1s;">Join thousands of responsible pet owners who trust PragmaVet for their daily veterinary management needs.</p>
+
+            <?php if (!isset($_SESSION['user_id'])): ?>
+                <div class="reveal" style="transition-delay: 0.2s;">
+                    <button class="btn-gradient ripple" data-bs-toggle="modal" data-bs-target="#authModal" style="font-size: 18px; padding: 18px 50px;">
+                        Join PragmaVet Now <i class="fa fa-arrow-right ms-2"></i>
+                    </button>
+                </div>
+            <?php endif; ?>
+        </div>
+       </div>
+      </div>
+    </section>
+
+    <!-- FOOTER -->
+    <footer class="footer">
+        <div class="container">
+            <div class="row g-4 mb-4">
+                <div class="col-lg-4 col-md-6">
+                    <h4><i class="fa fa-paw" style="color: var(--accent);"></i> PragmaVet</h4>
+                    <p>The ultimate all-in-one veterinary clinic management system built for speed, security, and aesthetics.</p>
+                    <div class="footer-social">
+                        <a href="#" aria-label="Facebook"><i class="fab fa-facebook-f"></i></a>
+                        <a href="#" aria-label="Twitter"><i class="fab fa-twitter"></i></a>
+                        <a href="#" aria-label="Instagram"><i class="fab fa-instagram"></i></a>
+                        <a href="#" aria-label="LinkedIn"><i class="fab fa-linkedin-in"></i></a>
+                        <a href="#" aria-label="YouTube"><i class="fab fa-youtube"></i></a>
+                    </div>
+                </div>
+                <div class="col-lg-2 col-md-6">
+                    <h5>Platform</h5>
+                    <a href="#" class="footer-link">Home</a>
+                    <a href="#features" class="footer-link">Features</a>
+                    <a href="#how-it-works" class="footer-link">How it Works</a>
+                    <a href="#team" class="footer-link">Our Team</a>
+                </div>
+                <div class="col-lg-2 col-md-6">
+                    <h5>Legal</h5>
+                    <a href="#" class="footer-link">Privacy Policy</a>
+                    <a href="#" class="footer-link">Terms of Service</a>
+                    <a href="#" class="footer-link">Cookie Policy</a>
+                </div>
+                <div class="col-lg-4 col-md-6">
+                    <h5>Contact Us</h5>
+                    <div class="footer-contact-item">
+                        <i class="fa fa-map-marker-alt"></i>
+                        <span>0234 Unit B Palico St, Palico 4, Imus, Cavite</span>
+                    </div>
+                    <div class="footer-contact-item">
+                        <i class="fa fa-envelope"></i>
+                        <span>pragmavet@gmail.com</span>
+                    </div>
+                    <div class="footer-contact-item">
+                        <i class="fa fa-phone"></i>
+                        <span>0954-285-3053</span>
+                    </div>
+                </div>
+            </div>
+            <hr class="footer-divider">
+            <div class="footer-bottom">
+                <p class="mb-0">&copy; 2026 PragmaVet Veterinary Management System. All rights reserved.</p>
+            </div>
+        </div>
+    </footer>
+
+    <!-- AUTH MODAL (Login + Register Tabs) -->
+    <div class="modal fade" id="authModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+
+                <div class="modal-header-saas mt-2">
+                    <div class="icon-box">
+                        <i class="fa fa-shield-alt"></i>
+                    </div>
+                    <div>
+                        <h4 class="fw-bold text-dark m-0" id="authModalTitle">LOGIN</h4>
+                        <p class="text-muted small m-0" id="authModalSub">Manage your pet's health securely</p>
+                    </div>
+                    <button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+
+                <!-- Tab Toggle -->
+                <div class="auth-tabs-modal" style="margin: 0 35px; display:flex; background:var(--gray-200); border-radius:50px; padding:4px;">
+                    <button class="auth-tab-modal active" id="tabLoginBtn" onclick="switchAuthTab('login')" style="flex:1; padding:10px 16px; text-align:center; font-weight:700; font-size:14px; color:var(--gray-500); cursor:pointer; border-radius:50px; border:none; background:transparent; transition:all 0.4s cubic-bezier(0.25,0.46,0.45,0.94);">
+                        <i class="fa fa-sign-in-alt me-2"></i>Login
+                    </button>
+                    <button class="auth-tab-modal" id="tabRegisterBtn" onclick="switchAuthTab('register')" style="flex:1; padding:10px 16px; text-align:center; font-weight:700; font-size:14px; color:var(--gray-500); cursor:pointer; border-radius:50px; border:none; background:transparent; transition:all 0.4s cubic-bezier(0.25,0.46,0.45,0.94);">
+                        <i class="fa fa-user-plus me-2"></i>Sign Up
+                    </button>
+                </div>
+
+                <div class="modal-body-saas">
+                    <?php if (isset($_SESSION['message']) && isset($_SESSION['show_modal'])): ?>
+                        <div class="alert alert-<?php echo $_SESSION['msg_type']; ?> px-3 py-2 text-center small fw-bold mb-4 border-0 shadow-sm"
+                            style="border-radius: 12px; background: <?php echo $_SESSION['msg_type'] == 'success' ? '#f0fdf4' : '#fff1f2'; ?>; color: <?php echo $_SESSION['msg_type'] == 'success' ? '#15803d' : '#be123c'; ?>;">
+                            <i class="fa fa-<?php echo $_SESSION['msg_type'] == 'success' ? 'check' : 'exclamation'; ?>-circle me-2"></i>
+                            <?php echo $_SESSION['message']; ?>
+                        </div>
+                        <?php
+                        unset($_SESSION['message']);
+                        unset($_SESSION['msg_type']);
+                    endif;
+                    ?>
+                    <?php if (isset($_SESSION['delay_message'])): ?>
+                        <div class="alert alert-warning border-0 text-center small py-2 fw-bold" style="border-radius:12px; background:#fffbeb; color:#b45309;">
+                            <i class="fa fa-clock me-2"></i><?php echo $_SESSION['delay_message']; ?>
+                        </div>
+                        <?php unset($_SESSION['delay_message']); ?>
+                    <?php endif; ?>
+
+                    <!-- LOGIN PANEL -->
+                    <div class="auth-panel-modal" id="panelLogin" style="display:block;">
+                        <form method="POST">
+                            <div class="mb-3">
+                                <label class="saas-label"><i class="fa fa-envelope"></i> Email Address</label>
+                                <input type="email" name="email" class="form-control" placeholder="name@example.com"
+                                    value="<?php echo isset($_SESSION['login_email']) ? htmlspecialchars($_SESSION['login_email']) : ''; ?>"
+                                    required>
+                            </div>
+                            <div class="mb-2">
+                                <label class="saas-label"><i class="fa fa-lock"></i> Password</label>
+                                <input type="password" name="password" class="form-control" placeholder="Enter password" required>
+                            </div>
+                            <div class="mb-4 text-end">
+                                <a href="#" onclick="event.preventDefault(); switchToModal('forgotModal');" class="text-primary text-decoration-none" style="font-weight:600; font-size:12px;">Forgot password?</a>
+                            </div>
+                            <button type="submit" name="login" class="btn-modal-primary ripple">
+                                Login <i class="fa fa-sign-in-alt ms-2"></i>
+                            </button>
+                            <!-- Legal Disclaimer below login button -->
+                            <p class="text-center text-muted small mt-3 mb-0" style="font-size: 12px; line-height: 1.6; color: var(--gray-400);">
+                                By logging in, you agree to our 
+                                <a href="#" onclick="event.preventDefault(); openTermsModal();" style="color: var(--primary-light); font-weight: 600; text-decoration: none;">Terms & Conditions</a>.
+                            </p>
+                        </form>
+                    </div>
+
+                    <!-- REGISTER PANEL (2-step OTP flow) -->
+                    <div class="auth-panel-modal" id="panelRegister" style="display:none;">
+
+                        <!-- Step 1: Fill in details -->
+                        <div id="regStep1">
+                            <div id="regAlert" style="display:none; margin-bottom:12px;"></div>
+                            <div class="mb-3">
+                                <label class="saas-label"><i class="fa fa-user"></i> Full Name</label>
+                                <input type="text" id="regFullname" class="form-control" placeholder="E.g. John Doe">
+                            </div>
+                            <div class="mb-3">
+                                <label class="saas-label"><i class="fa fa-envelope"></i> Email Address</label>
+                                <input type="email" id="regEmail" class="form-control" placeholder="you@example.com">
+                            </div>
+                            <div class="mb-3">
+                                <label class="saas-label"><i class="fa fa-map-marker-alt"></i> Home Address</label>
+                                <textarea id="regAddress" class="form-control" placeholder="123 Main St, City" rows="2"></textarea>
+                            </div>
+                            <div class="mb-3">
+                                <label class="saas-label"><i class="fa fa-key"></i> Create Password</label>
+                                <input type="password" id="regPassword" class="form-control" placeholder="8+ characters, lowercase &amp; numbers only">
+                                <div style="font-size:12px;color:#94a3b8;margin-top:6px;"><i class="fa fa-circle-info"></i> Min. 8 characters (lowercase letters &amp; numbers only)</div>
+                            </div>
+                            <div style="display:flex;align-items:flex-start;gap:10px;padding:14px 16px;margin-bottom:16px;background:rgba(94,196,230,0.05);border:1px solid rgba(94,196,230,0.15);border-radius:12px;">
+                                <input type="checkbox" id="agreeTermsModal" onchange="toggleRegisterBtnModal()" style="width:18px;height:18px;min-width:18px;margin-top:2px;accent-color:#1E7FA8;cursor:pointer;">
+                                <label for="agreeTermsModal" style="font-size:13px;color:#475569;line-height:1.5;cursor:pointer;user-select:none;">
+                                    I agree to the <a href="#" onclick="event.preventDefault(); openTermsModal();" style="color:#1E7FA8;font-weight:700;text-decoration:none;">Terms &amp; Conditions</a> and <a href="#" onclick="event.preventDefault(); openPrivacyModal();" style="color:#1E7FA8;font-weight:700;text-decoration:none;">Privacy Policy</a>.
+                                </label>
+                            </div>
+                            <button type="button" class="btn-modal-primary ripple" id="registerBtnModal" disabled onclick="regSendOtp()">
+                                <span id="regBtnText">Send Verification Code <i class="fa fa-paper-plane ms-2"></i></span>
+                                <span id="regBtnSpinner" style="display:none;"><i class="fa fa-spinner fa-spin me-1"></i> Sending&hellip;</span>
+                            </button>
+                        </div>
+
+                        <!-- Step 2: Enter OTP -->
+                        <div id="regStep2" style="display:none; text-align:center;">
+                            <div style="background:linear-gradient(135deg,#0E5A6B,#1E7FA8);border-radius:14px;padding:20px;margin-bottom:20px;">
+                                <i class="fa fa-envelope-open-text fa-2x text-white mb-2"></i>
+                                <h5 class="text-white fw-bold mb-1">Check Your Email</h5>
+                                <p class="text-white mb-0" style="font-size:13px;opacity:0.9;">We sent a 6-digit code to<br><strong id="regOtpEmailDisplay"></strong></p>
+                            </div>
+                            <div id="regOtpAlert" style="display:none;margin-bottom:12px;"></div>
+                            <label class="saas-label" style="text-align:left;display:block;margin-bottom:8px;"><i class="fa fa-shield-halved me-1"></i> Verification Code</label>
+                            <input type="text" id="regOtpInput" class="form-control text-center" style="font-size:32px;font-weight:800;letter-spacing:12px;border-radius:12px;padding:12px;" maxlength="6" placeholder="000000" inputmode="numeric" autocomplete="one-time-code">
+                            <p class="text-muted mt-2 mb-4" style="font-size:12px;"><i class="fa fa-clock me-1"></i> Code expires in 15 minutes</p>
+                            <button type="button" class="btn-modal-primary ripple mb-2" onclick="regVerifyOtp()" id="regVerifyBtn">
+                                <span id="regVerifyText"><i class="fa fa-check-circle me-1"></i> Verify &amp; Create Account</span>
+                                <span id="regVerifySpinner" style="display:none;"><i class="fa fa-spinner fa-spin me-1"></i> Verifying&hellip;</span>
+                            </button>
+                            <div style="margin-top:10px;">
+                                <button type="button" class="btn btn-link text-muted p-0" style="font-size:13px;" onclick="regResendOtp()"><i class="fa fa-redo me-1"></i> Resend Code</button>
+                                &nbsp;&middot;&nbsp;
+                                <button type="button" class="btn btn-link text-muted p-0" style="font-size:13px;" onclick="regGoBack()"><i class="fa fa-arrow-left me-1"></i> Change Details</button>
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== FORGOT PASSWORD MODAL (AJAX-Powered) ==================== -->
+    <div class="modal fade" id="forgotModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header-saas mt-2">
+                    <div class="icon-box">
+                        <i class="fa fa-lock"></i>
+                    </div>
+                    <div>
+                        <h4 class="fw-bold text-dark m-0">FORGOT PASSWORD</h4>
+                        <p class="text-muted small m-0">Recover your account access</p>
+                    </div>
+                    <button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body-saas" id="forgotModalBody">
+                    <!-- ===== Dynamic content loaded via AJAX ===== -->
+                    <div id="forgotAlertContainer"></div>
+                    <div id="forgotStep1">
+                        <div class="mb-4">
+                            <label class="saas-label"><i class="fa fa-envelope"></i> Registered Email</label>
+                            <input type="email" id="fpEmail" class="form-control" placeholder="name@example.com" required autofocus>
+                            <div class="text-muted mt-2" style="font-size:12px;"><i class="fa fa-info-circle me-1"></i>We'll send a 6-digit code to reset your password.</div>
+                        </div>
+                        <button type="button" id="fpSendCodeBtn" class="btn-modal-primary ripple" onclick="forgotSendCode()">
+                            <i class="fa fa-paper-plane me-2"></i>Send Code
+                        </button>
+                        <div class="text-center mt-3">
+                            <a href="#" onclick="event.preventDefault(); switchToModal('authModal');" class="text-muted small text-decoration-none"><i class="fa fa-arrow-left me-1"></i> Back to Login</a>
+                        </div>
+                    </div>
+                    <div id="forgotStep2" style="display:none;">
+                        <div class="mb-4">
+                            <label class="saas-label"><i class="fa fa-shield-halved"></i> 6-Digit Code</label>
+                            <input type="text" id="fpOtp" class="form-control text-center" style="font-size:28px;font-weight:800;letter-spacing:10px;" maxlength="6" pattern="\d{6}" placeholder="000000" required autofocus inputmode="numeric">
+                            <div class="text-muted mt-2 text-center" style="font-size:12px;">
+                                <i class="fa fa-clock me-1"></i>Sent to <strong id="fpEmailDisplay"></strong>. Expires in 15 min.
+                            </div>
+                        </div>
+                        <button type="button" id="fpVerifyBtn" class="btn-modal-primary ripple" onclick="forgotVerifyCode()">
+                            <i class="fa fa-check-shield me-2"></i>Verify Code
+                        </button>
+                        <div class="text-center mt-3">
+                            <a href="#" onclick="event.preventDefault(); forgotRestart();" class="text-muted small text-decoration-none"><i class="fa fa-rotate-left me-1"></i> Use different email</a>
+                        </div>
+                    </div>
+                    <div id="forgotStep3" style="display:none;">
+                        <div class="mb-3">
+                            <label class="saas-label"><i class="fa fa-key"></i> New Password</label>
+                            <input type="password" id="fpNewPass" class="form-control" placeholder="8+ characters" required autofocus>
+                        </div>
+                        <div class="mb-4">
+                            <label class="saas-label"><i class="fa fa-check-double"></i> Confirm Password</label>
+                            <input type="password" id="fpConfirmPass" class="form-control" placeholder="Re-enter new password" required>
+                        </div>
+                        <button type="button" id="fpResetBtn" class="btn-modal-primary ripple" onclick="forgotResetPassword()">
+                            <i class="fa fa-lock me-2"></i>Reset Password
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Doctor 1 Modal -->
+    <div class="modal fade" id="doctor1Modal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header-saas mt-2">
+                    <div class="icon-box">
+                        <i class="fa fa-user-md"></i>
+                    </div>
+                    <div>
+                        <h4 class="fw-bold text-dark m-0">Doctor Profile</h4>
+                        <p class="text-muted small m-0">Medical Excellence & Clinical Care</p>
+                    </div>
+                    <button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body-saas pt-3">
+                    <div class="text-center mb-4">
+                        <img src="https://thumbs.dreamstime.com/b/veterinarian-17919171.jpg"
+                            onerror="this.src='https://plus.unsplash.com/premium_photo-1661766569106-1b4e058eb7db?q=80&w=300&auto=format&fit=crop';"
+                            class="doctor-modal-img" alt="Dr. Sarah Jenkins">
+                        <h3 class="doctor-modal-name mt-3">Dr. Sarah Jenkins</h3>
+                        <p class="doctor-modal-title">Lead Veterinarian (DVM)</p>
+                    </div>
+
+                    <div class="doctor-modal-info-grid">
+                        <div class="doctor-modal-info-item">
+                            <div class="label"><i class="fa fa-graduation-cap me-1"></i> Degree</div>
+                            <div class="value">DVM, UPLB</div>
+                        </div>
+                        <div class="doctor-modal-info-item">
+                            <div class="label"><i class="fa fa-clock me-1"></i> Exp.</div>
+                            <div class="value">12+ Years</div>
+                        </div>
+                        <div class="doctor-modal-info-item full-width">
+                            <div class="label"><i class="fa fa-stethoscope me-1"></i> Specialty</div>
+                            <div class="value">Internal Medicine & Preventative Care</div>
+                        </div>
+                    </div>
+
+                    <p class="text-muted small text-center px-2 mb-0" style="line-height:1.7;">
+                        Dr. Jenkins is incredibly passionate about maintaining the optimal health of your pets and ensures every visit feels like home.
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Doctor 2 Modal -->
+    <div class="modal fade" id="doctor2Modal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header-saas mt-2">
+                    <div class="icon-box">
+                        <i class="fa fa-cut"></i>
+                    </div>
+                    <div>
+                        <h4 class="fw-bold text-dark m-0">Doctor Profile</h4>
+                        <p class="text-muted small m-0">Surgical precision & Pet recovery</p>
+                    </div>
+                    <button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body-saas pt-3">
+                    <div class="text-center mb-4">
+                        <img src="https://thumbs.dreamstime.com/b/male-veterinary-surgeon-holding-cat-surgery-26102483.jpg"
+                            class="doctor-modal-img" alt="Dr. Michael Chang">
+                        <h3 class="doctor-modal-name mt-3">Dr. Michael Chang</h3>
+                        <p class="doctor-modal-title">Surgical Specialist</p>
+                    </div>
+
+                    <div class="doctor-modal-info-grid">
+                        <div class="doctor-modal-info-item">
+                            <div class="label"><i class="fa fa-graduation-cap me-1"></i> Degree</div>
+                            <div class="value">Vet Surgery, UP</div>
+                        </div>
+                        <div class="doctor-modal-info-item">
+                            <div class="label"><i class="fa fa-clock me-1"></i> Exp.</div>
+                            <div class="value">8+ Years</div>
+                        </div>
+                        <div class="doctor-modal-info-item full-width">
+                            <div class="label"><i class="fa fa-stethoscope me-1"></i> Specialty</div>
+                            <div class="value">Orthopedics & Soft Tissue Surgery</div>
+                        </div>
+                    </div>
+
+                    <p class="text-muted small text-center px-2 mb-0" style="line-height:1.7;">
+                        Dr. Chang combines precise surgical expertise with a deeply compassionate approach, providing top-tier medical care for the most complex cases.
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Doctor 3 Modal -->
+    <div class="modal fade" id="doctor3Modal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header-saas mt-2">
+                    <div class="icon-box">
+                        <i class="fa fa-cat"></i>
+                    </div>
+                    <div>
+                        <h4 class="fw-bold text-dark m-0">Doctor Profile</h4>
+                        <p class="text-muted small m-0">Feline behavior & Calm therapy</p>
+                    </div>
+                    <button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body-saas pt-3">
+                    <div class="text-center mb-4">
+                        <img src="https://img.freepik.com/free-photo/front-view-female-veterinarian-observing-little-dog-yellow-wall_179666-12493.jpg"
+                            class="doctor-modal-img" alt="Dr. Emily Roberts">
+                        <h3 class="doctor-modal-name mt-3">Dr. Emily Roberts</h3>
+                        <p class="doctor-modal-title">Feline Behavioral Expert</p>
+                    </div>
+
+                    <div class="doctor-modal-info-grid">
+                        <div class="doctor-modal-info-item">
+                            <div class="label"><i class="fa fa-graduation-cap me-1"></i> Degree</div>
+                            <div class="value">PhD Behavior, DLSU</div>
+                        </div>
+                        <div class="doctor-modal-info-item">
+                            <div class="label"><i class="fa fa-clock me-1"></i> Exp.</div>
+                            <div class="value">10+ Years</div>
+                        </div>
+                        <div class="doctor-modal-info-item full-width">
+                            <div class="label"><i class="fa fa-stethoscope me-1"></i> Specialty</div>
+                            <div class="value">Feline Psychology & Calm Therapy</div>
+                        </div>
+                    </div>
+
+                    <p class="text-muted small text-center px-2 mb-0" style="line-height:1.7;">
+                        Dr. Roberts has a natural affinity for cats, offering specialized insights into behavioral issues and stress-free handling for all feline patients.
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+
+    <script>
+    // â”€â”€ Modal switcher: cleanly hides all modals then shows the target â”€â”€
+    function switchToModal(targetId) {
+        // Close every open modal
+        document.querySelectorAll('.modal.show').forEach(function(m) {
+            var inst = bootstrap.Modal.getInstance(m);
+            if (inst) inst.hide();
+        });
+        // Clean up any lingering backdrop + body state
+        function doShow() {
+            document.querySelectorAll('.modal-backdrop').forEach(function(el){ el.remove(); });
+            document.body.classList.remove('modal-open');
+            document.body.style.removeProperty('overflow');
+            document.body.style.removeProperty('padding-right');
+            var el = document.getElementById(targetId);
+            if (el) (new bootstrap.Modal(el)).show();
+        }
+        // Small delay to let fade-out finish
+        setTimeout(doShow, 350);
+    }
+        // ============ INIT ============
+        document.addEventListener('DOMContentLoaded', function() {
+
+            // ============ SCROLL REVEAL ============
+            const revealElements = document.querySelectorAll('.reveal, .reveal-left, .reveal-right, .reveal-scale, .reveal-stagger');
+
+            const revealObserver = new IntersectionObserver((entries) => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        entry.target.classList.add('visible');
+                        revealObserver.unobserve(entry.target);
+                    }
+                });
+            }, {
+                threshold: 0.1,
+                rootMargin: '0px 0px -50px 0px'
+            });
+
+            revealElements.forEach(el => revealObserver.observe(el));
+
+            // ============ SCROLL PROGRESS BAR ============
+            const progressBar = document.getElementById('scroll-progress');
+            window.addEventListener('scroll', function() {
+                const scrollTop = window.scrollY;
+                const docHeight = document.documentElement.scrollHeight - window.innerHeight;
+                const scrollPercent = (scrollTop / docHeight) * 100;
+                progressBar.style.width = scrollPercent + '%';
+            });
+
+            // ============ BACK TO TOP ============
+            const backToTop = document.getElementById('back-to-top');
+            window.addEventListener('scroll', function() {
+                if (window.scrollY > 500) {
+                    backToTop.classList.add('visible');
+                } else {
+                    backToTop.classList.remove('visible');
+                }
+            });
+
+            backToTop.addEventListener('click', function() {
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+            });
+
+            // ============ NAVBAR SCROLL EFFECT ============
+            const navbar = document.getElementById('mainNavbar');
+            window.addEventListener('scroll', function() {
+                if (window.scrollY > 50) {
+                    navbar.classList.add('scrolled');
+                } else {
+                    navbar.classList.remove('scrolled');
+                }
+            });
+
+            // ============ ACTIVE NAV LINK ON SCROLL ============
+            const sections = document.querySelectorAll('section[id]');
+            const navLinks = document.querySelectorAll('.nav-link');
+
+            window.addEventListener('scroll', function() {
+                let current = '';
+                sections.forEach(section => {
+                    const sectionTop = section.offsetTop - 150;
+                    if (window.scrollY >= sectionTop) {
+                        current = section.getAttribute('id');
+                    }
+                });
+                navLinks.forEach(link => {
+                    link.classList.remove('active');
+                    if (link.getAttribute('href') === '#' + current) {
+                        link.classList.add('active');
+                    }
+                });
+            });
+
+            // ============ RIPPLE EFFECT ============
+            document.addEventListener('click', function(e) {
+                const target = e.target.closest('.ripple');
+                if (!target) return;
+
+                const rect = target.getBoundingClientRect();
+                const ripple = document.createElement('span');
+                ripple.className = 'ripple-effect';
+                const size = Math.max(rect.width, rect.height);
+                ripple.style.width = ripple.style.height = size + 'px';
+                ripple.style.left = (e.clientX - rect.left - size / 2) + 'px';
+                ripple.style.top = (e.clientY - rect.top - size / 2) + 'px';
+                target.appendChild(ripple);
+                setTimeout(() => ripple.remove(), 600);
+            });
+
+            // ============ COUNTER ANIMATION ============
+            const counters = document.querySelectorAll('.counter-number');
+
+            const counterObserver = new IntersectionObserver((entries) => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        const counter = entry.target;
+                        const target = parseInt(counter.getAttribute('data-target'));
+                        const suffix = counter.textContent.includes('%') ? '%' : counter.textContent.includes('/') ? '/7' : '';
+                        let current = 0;
+                        const increment = target / 60;
+                        const updateCounter = () => {
+                            current += increment;
+                            if (current < target) {
+                                if (suffix === '/7') {
+                                    counter.textContent = Math.ceil(current) + suffix;
+                                } else {
+                                    counter.textContent = Math.ceil(current) + suffix;
+                                }
+                                requestAnimationFrame(updateCounter);
+                            } else {
+                                counter.textContent = target + suffix;
+                            }
+                        };
+                        updateCounter();
+                        counterObserver.unobserve(counter);
+                    }
+                });
+            }, { threshold: 0.5 });
+
+            counters.forEach(c => counterObserver.observe(c));
+
+            // ============ PAW CURSOR TRAIL ============
+            const pawEmojis = ['🐾', '🐾'];
+            let lastPaw = 0;
+
+            document.addEventListener('mousemove', function(e) {
+                const now = Date.now();
+                if (now - lastPaw < 120) return;
+                lastPaw = now;
+
+                const paw = document.createElement('div');
+                paw.className = 'paw-trail';
+                paw.textContent = pawEmojis[Math.floor(Math.random() * pawEmojis.length)];
+                paw.style.left = e.clientX + 'px';
+                paw.style.top = e.clientY + 'px';
+                paw.style.fontSize = (14 + Math.random() * 10) + 'px';
+                document.body.appendChild(paw);
+
+                setTimeout(() => paw.remove(), 1200);
+            });
+
+            // ============ IMAGE TILT (PARALLAX ON HOVER) ============
+            const tiltImages = document.querySelectorAll('.tilt-image');
+            tiltImages.forEach(img => {
+                img.addEventListener('mousemove', function(e) {
+                    const rect = this.getBoundingClientRect();
+                    const x = e.clientX - rect.left;
+                    const y = e.clientY - rect.top;
+                    const centerX = rect.width / 2;
+                    const centerY = rect.height / 2;
+                    const rotateX = (y - centerY) / centerY * -8;
+                    const rotateY = (x - centerX) / centerX * 8;
+                    this.style.transform = `scale(1.05) rotateX(${rotateX}deg) rotateY(${rotateY}deg)`;
+                });
+
+                img.addEventListener('mouseleave', function() {
+                    this.style.transform = 'scale(1) rotateX(0) rotateY(0)';
+                });
+            });
+
+            // ============ LIGHTBOX ============
+            window.openLightbox = function(item) {
+                const img = item.querySelector('img');
+                const lightbox = document.getElementById('lightbox');
+                const lightboxImg = document.getElementById('lightboxImg');
+                lightboxImg.src = img.src;
+                lightboxImg.alt = img.alt;
+                lightbox.classList.add('active');
+                document.body.style.overflow = 'hidden';
+            };
+
+            document.getElementById('lightboxClose').addEventListener('click', function() {
+                document.getElementById('lightbox').classList.remove('active');
+                document.body.style.overflow = '';
+            });
+
+            document.getElementById('lightbox').addEventListener('click', function(e) {
+                if (e.target === this) {
+                    this.classList.remove('active');
+                    document.body.style.overflow = '';
+                }
+            });
+
+            document.addEventListener('keydown', function(e) {
+                if (e.key === 'Escape') {
+                    document.getElementById('lightbox').classList.remove('active');
+                    document.body.style.overflow = '';
+                }
+            });
+
+        });
+
+        // ============ MODAL AUTO SHOW ============
+        <?php if (isset($_SESSION['show_modal'])): ?>
+            document.addEventListener("DOMContentLoaded", function() {
+                var authModal = new bootstrap.Modal(document.getElementById('authModal'));
+                authModal.show();
+                <?php if ($_SESSION['show_modal'] === 'register'): ?>
+                    var triggerEl = document.querySelector('button[data-bs-target="#register"]');
+                    var tab = new bootstrap.Tab(triggerEl);
+                    tab.show();
+                <?php endif; ?>
+            });
+            <?php
+            unset($_SESSION['show_modal']);
+            unset($_SESSION['login_email']);
+            unset($_SESSION['reg_email']);
+            unset($_SESSION['reg_fullname']);
+        endif;
+        ?>
+
+        // ============ AUTO DISMISS ALERTS ============
+        setTimeout(function() {
+            let alerts = document.querySelectorAll('.alert-container');
+            alerts.forEach(a => {
+                a.style.transition = 'opacity 0.5s ease-out, transform 0.5s ease-out';
+                a.style.opacity = '0';
+                a.style.transform = 'translateY(-20px)';
+                setTimeout(() => a.remove(), 500);
+            });
+        }, 4500);
+
+        // ============ FORGOT PASSWORD AJAX FUNCTIONS ============
+
+        /* Show an alert inside the forgot modal */
+        function forgotShowAlert(type, message) {
+            var container = document.getElementById('forgotAlertContainer');
+            var bg = type === 'success' ? '#f0fdf4' : '#fff1f2';
+            var color = type === 'success' ? '#15803d' : '#be123c';
+            var icon = type === 'success' ? 'check' : 'exclamation';
+            container.innerHTML = '<div class="alert alert-' + type + ' px-3 py-2 text-center small fw-bold mb-4 border-0 shadow-sm" style="border-radius:12px;background:' + bg + ';color:' + color + ';">' +
+                '<i class="fa fa-' + icon + '-circle me-2"></i>' + message + '</div>';
+        }
+
+        /* Show a specific step, hide others */
+        function forgotShowStep(step) {
+            document.getElementById('forgotStep1').style.display = step === 1 ? 'block' : 'none';
+            document.getElementById('forgotStep2').style.display = step === 2 ? 'block' : 'none';
+            document.getElementById('forgotStep3').style.display = step === 3 ? 'block' : 'none';
+        }
+
+        /* Step 1: Send verification code */
+        function forgotSendCode() {
+            var email = document.getElementById('fpEmail').value.trim();
+            if (!email) {
+                forgotShowAlert('danger', 'Please enter your email address.');
+                return;
+            }
+            var btn = document.getElementById('fpSendCodeBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fa fa-spinner fa-spin me-2"></i>Sending...';
+
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', 'ajax_forgot_password.php', true);
+            xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+            xhr.onload = function() {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fa fa-paper-plane me-2"></i>Send Code';
+                try {
+                    var resp = JSON.parse(xhr.responseText);
+                    if (resp.status === 'success') {
+                        document.getElementById('fpEmailDisplay').textContent = email;
+                        forgotShowAlert('success', resp.message);
+                        forgotShowStep(2);
+                        document.getElementById('fpOtp').value = '';
+                        document.getElementById('fpOtp').focus();
+                    } else {
+                        forgotShowAlert('danger', resp.message);
+                    }
+                } catch(e) {
+                    forgotShowAlert('danger', 'Server error. Please try again.');
+                }
+            };
+            xhr.onerror = function() {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fa fa-paper-plane me-2"></i>Send Code';
+                forgotShowAlert('danger', 'Network error. Please try again.');
+            };
+            xhr.send('action=send_code&email=' + encodeURIComponent(email));
+        }
+
+        /* Step 2: Verify OTP code */
+        function forgotVerifyCode() {
+            var otp = document.getElementById('fpOtp').value.trim();
+            if (!otp || otp.length !== 6 || !/^\d{6}$/.test(otp)) {
+                forgotShowAlert('danger', 'Please enter a valid 6-digit code.');
+                return;
+            }
+            var btn = document.getElementById('fpVerifyBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fa fa-spinner fa-spin me-2"></i>Verifying...';
+
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', 'ajax_forgot_password.php', true);
+            xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+            xhr.onload = function() {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fa fa-check-shield me-2"></i>Verify Code';
+                try {
+                    var resp = JSON.parse(xhr.responseText);
+                    if (resp.status === 'success') {
+                        forgotShowAlert('success', resp.message);
+                        forgotShowStep(3);
+                        document.getElementById('fpNewPass').value = '';
+                        document.getElementById('fpConfirmPass').value = '';
+                        document.getElementById('fpNewPass').focus();
+                    } else {
+                        forgotShowAlert('danger', resp.message);
+                        if (resp.step === 1) {
+                            forgotShowStep(1);
+                        }
+                    }
+                } catch(e) {
+                    forgotShowAlert('danger', 'Server error. Please try again.');
+                }
+            };
+            xhr.onerror = function() {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fa fa-check-shield me-2"></i>Verify Code';
+                forgotShowAlert('danger', 'Network error. Please try again.');
+            };
+            xhr.send('action=verify_code&otp=' + encodeURIComponent(otp));
+        }
+
+        /* Step 3: Reset password */
+        function forgotResetPassword() {
+            var newPass = document.getElementById('fpNewPass').value;
+            var confirmPass = document.getElementById('fpConfirmPass').value;
+
+            if (newPass.length < 8) {
+                forgotShowAlert('danger', 'Password must be at least 8 characters long.');
+                return;
+            }
+            if (newPass !== confirmPass) {
+                forgotShowAlert('danger', 'Passwords do not match.');
+                return;
+            }
+
+            var btn = document.getElementById('fpResetBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fa fa-spinner fa-spin me-2"></i>Resetting...';
+
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', 'ajax_forgot_password.php', true);
+            xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+            xhr.onload = function() {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fa fa-lock me-2"></i>Reset Password';
+                try {
+                    var resp = JSON.parse(xhr.responseText);
+                    if (resp.status === 'success') {
+                        // Show success and redirect to login modal
+                        forgotShowAlert('success', resp.message);
+                        setTimeout(function() {
+                            var authBody = document.querySelector('#authModal .modal-body-saas');
+                            authBody.insertAdjacentHTML('afterbegin',
+                                '<div class="alert alert-success px-3 py-2 text-center small fw-bold mb-4 border-0 shadow-sm" style="border-radius:12px;background:#f0fdf4;color:#15803d;">' +
+                                '<i class="fa fa-check-circle me-2"></i>Password changed successfully! You can now log in.</div>');
+                            forgotShowStep(1);
+                            document.getElementById('forgotAlertContainer').innerHTML = '';
+                            document.getElementById('fpEmail').value = '';
+                            switchToModal('authModal');
+                        }, 2000);
+                    } else {
+                        forgotShowAlert('danger', resp.message);
+                        if (resp.step === 1) {
+                            forgotShowStep(1);
+                        }
+                    }
+                } catch(e) {
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="fa fa-lock me-2"></i>Reset Password';
+                    forgotShowAlert('danger', 'Server error. Please try again.');
+                }
+            };
+            xhr.onerror = function() {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fa fa-lock me-2"></i>Reset Password';
+                forgotShowAlert('danger', 'Network error. Please try again.');
+            };
+            xhr.send('action=reset_password&new_pass=' + encodeURIComponent(newPass) + '&confirm_pass=' + encodeURIComponent(confirmPass));
+        }
+
+        /* Restart forgot password flow */
+        function forgotRestart() {
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', 'ajax_forgot_password.php', true);
+            xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+            xhr.onload = function() {
+                forgotShowStep(1);
+                document.getElementById('forgotAlertContainer').innerHTML = '';
+                document.getElementById('fpEmail').value = '';
+                document.getElementById('fpOtp').value = '';
+                document.getElementById('fpNewPass').value = '';
+                document.getElementById('fpConfirmPass').value = '';
+                document.getElementById('fpEmail').focus();
+            };
+            xhr.send('action=restart');
+        }
+
+        /* Reset forgot modal when it's hidden */
+        document.addEventListener('DOMContentLoaded', function() {
+            var forgotModalEl = document.getElementById('forgotModal');
+            forgotModalEl.addEventListener('hidden.bs.modal', function() {
+                forgotRestart();
+            });
+        });
+
+        /* Block Enter key on OTP input to allow form-style submission */
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') {
+                var step2 = document.getElementById('forgotStep2');
+                var step3 = document.getElementById('forgotStep3');
+                if (step2.style.display !== 'none' && document.activeElement === document.getElementById('fpOtp')) {
+                    e.preventDefault();
+                    forgotVerifyCode();
+                } else if (step3.style.display !== 'none' && (document.activeElement === document.getElementById('fpNewPass') || document.activeElement === document.getElementById('fpConfirmPass'))) {
+                    e.preventDefault();
+                    forgotResetPassword();
+                }
+            }
+        });
+    </script>
+
+    <!-- ==================== TERMS & CONDITIONS MODAL ==================== -->
+    <div class="terms-modal" id="termsModal">
+        <div class="terms-modal-content">
+            <div class="terms-modal-header">
+                <h3><i class="fa fa-file-contract me-2" style="color:var(--primary-light);"></i> Terms & Conditions</h3>
+                <button class="close-btn" onclick="closeTermsModal()"><i class="fa fa-times"></i></button>
+            </div>
+            <div class="terms-modal-body">
+                <h4>PragmaVet</h4>
+                <p class="last-updated"><i class="fa fa-calendar me-1"></i> Last Updated: July 2026</p>
+                <p>Welcome to Pragmavet. By creating an account, logging in, or using our web portal, you agree to comply with and be bound by the following terms and conditions. Please read them carefully.</p>
+                <h5>1. Services Provided</h5>
+                <p>Pragmavet provides an online portal for managing pet medical records, booking veterinary appointments, and communicating with clinic staff. This platform does not provide automated medical diagnoses.</p>
+                <h5>2. No Emergency Medical Advice</h5>
+                <p>The information and communication tools on this web page are NOT a substitute for professional veterinary medical advice, diagnosis, or treatment. If your animal is experiencing a medical emergency, you must contact Pragmavet directly via phone or visit an emergency veterinary hospital immediately. Do not rely on web portal messaging for emergencies.</p>
+                <h5>3. Account Responsibility</h5>
+                <p>You are responsible for maintaining the confidentiality of your login credentials. You agree to provide accurate, current, and complete information about yourself and your pets. Pragmavet reserves the right to suspend or terminate accounts that provide false information or misuse the platform.</p>
+                <h5>4. Appointment Cancellation Policy</h5>
+                <p>Appointments booked through this portal must be cancelled or rescheduled at least 24 hours in advance. Failure to do so may result in a cancellation fee billed to your account.</p>
+                <h5>5. Limitation of Liability</h5>
+                <p>Pragmavet and its staff shall not be liable for any indirect, incidental, or consequential damages resulting from the use or inability to use this web portal, or from reliance on any information provided herein.</p>
+                <h5>6. Changes to Terms</h5>
+                <p>We reserve the right to modify these terms at any time. Continued use of the portal after changes are posted constitutes your acceptance of the new terms.</p>
+            </div>
+            <div class="terms-modal-accept">
+                <button class="btn-gradient" onclick="closeTermsModal()">
+                    <i class="fa fa-check me-1"></i> Got It
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== PRIVACY POLICY MODAL ==================== -->
+    <div class="terms-modal" id="privacyModal">
+        <div class="terms-modal-content">
+            <div class="terms-modal-header">
+                <h3><i class="fa fa-shield-alt me-2" style="color:var(--primary-light);"></i> Privacy Policy</h3>
+                <button class="close-btn" onclick="closePrivacyModal()"><i class="fa fa-times"></i></button>
+            </div>
+            <div class="terms-modal-body">
+                <h4>PragmaVet Privacy Policy</h4>
+                <p class="last-updated"><i class="fa fa-calendar me-1"></i> Last Updated: July 2026</p>
+                <p>PragmaVet ("we," "our," or "us") is committed to protecting your privacy. This Privacy Policy explains how we collect, use, disclose, and safeguard your information when you use our veterinary management portal.</p>
+                <h5>1. Information We Collect</h5>
+                <p>We collect personal information that you voluntarily provide to us when you register, including your name, email address, phone number, home address, and pet health information. We also collect data on how you interact with our portal.</p>
+                <h5>2. How We Use Your Information</h5>
+                <p>We use the information we collect to provide, maintain, and improve our veterinary services; to process appointments; to communicate with you regarding your pet's care; and to send administrative information such as updates, security alerts, and support messages.</p>
+                <h5>3. Data Protection</h5>
+                <p>We implement a variety of security measures to maintain the safety of your personal information, including SSL/TLS encryption, secure server storage, and access controls.</p>
+                <h5>4. Data Retention</h5>
+                <p>We retain your personal information for as long as your account is active or as needed to provide you services. You can request deletion of your data by contacting us directly.</p>
+                <h5>5. Third-Party Disclosure</h5>
+                <p>We do not sell, trade, or otherwise transfer your personally identifiable information to outside parties without your consent, except as required by law.</p>
+                <h5>6. Contact</h5>
+                <p>If you have questions about this Privacy Policy, please contact us at pragmavet@gmail.com or visit our clinic at 0234 Unit B Palico St, Palico 4, Imus, Cavite.</p>
+            </div>
+            <div class="terms-modal-accept">
+                <button class="btn-gradient" onclick="closePrivacyModal()">
+                    <i class="fa fa-check me-1"></i> Got It
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal Scripts -->
+    <script>
+    /* ===== AUTH TAB SWITCHING ===== */
+    function switchAuthTab(tab) {
+        // Update tab buttons
+        document.querySelectorAll('.auth-tab-modal').forEach(function(btn) {
+            btn.classList.remove('active');
+            btn.style.background = 'transparent';
+            btn.style.color = 'var(--gray-500)';
+            btn.style.boxShadow = 'none';
+        });
+        var activeBtn = document.getElementById(tab === 'login' ? 'tabLoginBtn' : 'tabRegisterBtn');
+        activeBtn.classList.add('active');
+        activeBtn.style.background = 'white';
+        activeBtn.style.color = 'var(--primary)';
+        activeBtn.style.boxShadow = 'var(--shadow-sm)';
+
+        // Update panels
+        document.getElementById('panelLogin').style.display = tab === 'login' ? 'block' : 'none';
+        document.getElementById('panelRegister').style.display = tab === 'register' ? 'block' : 'none';
+
+        // Update header
+        document.getElementById('authModalTitle').textContent = tab === 'login' ? 'LOGIN' : 'CREATE ACCOUNT';
+        document.getElementById('authModalSub').textContent = tab === 'login' ? 'Manage your pet\'s health securely' : 'Join PragmaVet for professional pet care';
+    }
+
+    function toggleRegisterBtnModal() {
+        document.getElementById('registerBtnModal').disabled = !document.getElementById('agreeTermsModal').checked;
+    }
+
+    function validateRegisterModal() { return false; } // legacy ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no longer used
+
+    // ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ Registration OTP Flow ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
+    var _regEmail = '';
+
+    function regShowAlert(id, type, msg) {
+        var el = document.getElementById(id);
+        el.style.display = 'block';
+        el.innerHTML = '<div class="alert alert-' + type + ' py-2 px-3 rounded-3 mb-0" style="font-size:13px;">' +
+                       '<i class="fa fa-' + (type === 'danger' ? 'circle-xmark' : type === 'success' ? 'check-circle' : 'info-circle') + ' me-1"></i>' + msg + '</div>';
+    }
+    function regHideAlert(id) { document.getElementById(id).style.display = 'none'; }
+
+    function regSendOtp() {
+        var fullname = document.getElementById('regFullname').value.trim();
+        var email    = document.getElementById('regEmail').value.trim();
+        var address  = document.getElementById('regAddress').value.trim();
+        var password = document.getElementById('regPassword').value;
+
+        if (!fullname || !email || !address || !password) {
+            regShowAlert('regAlert', 'danger', 'Please fill in all fields.');
+            return;
+        }
+        if (!/^(?=.*[a-z])(?=.*\d)[a-z0-9]{8,}$/.test(password)) {
+            regShowAlert('regAlert', 'danger', 'Password must be at least 8 characters, lowercase letters and numbers only.');
+            return;
+        }
+
+        // Show spinner
+        document.getElementById('regBtnText').style.display = 'none';
+        document.getElementById('regBtnSpinner').style.display = '';
+        document.getElementById('registerBtnModal').disabled = true;
+        regHideAlert('regAlert');
+
+        var fd = new FormData();
+        fd.append('step', 'send_otp');
+        fd.append('fullname', fullname);
+        fd.append('email', email);
+        fd.append('address', address);
+        fd.append('password', password);
+
+        fetch('register_ajax.php', { method: 'POST', body: fd })
+            .then(r => r.json())
+            .then(data => {
+                document.getElementById('regBtnText').style.display = '';
+                document.getElementById('regBtnSpinner').style.display = 'none';
+                document.getElementById('registerBtnModal').disabled = false;
+
+                if (data.success) {
+                    _regEmail = email;
+                    document.getElementById('regOtpEmailDisplay').textContent = email;
+                    document.getElementById('regStep1').style.display = 'none';
+                    document.getElementById('regStep2').style.display = 'block';
+                    document.getElementById('regOtpInput').value = '';
+                    document.getElementById('regOtpInput').focus();
+                } else {
+                    regShowAlert('regAlert', 'danger', data.message);
+                }
+            })
+            .catch(() => {
+                document.getElementById('regBtnText').style.display = '';
+                document.getElementById('regBtnSpinner').style.display = 'none';
+                document.getElementById('registerBtnModal').disabled = false;
+                regShowAlert('regAlert', 'danger', 'Network error. Please check your connection.');
+            });
+    }
+
+    function regVerifyOtp() {
+        var otp = document.getElementById('regOtpInput').value.trim();
+        if (!otp || otp.length !== 6 || !/^\d{6}$/.test(otp)) {
+            regShowAlert('regOtpAlert', 'danger', 'Please enter the 6-digit code sent to your email.');
+            return;
+        }
+        document.getElementById('regVerifyText').style.display = 'none';
+        document.getElementById('regVerifySpinner').style.display = '';
+        document.getElementById('regVerifyBtn').disabled = true;
+        regHideAlert('regOtpAlert');
+
+        var fd = new FormData();
+        fd.append('step', 'verify_otp');
+        fd.append('email', _regEmail);
+        fd.append('otp', otp);
+
+        fetch('register_ajax.php', { method: 'POST', body: fd })
+            .then(r => r.json())
+            .then(data => {
+                document.getElementById('regVerifyText').style.display = '';
+                document.getElementById('regVerifySpinner').style.display = 'none';
+                document.getElementById('regVerifyBtn').disabled = false;
+
+                if (data.success) {
+                    regShowAlert('regOtpAlert', 'success', '&#10003; ' + data.message + ' Redirecting to login&hellip;');
+                    setTimeout(() => {
+                        // Switch to login tab
+                        document.getElementById('regStep2').style.display = 'none';
+                        document.getElementById('regStep1').style.display = 'block';
+                        document.getElementById('regOtpInput').value = '';
+                        if (typeof switchToLogin === 'function') switchToLogin();
+                        else document.getElementById('tabLogin').click();
+                    }, 2000);
+                } else {
+                    regShowAlert('regOtpAlert', 'danger', data.message);
+                }
+            })
+            .catch(() => {
+                document.getElementById('regVerifyText').style.display = '';
+                document.getElementById('regVerifySpinner').style.display = 'none';
+                document.getElementById('regVerifyBtn').disabled = false;
+                regShowAlert('regOtpAlert', 'danger', 'Network error. Please try again.');
+            });
+    }
+
+    function regResendOtp() {
+        regHideAlert('regOtpAlert');
+        var fd = new FormData();
+        fd.append('step', 'resend_otp');
+        fd.append('email', _regEmail);
+        fetch('register_ajax.php', { method: 'POST', body: fd })
+            .then(r => r.json())
+            .then(data => {
+                regShowAlert('regOtpAlert', data.success ? 'info' : 'danger', data.message);
+            });
+    }
+
+    function regGoBack() {
+        document.getElementById('regStep2').style.display = 'none';
+        document.getElementById('regStep1').style.display = 'block';
+        regHideAlert('regOtpAlert');
+    }
+
+
+
+    function openTermsModal() {
+        document.getElementById('termsModal').classList.add('active');
+        document.body.style.overflow = 'hidden';
+    }
+    function closeTermsModal() {
+        document.getElementById('termsModal').classList.remove('active');
+        document.body.style.overflow = '';
+    }
+    function openPrivacyModal() {
+        document.getElementById('privacyModal').classList.add('active');
+        document.body.style.overflow = 'hidden';
+    }
+    function closePrivacyModal() {
+        document.getElementById('privacyModal').classList.remove('active');
+        document.body.style.overflow = '';
+    }
+    document.querySelectorAll('.terms-modal').forEach(function(mod) {
+        mod.addEventListener('click', function(e) {
+            if (e.target === this) {
+                this.classList.remove('active');
+                document.body.style.overflow = '';
+            }
+        });
+    });
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') {
+            document.querySelectorAll('.terms-modal.active').forEach(function(mod) {
+                mod.classList.remove('active');
+                document.body.style.overflow = '';
+            });
+        }
+    });
+    </script>
+
+    <style>
+    /* Terms Modal Styles */
+    .terms-modal {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: rgba(0,0,0,0.6);
+        backdrop-filter: blur(8px);
+        z-index: 99999;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+    }
+    .terms-modal.active { display: flex; }
+    .terms-modal-content {
+        background: white;
+        border-radius: var(--radius-lg);
+        max-width: 680px;
+        width: 100%;
+        max-height: 80vh;
+        overflow-y: auto;
+        box-shadow: 0 30px 80px rgba(0,0,0,0.3);
+        animation: modalIn 0.3s cubic-bezier(0.25,0.46,0.45,0.94);
+    }
+    @keyframes modalIn {
+        from { opacity: 0; transform: scale(0.95) translateY(20px); }
+        to { opacity: 1; transform: scale(1) translateY(0); }
+    }
+    .terms-modal-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 28px 32px 20px;
+        border-bottom: 1px solid var(--gray-200);
+        position: sticky;
+        top: 0;
+        background: white;
+        z-index: 2;
+        border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+    }
+    .terms-modal-header h3 { font-weight: 800; color: var(--dark); margin: 0; font-size: 20px; }
+    .terms-modal-header .close-btn {
+        width: 40px; height: 40px; border-radius: 50%; border: none;
+        background: var(--gray-200); color: var(--gray-500);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 18px; cursor: pointer; transition: var(--transition);
+    }
+    .terms-modal-header .close-btn:hover { background: #fee2e2; color: #ef4444; transform: rotate(90deg); }
+    .terms-modal-body { padding: 28px 32px 32px; }
+    .terms-modal-body h4 { font-size: 20px; font-weight: 800; color: var(--primary); margin-bottom: 4px; }
+    .terms-modal-body .last-updated { font-size: 13px; color: var(--gray-400); margin-bottom: 24px; }
+    .terms-modal-body h5 { font-weight: 700; color: var(--dark); margin-top: 24px; margin-bottom: 8px; font-size: 15px; }
+    .terms-modal-body p { font-size: 14px; line-height: 1.7; color: var(--gray-600); margin-bottom: 12px; }
+    .terms-modal-accept {
+        padding: 20px 32px 28px;
+        border-top: 1px solid var(--gray-200);
+        text-align: center;
+    }
+    .terms-modal-accept .btn-gradient { width: auto; min-width: 200px; padding: 14px 36px; }
+    @media (max-width: 520px) {
+        .terms-modal-content { max-height: 90vh; }
+        .terms-modal-header { padding: 20px 24px 16px; }
+        .terms-modal-body { padding: 20px 24px 24px; }
+        .terms-modal-accept { padding: 16px 24px 20px; }
+    }
+    </style>
+
+    <script src="mousetrail.js"></script>
+    <script>
+    // Show / hide toggle on password fields in the login, sign-up and forgot-password windows (display only)
+    document.addEventListener('DOMContentLoaded', function () {
+        document.querySelectorAll('#authModal input[type="password"], #forgotModal input[type="password"]').forEach(function (inp) {
+            if (inp.parentElement.classList.contains('pv-pass-wrap')) return;
+            var wrap = document.createElement('div');
+            wrap.className = 'pv-pass-wrap';
+            inp.parentNode.insertBefore(wrap, inp);
+            wrap.appendChild(inp);
+            var eye = document.createElement('button');
+            eye.type = 'button';
+            eye.className = 'pv-eye';
+            eye.setAttribute('aria-label', 'Show password');
+            eye.innerHTML = '<i class="fa fa-eye"></i>';
+            eye.addEventListener('click', function () {
+                var show = inp.type === 'password';
+                inp.type = show ? 'text' : 'password';
+                eye.innerHTML = show ? '<i class="fa fa-eye-slash"></i>' : '<i class="fa fa-eye"></i>';
+                eye.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+                inp.focus();
+            });
+            wrap.appendChild(eye);
+        });
+    });
+    </script>
+</body>
+
+</html>

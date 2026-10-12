@@ -1,0 +1,255 @@
+/**
+ * ================================================================
+ * PRAGMAVET MOUSE TRAIL + GLOBAL EFFECTS
+ * FULLY SELF-CONTAINED — injects its own CSS + HTML elements
+ * Works on ANY page with just ONE script tag — no other files needed
+ * ================================================================
+ * 
+ * Just add this ONE line before </body> on any page:
+ *   <script src="mousetrail.js"></script>
+ * 
+ * You get immediately:
+ *    🐾 Paw cursor trail everywhere
+ *    💥 Ripple click on ALL buttons
+ *    📜 Scroll progress bar
+ *    ⬆️ Back-to-top button
+ *    🔄 Scroll reveal animations
+ *    🔔 Auto-dismiss alerts
+ * ================================================================
+ */
+(function() {
+    'use strict';
+
+    // =============================================================
+    // 1. INJECT REQUIRED CSS INTO THE PAGE
+    // =============================================================
+    var style = document.createElement('style');
+    style.textContent = `
+        /* 🐾 Paw trail */
+        .paw-trail {
+            position: fixed;
+            pointer-events: none;
+            z-index: 99999;
+            font-size: 18px;
+            animation: pragmavetPawFade 1.2s ease-out forwards;
+        }
+        @keyframes pragmavetPawFade {
+            0%   { opacity: 1; transform: translate(0,0) scale(1) rotate(0deg); }
+            50%  { opacity: 0.7; transform: translate(10px,-20px) scale(0.8) rotate(15deg); }
+            100% { opacity: 0; transform: translate(20px,-40px) scale(0.4) rotate(30deg); }
+        }
+        /* 💥 Ripple effect */
+        .ripple-effect {
+            position: absolute;
+            border-radius: 50%;
+            background: rgba(255,255,255,0.4);
+            transform: scale(0);
+            animation: pragmavetRippleAnim 0.6s linear;
+            pointer-events: none;
+        }
+        @keyframes pragmavetRippleAnim {
+            to { transform: scale(4); opacity: 0; }
+        }
+        .ripple-container {
+            position: relative;
+            overflow: hidden;
+        }
+        /* 📜 Scroll progress bar */
+        #pragmavet-scroll-progress {
+            position: fixed;
+            top: 0; left: 0;
+            height: 3px;
+            background: linear-gradient(135deg, #5EC4E6 0%, #1E7FA8 100%);
+            z-index: 10000;
+            width: 0%;
+            transition: width 0.1s linear;
+        }
+        /* ⬆️ Back to top */
+        #pragmavet-back-to-top {
+            position: fixed;
+            bottom: 30px; right: 30px;
+            width: 50px; height: 50px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #5EC4E6 0%, #1E7FA8 100%);
+            color: white; border: none;
+            font-size: 20px; cursor: pointer;
+            opacity: 0;
+            transform: translateY(20px) scale(0.8);
+            transition: all 0.4s cubic-bezier(0.25,0.46,0.45,0.94);
+            z-index: 9999;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 0 25px rgba(94,196,230,0.3);
+        }
+        #pragmavet-back-to-top.visible {
+            opacity: 1;
+            transform: translateY(0) scale(1);
+        }
+        #pragmavet-back-to-top:hover {
+            transform: translateY(-5px) scale(1.1);
+            box-shadow: 0 0 40px rgba(94,196,230,0.5);
+        }
+        /* 🔄 Scroll reveal */
+        .pm-reveal {
+            opacity: 0;
+            transform: translateY(40px);
+            transition: opacity 0.8s cubic-bezier(0.25,0.46,0.45,0.94), transform 0.8s cubic-bezier(0.25,0.46,0.45,0.94);
+        }
+        .pm-reveal.visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+        .pm-reveal-left {
+            opacity: 0;
+            transform: translateX(-50px);
+            transition: opacity 0.8s ease, transform 0.8s ease;
+        }
+        .pm-reveal-left.visible {
+            opacity: 1;
+            transform: translateX(0);
+        }
+        .pm-reveal-right {
+            opacity: 0;
+            transform: translateX(50px);
+            transition: opacity 0.8s ease, transform 0.8s ease;
+        }
+        .pm-reveal-right.visible {
+            opacity: 1;
+            transform: translateX(0);
+        }
+    `;
+    document.head.appendChild(style);
+
+    // =============================================================
+    // 2. INJECT SCROLL PROGRESS BAR + BACK-TO-TOP HTML
+    // =============================================================
+    if (!document.getElementById('pragmavet-scroll-progress')) {
+        var progressBar = document.createElement('div');
+        progressBar.id = 'pragmavet-scroll-progress';
+        document.body.insertBefore(progressBar, document.body.firstChild);
+    }
+
+    if (!document.getElementById('pragmavet-back-to-top')) {
+        var backBtn = document.createElement('button');
+        backBtn.id = 'pragmavet-back-to-top';
+        backBtn.setAttribute('aria-label', 'Back to top');
+        backBtn.innerHTML = '<i class="fa fa-arrow-up"></i>';
+        document.body.appendChild(backBtn);
+    }
+
+    // =============================================================
+    // 3. WAIT FOR DOM, THEN INITIALIZE ALL EFFECTS
+    // =============================================================
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initEffects);
+    } else {
+        initEffects();
+    }
+
+    function initEffects() {
+        /* ==========================================================
+           3a. 🐾 PAW CURSOR TRAIL
+           ========================================================== */
+        var pawEmojis = ['🐾', '🐾'];
+        var lastPaw = 0;
+        document.addEventListener('mousemove', function(e) {
+            var now = Date.now();
+            if (now - lastPaw < 120) return;
+            lastPaw = now;
+            var paw = document.createElement('div');
+            paw.className = 'paw-trail';
+            paw.textContent = pawEmojis[Math.floor(Math.random() * pawEmojis.length)];
+            paw.style.left = e.clientX + 'px';
+            paw.style.top = e.clientY + 'px';
+            paw.style.fontSize = (14 + Math.random() * 10) + 'px';
+            document.body.appendChild(paw);
+            setTimeout(function() { paw.remove(); }, 1200);
+        });
+
+        /* ==========================================================
+           3b. 💥 RIPPLE CLICK ON ALL BUTTONS
+           ========================================================== */
+        document.addEventListener('click', function(e) {
+            var target = e.target.closest('button, .btn, a[href], [role="button"], .btn-gradient, .btn-modal-primary, .btn-login-nav, .btn-outline-dashboard, .btn-outline-light-custom, .btn-call, .btn-directions, .btn-profile, .btn-primary, .btn-secondary, input[type="submit"]');
+            if (!target) return;
+
+            // Ensure position relative for ripple positioning
+            if (getComputedStyle(target).position === 'static') {
+                target.style.position = 'relative';
+            }
+            target.style.overflow = 'hidden';
+
+            var rect = target.getBoundingClientRect();
+            var ripple = document.createElement('span');
+            ripple.className = 'ripple-effect';
+            var size = Math.max(rect.width, rect.height);
+            ripple.style.width = size + 'px';
+            ripple.style.height = size + 'px';
+            ripple.style.left = (e.clientX - rect.left - size / 2) + 'px';
+            ripple.style.top = (e.clientY - rect.top - size / 2) + 'px';
+            target.appendChild(ripple);
+            setTimeout(function() { ripple.remove(); }, 600);
+        });
+
+        /* ==========================================================
+           3c. 📜 SCROLL PROGRESS BAR
+           ========================================================== */
+        var pb = document.getElementById('pragmavet-scroll-progress');
+        if (pb) {
+            window.addEventListener('scroll', function() {
+                var scrollTop = window.scrollY;
+                var docHeight = document.documentElement.scrollHeight - window.innerHeight;
+                if (docHeight > 0) {
+                    pb.style.width = ((scrollTop / docHeight) * 100) + '%';
+                }
+            }, { passive: true });
+        }
+
+        /* ==========================================================
+           3d. ⬆️ BACK TO TOP BUTTON
+           ========================================================== */
+        var bt = document.getElementById('pragmavet-back-to-top');
+        if (bt) {
+            window.addEventListener('scroll', function() {
+                if (window.scrollY > 500) {
+                    bt.classList.add('visible');
+                } else {
+                    bt.classList.remove('visible');
+                }
+            }, { passive: true });
+            bt.addEventListener('click', function() {
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+            });
+        }
+
+        /* ==========================================================
+           3e. 🔄 SCROLL REVEAL ANIMATIONS
+           ========================================================== */
+        var revealElements = document.querySelectorAll('.pm-reveal, .pm-reveal-left, .pm-reveal-right, .reveal, .reveal-left, .reveal-right, .reveal-scale');
+        if (revealElements.length > 0) {
+            var revealObserver = new IntersectionObserver(function(entries) {
+                entries.forEach(function(entry) {
+                    if (entry.isIntersecting) {
+                        entry.target.classList.add('visible');
+                        revealObserver.unobserve(entry.target);
+                    }
+                });
+            }, { threshold: 0.1, rootMargin: '0px 0px -50px 0px' });
+            revealElements.forEach(function(el) { revealObserver.observe(el); });
+        }
+
+        /* ==========================================================
+           3f. 🔔 AUTO DISMISS ALERTS
+           ========================================================== */
+        setTimeout(function() {
+            var alerts = document.querySelectorAll('.alert-container, .alert-dismissible');
+            alerts.forEach(function(a) {
+                a.style.transition = 'opacity 0.5s ease-out, transform 0.5s ease-out';
+                a.style.opacity = '0';
+                a.style.transform = 'translateY(-20px)';
+                setTimeout(function() { a.remove(); }, 500);
+            });
+        }, 4500);
+    }
+})();

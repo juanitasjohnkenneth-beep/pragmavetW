@@ -1,0 +1,327 @@
+<?php
+session_start();
+include("dbconnection.php");
+
+$user_role = $_SESSION['role'] ?? ($_SESSION['user_role'] ?? '');
+if(!isset($_SESSION['user_id']) || !in_array($user_role, ['admin', 'clinic_owner', 'owner'])){
+    header("Location: index.php");
+    exit();
+}
+
+$active_nav = 'settings';
+$msg = "";
+$msg_type = "";
+
+// Ensure system_settings table exists
+$conn->query("
+CREATE TABLE IF NOT EXISTS system_settings (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    clinic_name VARCHAR(255) DEFAULT 'PragmaVet Hub',
+    clinic_address VARCHAR(255) DEFAULT '123 Clinic Avenue, Wellness District, NY 10001',
+    clinic_phone VARCHAR(50) DEFAULT '(555) 123-4567',
+    smtp_user VARCHAR(100) DEFAULT 'timferrer1@gmail.com',
+    smtp_pass VARCHAR(255) DEFAULT 'azrpmoxxzvhucetu',
+    stripe_pub_key VARCHAR(255) DEFAULT 'pk_test_placeholder',
+    stripe_sec_key VARCHAR(255) DEFAULT 'sk_test_placeholder',
+    dark_mode_default BOOLEAN DEFAULT 0,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)");
+
+// Ensure row 1 exists
+$check = $conn->query("SELECT id FROM system_settings WHERE id=1");
+if(!$check || $check->num_rows == 0) {
+    $conn->query("INSERT INTO system_settings (id, clinic_name, clinic_address, clinic_phone, smtp_user, smtp_pass, stripe_pub_key, stripe_sec_key) 
+                  VALUES (1, 'PragmaVet Hub', '123 Clinic Avenue, Wellness District, NY 10001', '(555) 123-4567', 'timferrer1@gmail.com', 'azrpmoxxzvhucetu', 'pk_test_placeholder', 'sk_test_placeholder')");
+}
+
+if(isset($_POST['update_settings'])) {
+    $c_name = $_POST['clinic_name'] ?? 'PragmaVet Hub';
+    $c_addr = $_POST['clinic_address'] ?? '';
+    $c_phone = $_POST['clinic_phone'] ?? '';
+    
+    $s_user = $_POST['smtp_user'] ?? '';
+    $s_pass = $_POST['smtp_pass'] ?? '';
+    
+    $stripe_pub = trim($_POST['stripe_pub_key'] ?? '');
+    $stripe_sec = trim($_POST['stripe_sec_key'] ?? '');
+    
+    $stmt = $conn->prepare("UPDATE system_settings SET clinic_name=?, clinic_address=?, clinic_phone=?, smtp_user=?, smtp_pass=?, stripe_pub_key=?, stripe_sec_key=? WHERE id=1");
+    if ($stmt) {
+        $stmt->bind_param("sssssss", $c_name, $c_addr, $c_phone, $s_user, $s_pass, $stripe_pub, $stripe_sec);
+        if($stmt->execute()) {
+            $msg = "System configurations securely synchronized!";
+            $msg_type = "success";
+        } else {
+            $msg = "Warning: Failed to synchronize configurations: " . $stmt->error;
+            $msg_type = "danger";
+        }
+        $stmt->close();
+    } else {
+        $msg = "Database Error: " . $conn->error;
+        $msg_type = "danger";
+    }
+}
+
+// Fetch current
+$settings_res = $conn->query("SELECT * FROM system_settings WHERE id=1");
+$settings = ($settings_res && $settings_res->num_rows > 0) ? $settings_res->fetch_assoc() : [
+    'clinic_name' => 'PragmaVet Hub',
+    'clinic_address' => '123 Clinic Avenue, Wellness District, NY 10001',
+    'clinic_phone' => '(555) 123-4567',
+    'smtp_user' => 'timferrer1@gmail.com',
+    'smtp_pass' => 'azrpmoxxzvhucetu',
+    'stripe_pub_key' => '',
+    'stripe_sec_key' => ''
+];
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="theme.js?v=<?=time()?>"></script>
+<link rel="stylesheet" href="theme.css?v=<?=time()?>">
+
+<title>System Settings | VetAdmin</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+    <style>
+        :root { --primary: #2563eb; --secondary: #3b82f6; --dark: #1e40af; --light-bg: #E6EEF8; --sidebar-width:260px; }
+        body { background: var(--light-bg); font-family: 'Inter', sans-serif; color: #2D3748; }
+
+        /* ====== WHITE SIDEBAR THEME ====== */
+        .sidebar {
+            background: #ffffff !important;
+            width: var(--sidebar-width, 260px) !important;
+            height: 100vh !important;
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            padding: 28px 20px 24px !important;
+            z-index: 1000 !important;
+            display: flex !important;
+            flex-direction: column !important;
+            border-right: 1px solid #eef2f6 !important;
+            box-shadow: none !important;
+            overflow-y: auto !important;
+        }
+
+        .sidebar-brand {
+            display: flex !important;
+            align-items: center !important;
+            gap: 12px !important;
+            margin-bottom: 24px !important;
+            padding: 0 4px !important;
+            text-decoration: none !important;
+        }
+
+        .sidebar-brand-icon {
+            width: 44px !important;
+            height: 44px !important;
+            min-width: 44px !important;
+            border-radius: 13px !important;
+            background: #2563eb !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            color: #ffffff !important;
+            font-size: 20px !important;
+            flex-shrink: 0 !important;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+        }
+
+        .sidebar-brand span {
+            font-weight: 800 !important;
+            color: #182032 !important;
+            font-size: 22px !important;
+            letter-spacing: -0.4px !important;
+        }
+
+        .sidebar-user {
+            margin-bottom: 24px !important;
+            padding: 15px 18px !important;
+            border-radius: 14px !important;
+            background: #f8fafc !important;
+            border: 1px solid #eef2f6 !important;
+        }
+
+        .sidebar-user .welcome {
+            font-size: 13px !important;
+            color: #64748b !important;
+            font-weight: 500 !important;
+            line-height: 1.3 !important;
+        }
+
+        .sidebar-user .uname {
+            font-weight: 700 !important;
+            color: #0f172a !important;
+            font-size: 15.5px !important;
+            margin-top: 3px !important;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+        }
+
+        .sidebar a {
+            display: flex !important;
+            align-items: center !important;
+            gap: 14px !important;
+            padding: 12px 16px !important;
+            border-radius: 12px !important;
+            color: #334155 !important;
+            text-decoration: none !important;
+            margin-bottom: 4px !important;
+            font-weight: 600 !important;
+            font-size: 14.5px !important;
+            transition: all 0.2s ease !important;
+            letter-spacing: -0.1px !important;
+        }
+
+        .sidebar a i {
+            width: 22px !important;
+            text-align: center !important;
+            font-size: 16px !important;
+            color: #64748b !important;
+            transition: color 0.2s !important;
+            flex-shrink: 0 !important;
+        }
+
+        .sidebar a:hover {
+            background: #f8fafc !important;
+            color: #0f172a !important;
+        }
+
+        .sidebar a:hover i {
+            color: #2563eb !important;
+        }
+
+        .sidebar a.active {
+            background: #2563eb !important;
+            color: #ffffff !important;
+            font-weight: 700 !important;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+        }
+
+        .sidebar a.active i {
+            color: #ffffff !important;
+        }
+
+        .sidebar .sidebar-logout {
+            margin-top: auto !important;
+            padding-top: 20px !important;
+            border-top: 1px solid #f1f5f9 !important;
+        }
+
+        .sidebar .sidebar-logout a {
+            color: #dc2626 !important;
+            font-weight: 600 !important;
+            margin-bottom: 0 !important;
+        }
+
+        .sidebar .sidebar-logout a i {
+            color: #dc2626 !important;
+        }
+
+        .sidebar .sidebar-logout a:hover {
+            background: #fef2f2 !important;
+            color: #b91c1c !important;
+        }
+
+        .sidebar::-webkit-scrollbar { width: 5px; }
+        .sidebar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.06); border-radius: 10px; }
+        .sidebar::-webkit-scrollbar-track { background: transparent; }
+
+        .main-content { margin-left: var(--sidebar-width); padding: 40px; }
+        .card-premium { background: white; border: none; border-radius: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); padding: 30px; margin-bottom: 25px; }
+
+        .form-control { border-radius: 10px; border: 1px solid #E2E8F0; padding: 12px 16px; font-size: 15px; background: #fafcff; }
+        .form-control:focus { border-color: var(--secondary); box-shadow: 0 0 0 3px rgba(43, 108, 176, 0.1); }
+        .form-label { font-weight: 600; color: var(--primary); font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .btn-primary { background: var(--secondary); border: none; padding: 12px 25px; border-radius: 10px; font-weight: 600; }
+    </style>
+    <link rel="stylesheet" href="assets/pragmavet.css">
+    <link href="assets/global-style.css" rel="stylesheet">
+</head>
+<body>
+
+<?php if($msg != ""): ?>
+<div class="position-fixed top-0 end-0 p-3" style="z-index: 9999">
+    <div class="alert alert-<?php echo $msg_type; ?> shadow-sm fw-bold">
+        <i class="fa fa-info-circle me-2"></i><?php echo $msg; ?>
+    </div>
+</div>
+<?php endif; ?>
+
+<!-- Admin Sidebar -->
+<?php include("includes/admin_sidebar.php"); ?>
+
+<div class="main-content">
+    <div class="mb-4">
+        <h2 class="fw-bold m-0 text-dark">System Configurations</h2>
+        <p class="text-muted">Global variables mapping routing, branding, and billing.</p>
+    </div>
+
+    <form method="POST">
+        <div class="row">
+            <!-- Branding Map -->
+            <div class="col-xl-6">
+                <div class="card-premium">
+                    <h5 class="fw-bold mb-4 text-dark border-bottom pb-3"><i class="fa fa-building text-secondary me-2"></i> Clinic Branding Map</h5>
+                    <div class="mb-3">
+                        <label class="form-label">Official Clinic Name</label>
+                        <input type="text" name="clinic_name" class="form-control" value="<?php echo htmlspecialchars($settings['clinic_name']); ?>" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Public Address</label>
+                        <textarea name="clinic_address" class="form-control" rows="2" required><?php echo htmlspecialchars($settings['clinic_address']); ?></textarea>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Contact Registry</label>
+                        <input type="text" name="clinic_phone" class="form-control" value="<?php echo htmlspecialchars($settings['clinic_phone']); ?>" required>
+                    </div>
+                </div>
+            </div>
+
+            <!-- SMTP & API Keys -->
+            <div class="col-xl-6">
+                <div class="card-premium border-top border-4 border-danger">
+                    <h5 class="fw-bold mb-4 text-dark border-bottom pb-3"><i class="fa fa-server text-danger me-2"></i> High-Security Keys</h5>
+                    
+                    <div class="mb-4">
+                        <h6 class="fw-bold text-muted mb-3"><i class="fa fa-envelope-open me-2"></i> Google SMTP Automailer</h6>
+                        <div class="mb-2">
+                            <label class="form-label">Dispatch Email (Username)</label>
+                            <input type="email" name="smtp_user" class="form-control" value="<?php echo htmlspecialchars($settings['smtp_user']); ?>">
+                        </div>
+                        <div>
+                            <label class="form-label">App Password (16-char)</label>
+                            <input type="text" name="smtp_pass" class="form-control text-muted" value="<?php echo htmlspecialchars($settings['smtp_pass']); ?>">
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <h6 class="fw-bold text-muted mb-3"><i class="fab fa-stripe me-2" style="color: #635bff;"></i> Stripe Payment Gateway</h6>
+                        <div class="mb-2">
+                            <label class="form-label">Publishable Key</label>
+                            <input type="text" name="stripe_pub_key" class="form-control font-monospace" value="<?php echo htmlspecialchars($settings['stripe_pub_key']); ?>">
+                        </div>
+                        <div>
+                            <label class="form-label">Secret Key</label>
+                            <input type="text" name="stripe_sec_key" class="form-control font-monospace text-muted" value="<?php echo htmlspecialchars($settings['stripe_sec_key']); ?>">
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="col-12 text-end">
+                <button type="submit" name="update_settings" class="btn btn-primary shadow-sm fs-5 px-5"><i class="fa fa-save me-2"></i> Apply Global Changes</button>
+            </div>
+        </div>
+    </form>
+</div>
+
+    <script src="mousetrail.js"></script>
+</body>
+</html>

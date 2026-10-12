@@ -1,0 +1,1635 @@
+<?php
+session_start();
+include("dbconnection.php");
+include_once("includes/rbac_guard.php");
+include("helpers_smart_scheduling.php");
+include_once("includes/pet_data_helper.php");
+
+// RBAC Access Guard
+$user_role = rbac_get_role();
+if (!isset($_SESSION['user_id']) || !in_array($user_role, ['admin', 'staff', 'clinic_owner', 'owner'])) {
+    header("Location: " . rbac_home_url($user_role));
+    exit();
+}
+
+// Counts (Moved to top for sidebar badges)
+$counts = [];
+foreach (['all','Pending','Approved','Completed','Cancelled','No Show','Reschedule Requested'] as $s) {
+    if ($s === 'all') {
+        $c = $conn->query("SELECT COUNT(*) as c FROM appointments WHERE is_archived = 0 AND service_type != 'Pet Boarding Reservation'");
+        $bc = $conn->query("SELECT COUNT(*) as c FROM boarding_reservations WHERE is_archived = 0");
+    } else {
+        $c = $conn->query("SELECT COUNT(*) as c FROM appointments WHERE is_archived = 0 AND status='$s' AND service_type != 'Pet Boarding Reservation'");
+        $bc = $conn->query("SELECT COUNT(*) as c FROM boarding_reservations WHERE is_archived = 0 AND status='$s'");
+    }
+    $ac = $c ? $c->fetch_assoc()['c'] : 0;
+    $bcc = $bc ? $bc->fetch_assoc()['c'] : 0;
+    $counts[$s] = $ac + $bcc;
+}
+
+// POST: Mark No Show
+if (isset($_POST['mark_no_show']) && isset($_POST['apt_id'])) {
+    $apt_id = (int)$_POST['apt_id'];
+    $stmt = $conn->prepare("UPDATE appointments SET status='No Show' WHERE id=?");
+    $stmt->bind_param("i", $apt_id);
+    if ($stmt->execute()) {
+        $_SESSION['message'] = "Appointment #$apt_id marked as No Show.";
+        $_SESSION['msg_type'] = "warning";
+    }
+    header("Location: admin_list.php"); exit();
+}
+
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\Exception;
+require 'PHPMailer/src/Exception.php';
+require 'PHPMailer/src/PHPMailer.php';
+require 'PHPMailer/src/SMTP.php';
+
+// â”€â”€ Helper: send email + notification â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+function sendApptEmail($conn, $apt_id, $subject, $bodyHtml, $notif_msg) {
+    $q = $conn->query("SELECT a.user_id, a.pet_name, a.appointment_date, u.email, u.fullname FROM appointments a JOIN users u ON a.user_id = u.id WHERE a.id=$apt_id");
+    if (!$q || $q->num_rows === 0) return;
+    $d = $q->fetch_assoc();
+    $uid = $d['user_id'];
+    $ins = $conn->prepare("INSERT INTO notifications(user_id, message) VALUES(?,?)");
+    $ins->bind_param("is", $uid, $notif_msg);
+    $ins->execute();
+    try {
+        $mail = new PHPMailer(true);
+        $mail->isSMTP(); $mail->Host='smtp.gmail.com'; $mail->SMTPAuth=true;
+        $mail->Username='timferrer1@gmail.com'; $mail->Password='azrpmoxxzvhucetu';
+        $mail->SMTPSecure=PHPMailer::ENCRYPTION_STARTTLS; $mail->Port=587;
+        $mail->setFrom('timferrer1@gmail.com','PragmaVet Clinic');
+        $mail->addAddress($d['email'], $d['fullname']);
+        $mail->isHTML(true); $mail->Subject=$subject; $mail->Body=$bodyHtml;
+        $mail->send();
+    } catch (Exception $e) {}
+}
+
+// â”€â”€ POST: Book Appointment (Walk-in, auto-Approved with Smart Scheduling) â”€â”€â”€â”€
+if (isset($_POST['book_walkin_appt'])) {
+    $uid      = (int)$_POST['walkin_user_id'];
+    $pet_name = trim($_POST['walkin_pet_name']);
+    $service  = trim($_POST['walkin_service']);
+    $date     = $_POST['walkin_date'];
+    $time     = $_POST['walkin_time'];
+    $location = $_POST['walkin_location'] ?? 'On-Site';
+    $doc_id   = !empty($_POST['walkin_doctor']) ? (int)$_POST['walkin_doctor'] : null;
+
+    // â”€â”€â”€ SMART SCHEDULING VALIDATION FOR WALK-INS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    
+    // Validate pet name is not empty
+    if (empty($pet_name)) {
+        $_SESSION['message'] = "âŒ Pet name cannot be empty.";
+        $_SESSION['msg_type'] = "danger";
+        header("Location: admin_list.php");
+        exit();
+    }
+    
+    // For walk-ins, allow same-day and past bookings, but perform all other validations
+    if (!empty($doc_id) && !empty($service)) {
+        $validation = validate_appointment_slot($conn, $doc_id, $date, $time, $service, false);
+        if (!$validation['valid']) {
+            $_SESSION['message'] = "âŒ Cannot book walk-in: " . htmlspecialchars($validation['message']);
+            $_SESSION['msg_type'] = "danger";
+            header("Location: admin_list.php");
+            exit();
+        }
+        $duration_minutes = $validation['data']['duration_minutes'] ?? 30;
+        $appointment_end_time = $validation['data']['end_time'];
+    } else {
+        // If no doctor specified, default to 30 minutes
+        $duration_minutes = 30;
+        $appointment_end_time = date('H:i:s', strtotime($time . ' +' . $duration_minutes . ' minutes'));
+    }
+
+    // If inline pet was added, save it to pets table first
+    if (!empty($_POST['do_add_pet']) && $_POST['do_add_pet'] === '1' && !empty($pet_name)) {
+        $sp = trim($_POST['inline_pet_species'] ?? '');
+        $br = trim($_POST['inline_pet_breed'] ?? '');
+        $ag = (int)($_POST['inline_pet_age'] ?? 0);
+        $ip = $conn->prepare("INSERT INTO pets(user_id,name,species,breed,age) VALUES(?,?,?,?,?)");
+        if ($ip) { $ip->bind_param("isssi", $uid, $pet_name, $sp, $br, $ag); $ip->execute(); }
+    }
+
+    $doc_param = $doc_id ?: null;
+    $stmt = $conn->prepare("INSERT INTO appointments(user_id, pet_name, service_type, appointment_date, appointment_time, appointment_end_time, service_duration_minutes, service_location, doctor_id, status, approved_at) VALUES(?,?,?,?,?,?,?,?,?,'Approved',NOW())");
+    if (!$stmt) {
+        $_SESSION['message']  = "âŒ Prepare failed: " . htmlspecialchars($conn->error);
+        $_SESSION['msg_type'] = "danger";
+        header("Location: admin_list.php"); exit();
+    }
+    $stmt->bind_param("issssssis", $uid, $pet_name, $service, $date, $time, $appointment_end_time, $duration_minutes, $location, $doc_param);
+    if ($stmt->execute()) {
+        $new_appointment_id = $stmt->insert_id;
+        
+        // Insert into appointment_pets junction table
+        include_once("includes/pet_data_helper.php");
+        $pet_ids = [];
+        // Try to find pet_id from pets table
+        $pet_q = $conn->prepare("SELECT id FROM pets WHERE user_id=? AND name=?");
+        if ($pet_q) {
+            $pet_q->bind_param("is", $uid, $pet_name);
+            $pet_q->execute();
+            $pet_r = $pet_q->get_result();
+            if ($pet_r && $pet_r->num_rows > 0) {
+                $pet_ids[] = $pet_r->fetch_assoc()['id'];
+            } else {
+                $pet_ids[] = null;
+            }
+        }
+        if (function_exists('insertAppointmentPets')) {
+            insertAppointmentPets($conn, $new_appointment_id, $uid, $pet_ids, [$pet_name]);
+        }
+        
+        $notif = "A walk-in appointment for <b>$pet_name</b> on ".date('M d, Y', strtotime($date))." at ".substr($time, 0, 5)." has been booked and Approved.";
+        $ins = $conn->prepare("INSERT INTO notifications(user_id, message) VALUES(?,?)");
+        if ($ins) { $ins->bind_param("is", $uid, $notif); $ins->execute(); }
+        $_SESSION['message']  = "âœ… Walk-in appointment booked & approved for $pet_name! Duration: " . $duration_minutes . " minutes";
+        $_SESSION['msg_type'] = "success";
+    } else {
+        if (strpos($conn->error, 'Duplicate') !== false || strpos($conn->error, 'unique') !== false) {
+            $_SESSION['message']  = "âŒ Time slot conflict: This slot was just taken. Please choose another time.";
+        } else {
+            $_SESSION['message']  = "âŒ Error: " . htmlspecialchars($conn->error);
+        }
+        $_SESSION['msg_type'] = "danger";
+    }
+    header("Location: admin_list.php"); exit();
+}
+
+// Fetch owners + pets for Book Appointment modal
+$owners_q = $conn->query("SELECT u.id, u.fullname, p.id as pet_id, p.name as pet_name, p.species FROM users u LEFT JOIN pets p ON p.user_id = u.id WHERE u.role IN ('user','client') ORDER BY u.fullname, p.name");
+$owners_map = [];
+if ($owners_q) {
+    while ($row = $owners_q->fetch_assoc()) {
+        if (!isset($owners_map[$row['id']])) {
+            $owners_map[$row['id']] = ['fullname' => $row['fullname'], 'pets' => []];
+        }
+        if ($row['pet_id']) {
+            $owners_map[$row['id']]['pets'][] = ['id' => $row['pet_id'], 'name' => $row['pet_name'], 'species' => $row['species']];
+        }
+    }
+}
+$doctors_q = $conn->query("SELECT id, fullname FROM users WHERE role='doctor' ORDER BY fullname");
+$doctors_list = [];
+if ($doctors_q) { while ($d = $doctors_q->fetch_assoc()) $doctors_list[] = $d; }
+
+
+// â”€â”€ POST: Quick Approve â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+if (isset($_POST['action']) && isset($_POST['apt_id'])) {
+    $apt_id = (int)$_POST['apt_id'];
+    $action = $_POST['action'];
+    $type = $_POST['appt_type'] ?? 'Appointment';
+    $new_status = $action === 'approve' ? 'Approved' : 'Rejected';
+    
+    $table = $type === 'Boarding' ? 'boarding_reservations' : 'appointments';
+    if ($action === 'approve') {
+        $s = $conn->prepare("UPDATE $table SET status=?, approved_at=NOW() WHERE id=?");
+    } else {
+        $s = $conn->prepare("UPDATE $table SET status=? WHERE id=?");
+    }
+    $s->bind_param("si", $new_status, $apt_id);
+    if ($s->execute()) {
+        $q = $conn->query("SELECT a.user_id, a.pet_name, a.appointment_date, u.email, u.fullname FROM $table a JOIN users u ON a.user_id = u.id WHERE a.id=$apt_id");
+        if ($q && $q->num_rows > 0) {
+            $d = $q->fetch_assoc();
+            $uid  = $d['user_id'];
+            $pn   = $d['pet_name'];
+            $adate= date("M d, Y", strtotime($d['appointment_date']));
+            // Get full pet list for notification
+            if ($table === 'appointments' && function_exists('getAppointmentPetSummary')) {
+                $pn_display = getAppointmentPetSummary($conn, $apt_id);
+            } else {
+                $pn_display = $pn;
+            }
+            $msg  = "Your appointment for <b>$pn_display</b> on $adate has been <b>$new_status</b>.";
+            $ins  = $conn->prepare("INSERT INTO notifications(user_id,message) VALUES(?,?)");
+            $ins->bind_param("is", $uid, $msg);
+            $ins->execute();
+            try {
+                $mail = new PHPMailer(true);
+                $mail->isSMTP(); $mail->Host='smtp.gmail.com'; $mail->SMTPAuth=true;
+                $mail->Username='timferrer1@gmail.com'; $mail->Password='azrpmoxxzvhucetu';
+                $mail->SMTPSecure=PHPMailer::ENCRYPTION_STARTTLS; $mail->Port=587;
+                $mail->setFrom('timferrer1@gmail.com','PragmaVet Clinic');
+                $mail->addAddress($d['email'],$d['fullname']);
+                $mail->isHTML(true); $mail->Subject='Appointment Update | PragmaVet';
+                $mail->Body="<div style='font-family:Arial,sans-serif;max-width:600px;padding:25px;border:1px solid #e1e8ed;border-radius:10px;'><h2 style='color:#2563eb;'>Hello, {$d['fullname']}!</h2><div style='background:#E6EEF8;padding:20px;border-radius:8px;border-left:4px solid #3b82f6;margin:20px 0;'><p style='margin:0;'>$msg</p></div></div>";
+                $mail->send();
+            } catch (Exception $e) {}
+        }
+        $_SESSION['message']  = "Appointment #$apt_id marked as $new_status.";
+        $_SESSION['msg_type'] = "success";
+    }
+    header("Location: admin_list.php"); exit();
+}
+
+// â”€â”€ POST: Advanced manage (complete / cancel / reschedule) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+if (isset($_POST['admin_manage_appt']) && isset($_POST['apt_id'])) {
+    $apt_id = (int)$_POST['apt_id'];
+    $cmd    = $_POST['admin_manage_appt'];
+    $type   = $_POST['appt_type'] ?? 'Appointment';
+    $table  = $type === 'Boarding' ? 'boarding_reservations' : 'appointments';
+    
+    $q = $conn->query("SELECT a.user_id,a.pet_name,a.appointment_date,u.email,u.fullname FROM $table a JOIN users u ON a.user_id=u.id WHERE a.id=$apt_id");
+    if ($q && $q->num_rows > 0) {
+        $d = $q->fetch_assoc();
+        $uid = $d['user_id']; $pn = $d['pet_name'];
+        $old_date = date("M d, Y", strtotime($d['appointment_date']));
+        // Get full pet list for notification
+        if ($table === 'appointments' && function_exists('getAppointmentPetSummary')) {
+            $pn_display = getAppointmentPetSummary($conn, $apt_id);
+        } else {
+            $pn_display = $pn;
+        }
+        if ($cmd === 'approve') {
+            $s = $conn->prepare("UPDATE $table SET status='Approved', approved_at=NOW() WHERE id=?");
+            $s->bind_param("i", $apt_id); $s->execute();
+            $notif = "Your appointment for <b>$pn_display</b> on $old_date has been <b>Approved</b>.";
+            $ins = $conn->prepare("INSERT INTO notifications(user_id,message) VALUES(?,?)");
+            $ins->bind_param("is",$uid,$notif); $ins->execute();
+            $_SESSION['message'] = "Request #$apt_id approved.";
+        } elseif ($cmd === 'complete') {
+            $s = $conn->prepare("UPDATE $table SET status='Completed' WHERE id=?");
+            $s->bind_param("i",$apt_id); $s->execute();
+            $notif = "Your appointment for <b>$pn_display</b> on $old_date has been marked as <b>Completed</b>. Thank you!";
+            $ins = $conn->prepare("INSERT INTO notifications(user_id,message) VALUES(?,?)");
+            $ins->bind_param("is",$uid,$notif); $ins->execute();
+            try {
+                $mail = new PHPMailer(true); $mail->isSMTP(); $mail->Host='smtp.gmail.com'; $mail->SMTPAuth=true;
+                $mail->Username='timferrer1@gmail.com'; $mail->Password='azrpmoxxzvhucetu';
+                $mail->SMTPSecure=PHPMailer::ENCRYPTION_STARTTLS; $mail->Port=587;
+                $mail->setFrom('timferrer1@gmail.com','PragmaVet Clinic'); $mail->addAddress($d['email'],$d['fullname']);
+                $mail->isHTML(true); $mail->Subject='Appointment Completed | PragmaVet';
+                $mail->Body="<div style='font-family:Arial,sans-serif;max-width:600px;padding:25px;border:1px solid #e1e8ed;border-radius:10px;'><h2 style='color:#2563eb;'>Hello, {$d['fullname']}!</h2><div style='background:#e6fcf5;padding:20px;border-radius:8px;border-left:4px solid #38A169;margin:20px 0;'><p style='margin:0;'>$notif</p></div></div>";
+                $mail->send();
+            } catch (Exception $e) {}
+            $_SESSION['message'] = "Request #$apt_id marked Completed.";
+        } elseif ($cmd === 'cancel') {
+            $reason = $_POST['admin_message'] ?? 'Administrative Cancellation';
+            $s = $conn->prepare("UPDATE $table SET status='Cancelled', admin_message=?, client_action_needed=0 WHERE id=?");
+            $s->bind_param("si",$reason,$apt_id); $s->execute();
+            $notif = "Your appointment for <b>$pn_display</b> on $old_date was Cancelled. Reason: $reason";
+            $ins = $conn->prepare("INSERT INTO notifications(user_id,message) VALUES(?,?)");
+            $ins->bind_param("is",$uid,$notif); $ins->execute();
+            $chatMsg = "Admin Notice: Your appointment for $pn on $old_date was Cancelled. Reason: $reason";
+            $ic = $conn->prepare("INSERT INTO chat_messages(sender_id,receiver_id,message) VALUES((SELECT id FROM users WHERE role='admin' ORDER BY id ASC LIMIT 1),?,?)");
+            $ic->bind_param("is",$uid,$chatMsg); $ic->execute();
+            try {
+                $mail = new PHPMailer(true); $mail->isSMTP(); $mail->Host='smtp.gmail.com'; $mail->SMTPAuth=true;
+                $mail->Username='timferrer1@gmail.com'; $mail->Password='azrpmoxxzvhucetu';
+                $mail->SMTPSecure=PHPMailer::ENCRYPTION_STARTTLS; $mail->Port=587;
+                $mail->setFrom('timferrer1@gmail.com','PragmaVet Clinic'); $mail->addAddress($d['email'],$d['fullname']);
+                $mail->isHTML(true); $mail->Subject='Appointment Cancelled | PragmaVet';
+                $mail->Body="<div style='font-family:Arial,sans-serif;max-width:600px;padding:25px;border:1px solid #e1e8ed;border-radius:10px;'><h2 style='color:#c92a2a;'>Hello, {$d['fullname']}!</h2><div style='background:#fdf5f5;padding:20px;border-radius:8px;border-left:4px solid #c92a2a;margin:20px 0;'><p style='margin:0;'>$notif</p></div></div>";
+                $mail->send();
+            } catch (Exception $e) {}
+            $_SESSION['message'] = "Request #$apt_id cancelled.";
+        } elseif ($cmd === 'reschedule') {
+            $parts = explode(" ", $_POST['new_date'] ?? '');
+            $new_date_raw = $parts[0] ?? '';
+            $new_time_raw = isset($parts[1]) ? date("H:i", strtotime($parts[1])) : '08:00';
+            $reason = $_POST['admin_message'] ?? 'We propose shifting your appointment.';
+            $new_date_f = date("M d, Y", strtotime($new_date_raw)) . " at " . date("h:i A", strtotime($new_time_raw));
+            
+            if ($type === 'Boarding') {
+                $s = $conn->prepare("UPDATE $table SET status='Reschedule Proposed', proposed_reschedule_date=?, proposed_reschedule_end_date=?, admin_message=?, client_action_needed=1 WHERE id=?");
+                $s->bind_param("sssi",$new_date_raw,$new_date_raw,$reason,$apt_id); $s->execute();
+            } else {
+                $s = $conn->prepare("UPDATE $table SET status='Reschedule Proposed', proposed_reschedule_date=?, proposed_reschedule_time=?, admin_message=?, client_action_needed=1 WHERE id=?");
+                $s->bind_param("sssi",$new_date_raw,$new_time_raw,$reason,$apt_id); $s->execute();
+            }
+            $notif = "The clinic proposed shifting your appointment for <b>$pn_display</b>. Old: $old_date â†’ New: <b>$new_date_f</b>. Reason: $reason";
+            $ins = $conn->prepare("INSERT INTO notifications(user_id,message) VALUES(?,?)");
+            $ins->bind_param("is",$uid,$notif); $ins->execute();
+            $chatMsg = "Admin: Reschedule proposed for $pn. New Date: $new_date_f. Reason: $reason";
+            $ic = $conn->prepare("INSERT INTO chat_messages(sender_id,receiver_id,message) VALUES((SELECT id FROM users WHERE role='admin' ORDER BY id ASC LIMIT 1),?,?)");
+            $ic->bind_param("is",$uid,$chatMsg); $ic->execute();
+            try {
+                $mail = new PHPMailer(true); $mail->isSMTP(); $mail->Host='smtp.gmail.com'; $mail->SMTPAuth=true;
+                $mail->Username='timferrer1@gmail.com'; $mail->Password='azrpmoxxzvhucetu';
+                $mail->SMTPSecure=PHPMailer::ENCRYPTION_STARTTLS; $mail->Port=587;
+                $mail->setFrom('timferrer1@gmail.com','PragmaVet Clinic'); $mail->addAddress($d['email'],$d['fullname']);
+                $mail->isHTML(true); $mail->Subject='Reschedule Proposal | PragmaVet';
+                $mail->Body="<div style='font-family:Arial,sans-serif;max-width:600px;padding:25px;border:1px solid #e1e8ed;border-radius:10px;'><h2 style='color:#2563eb;'>Hello, {$d['fullname']}!</h2><div style='background:#E6EEF8;padding:20px;border-radius:8px;border-left:4px solid #3b82f6;margin:20px 0;'><p style='margin:0;'>$notif</p></div></div>";
+                $mail->send();
+            } catch (Exception $e) {}
+            $_SESSION['message'] = "Reschedule proposal sent to client.";
+        } elseif ($cmd === 'accept_client_resched') {
+            $s = $conn->prepare("UPDATE $table SET appointment_date=proposed_reschedule_date, appointment_time=proposed_reschedule_time, status='Approved', proposed_reschedule_date=NULL, proposed_reschedule_time=NULL, client_action_needed=0 WHERE id=?");
+            $s->bind_param("i",$apt_id); $s->execute();
+            $notif = "Clinic accepted your reschedule for <b>$pn_display</b>. New schedule confirmed.";
+            $ins = $conn->prepare("INSERT INTO notifications(user_id,message) VALUES(?,?)");
+            $ins->bind_param("is",$uid,$notif); $ins->execute();
+            $_SESSION['message'] = "Client reschedule request accepted!";
+        } elseif ($cmd === 'decline_client_resched') {
+            $reason = $_POST['admin_message'] ?? 'Clinic cannot accommodate the requested schedule.';
+            $s = $conn->prepare("UPDATE $table SET status='Approved', proposed_reschedule_date=NULL, proposed_reschedule_time=NULL, client_action_needed=0 WHERE id=?");
+            $s->bind_param("i",$apt_id); $s->execute();
+            $notif = "Clinic declined your reschedule request for <b>$pn_display</b>. Appointment remains at $old_date. Reason: $reason";
+            $ins = $conn->prepare("INSERT INTO notifications(user_id,message) VALUES(?,?)");
+            $ins->bind_param("is",$uid,$notif); $ins->execute();
+            $_SESSION['message'] = "Client reschedule request declined.";
+        }
+        $_SESSION['msg_type'] = "success";
+    }
+    header("Location: admin_list.php"); exit();
+}
+
+// â”€â”€ POST: Archive â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+// -- POST: Lifecycle transitions (Check In / In Progress / No Show) -----------
+if (isset($_POST['lifecycle_action']) && isset($_POST['apt_id'])) {
+    $apt_id  = (int)$_POST['apt_id'];
+    $laction = $_POST['lifecycle_action'];
+    $allowed = ['check_in' => 'Checked In', 'in_progress' => 'In Progress', 'no_show' => 'No Show'];
+    if (isset($allowed[$laction])) {
+        $new_status = $allowed[$laction];
+        $extra_sql  = '';
+        if ($laction === 'check_in')    $extra_sql = ', check_in_time=NOW()';
+        if ($laction === 'in_progress') $extra_sql = ', check_in_time=COALESCE(check_in_time,NOW())';
+        $conn->query("UPDATE appointments SET status='" . $new_status . "'" . $extra_sql . " WHERE id=" . $apt_id);
+        $q = $conn->query("SELECT user_id, pet_name FROM appointments WHERE id=" . $apt_id);
+        if ($q && $d = $q->fetch_assoc()) {
+            $notif = "Your appointment for " . $d['pet_name'] . " status updated to: " . $new_status;
+            $ins = $conn->prepare("INSERT INTO notifications(user_id,message) VALUES(?,?)");
+            $ins->bind_param("is", $d['user_id'], $notif);
+            $ins->execute();
+        }
+        $_SESSION['message']  = "Appointment #" . $apt_id . " marked as " . $new_status . ".";
+        $_SESSION['msg_type'] = "success";
+    }
+    header("Location: admin_list.php"); exit();
+}
+// -- POST: Update Doctor Assignment --
+if (isset($_POST['update_doctor_assignment']) && isset($_POST['apt_id'])) {
+    $aid = (int)$_POST['apt_id'];
+    $doc_id = !empty($_POST['assign_doctor_id']) ? (int)$_POST['assign_doctor_id'] : NULL;
+    $stmt = $conn->prepare("UPDATE appointments SET doctor_id=? WHERE id=?");
+    $stmt->bind_param("ii", $doc_id, $aid);
+    if ($stmt->execute()) {
+        $_SESSION['message']  = "Doctor assignment updated successfully for Appointment #$aid.";
+        $_SESSION['msg_type'] = "success";
+    }
+    header("Location: admin_list.php"); exit();
+}
+
+if (isset($_POST['archive_appt']) && isset($_POST['apt_id'])) {
+    $aid = (int)$_POST['apt_id'];
+    $type = $_POST['appt_type'] ?? 'Appointment';
+    $table = $type === 'Boarding' ? 'boarding_reservations' : 'appointments';
+    $conn->query("UPDATE $table SET is_archived=1 WHERE id=$aid");
+    $_SESSION['message']  = "Appointment #$aid moved to Archive.";
+    $_SESSION['msg_type'] = "success";
+    header("Location: admin_list.php"); exit();
+}
+
+// Fetch all doctors for inline assignment
+$all_doctors = [];
+$doc_q = $conn->query("SELECT id, fullname FROM users WHERE role='doctor' ORDER BY fullname ASC");
+if ($doc_q) {
+    while ($d = $doc_q->fetch_assoc()) {
+        $all_doctors[] = $d;
+    }
+}
+
+// Fetch pet EMR details for quick view modal
+$pets_emr_list = [];
+$pemr_q = $conn->query("SELECT p.*, u.fullname as owner_name FROM pets p JOIN users u ON p.user_id = u.id");
+if ($pemr_q) {
+    while ($p = $pemr_q->fetch_assoc()) {
+        $pets_emr_list[strtolower($p['user_id'] . '_' . trim($p['name']))] = $p;
+        $pets_emr_list['id_' . $p['id']] = $p;
+    }
+}
+
+// ── Fetch all appointments ──────────────────────────────────────────────────
+// Auto-archive completed/cancelled appointments older than 30 days
+$conn->query("UPDATE appointments SET is_archived = 1 WHERE is_archived = 0 AND status IN ('Completed', 'Cancelled', 'Rejected') AND appointment_date < DATE_SUB(CURDATE(), INTERVAL 30 DAY)");
+$conn->query("UPDATE boarding_reservations SET is_archived = 1 WHERE is_archived = 0 AND status IN ('Completed', 'Cancelled', 'Rejected') AND appointment_date < DATE_SUB(CURDATE(), INTERVAL 30 DAY)");
+
+$filter = $_GET['filter'] ?? 'all';
+$filterSQL = '';
+$bFilterSQL = '';
+if (in_array($filter, ['Pending','Approved','Completed','Cancelled','Reschedule Proposed','Reschedule Requested'])) {
+    $filterSQL = " AND a.status = '$filter'";
+    $bFilterSQL = " AND b.status = '$filter'";
+}
+$appts = $conn->query("SELECT a.*, u.fullname as client_name, IFNULL(d.fullname,'Unassigned') as doctor_name FROM appointments a JOIN users u ON a.user_id = u.id LEFT JOIN users d ON a.doctor_id = d.id WHERE a.is_archived = 0 AND a.service_type != 'Pet Boarding Reservation' $filterSQL ORDER BY a.appointment_date DESC, a.appointment_time DESC");
+$rows = [];
+if ($appts) {
+    while ($r = $appts->fetch_assoc()) {
+        $r['_type'] = 'Appointment';
+        $rows[] = $r;
+    }
+}
+
+$boards = $conn->query("SELECT b.*, u.fullname as client_name FROM boarding_reservations b JOIN users u ON b.user_id = u.id WHERE b.is_archived = 0 $bFilterSQL ORDER BY b.appointment_date DESC");
+if ($boards) {
+    while ($r = $boards->fetch_assoc()) {
+        $r['_type'] = 'Boarding';
+        $r['doctor_name'] = 'Clinic (Boarding)';
+        $r['service_type'] = 'Pet Boarding (Cage ' . str_pad($r['cage_number'] ?? '?', 2, '0', STR_PAD_LEFT) . ')';
+        $r['service_location'] = 'On-Site';
+        $r['appointment_time'] = $r['appointment_time'] ?? '12:00:00';
+        $rows[] = $r;
+    }
+}
+
+// Sort $rows by date and time DESC
+usort($rows, function($a, $b) {
+    $dateA = strtotime($a['appointment_date'] . ' ' . $a['appointment_time']);
+    $dateB = strtotime($b['appointment_date'] . ' ' . $b['appointment_time']);
+    return $dateB - $dateA;
+});
+
+?>
+<!DOCTYPE html>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<title>Manage Appointments | VetAdmin</title>
+<meta charset="UTF-8">
+<script src='https://cdn.jsdelivr.net/npm/fullcalendar@6.1.10/index.global.min.js'></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+<style>
+:root { --primary:#2563eb; --secondary:#3b82f6; --dark:#1e40af; --accent:#3b82f6; --light:#E6EEF8; --sidebar-width:260px; }
+* { box-sizing:border-box; }
+body { background:#f0f4f8; font-family:'Inter',sans-serif; color:#2D3748; margin:0; }
+
+/* SIDEBAR */
+.sidebar { background:#0f172a; width:var(--sidebar-width); height:100vh; position:fixed; top:0; left:0; padding:24px 16px; z-index:1000; display:flex; flex-direction:column; box-shadow:5px 0 20px rgba(0,0,0,.2); overflow-y:auto; }
+.sidebar h4 { color:#ffffff; font-weight:800; font-size:22px; margin-bottom:30px; letter-spacing:0.5px; display:flex; align-items:center; gap:10px; }
+.sidebar a { display:flex; align-items:center; gap:10px; padding:12px 16px; border-radius:8px; color:#94a3b8; text-decoration:none; margin-bottom:4px; font-weight:600; font-size:15px; transition:.2s; }
+.sidebar a i { width:18px; text-align:center; }
+.sidebar a:hover, .sidebar a.active { background:#2563eb; color:#ffffff; }
+.sidebar-logout { margin-top:auto; }
+.sidebar-logout a { color:#ff7070 !important; }
+.sidebar-logout a:hover { background:rgba(255,112,112,.15) !important; }
+
+/* MAIN */
+.main-content { margin-left: 260px !important; width: calc(100% - 260px) !important; max-width: calc(100% - 260px) !important; padding: 24px 28px !important; min-height: 100vh; box-sizing: border-box !important; }
+
+@media (max-width: 1200px) {
+    .main-content { padding: 20px 20px !important; }
+}
+
+@media (max-width: 768px) {
+    .main-content { margin-left: 0 !important; width: 100% !important; max-width: 100% !important; padding: 16px !important; }
+    .sidebar { position: relative !important; width: 100% !important; height: auto !important; }
+}
+
+/* STAT CARDS */
+.stat-card { background:#fff; border-radius:14px; padding:18px 22px; box-shadow:0 2px 12px rgba(0,0,0,.05); display:flex; align-items:center; gap:14px; }
+.stat-icon { width:46px; height:46px; border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:20px; flex-shrink:0; }
+
+/* MAIN CARD */
+.card-main { background:#fff; border-radius:18px; box-shadow:0 4px 24px rgba(0,0,0,.06); overflow:hidden; }
+.card-toolbar { padding:20px 24px; border-bottom:1px solid #f1f5f9; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+
+/* SEARCH */
+.search-w { position:relative; }
+.search-w input { padding:9px 14px 9px 36px; border:1.5px solid #e2e8f0; border-radius:10px; font-size:13px; font-family:inherit; background:#E6EEF8; outline:none; transition:.2s; min-width:240px; }
+.search-w input:focus { border-color:var(--accent); background:#fff; box-shadow:0 0 0 3px rgba(74, 127, 196,.15); }
+.search-w .si { position:absolute; left:11px; top:50%; transform:translateY(-50%); color:#94a3b8; font-size:13px; pointer-events:none; }
+
+/* FILTER TABS */
+.ftab { padding:7px 14px; border-radius:20px; border:1.5px solid #e2e8f0; background:#E6EEF8; font-size:12px; font-weight:700; color:#64748b; cursor:pointer; transition:.15s; font-family:inherit; display:inline-flex; align-items:center; gap:5px; }
+.ftab:hover, .ftab.active { background:var(--secondary); border-color:var(--secondary); color:#fff; }
+.ftab .cnt { background:rgba(255,255,255,.25); border-radius:20px; padding:1px 7px; font-size:11px; }
+.ftab:not(.active) .cnt { background:#e2e8f0; color:#64748b; }
+
+/* TABLE */
+.appt-table { width:100%; border-collapse:collapse; }
+.appt-table thead th { padding:11px 16px; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.07em; color:#94a3b8; border-bottom:2px solid #f1f5f9; white-space:nowrap; background:#fafbfc; }
+.appt-table tbody tr { cursor:pointer; transition:background .12s; }
+.appt-table tbody tr:hover { background:#E6EEF8; }
+.appt-table tbody td { padding:14px 16px; vertical-align:middle; border-bottom:1px solid #f1f5f9; font-size:13px; }
+.appt-table tbody tr:last-child td { border-bottom:none; }
+
+/* AVATAR */
+.av { width:40px; height:40px; border-radius:11px; background:linear-gradient(135deg,#e0f2fe,#bae6fd); display:flex; align-items:center; justify-content:center; font-size:17px; color:#0369a1; flex-shrink:0; }
+
+/* STATUS */
+.bs { display:inline-flex; align-items:center; gap:5px; padding:4px 11px; border-radius:20px; font-size:12px; font-weight:700; border:1.5px solid transparent; }
+.bs-pending     { background:#fff7ed; color:#c2410c; border-color:#fed7aa; }
+.bs-approved    { background:#f0fdf4; color:#15803d; border-color:#bbf7d0; }
+.bs-checkin     { background:#ecfeff; color:#0e7490; border-color:#a5f3fc; }
+.bs-inprogress  { background:#f5f3ff; color:#6d28d9; border-color:#ddd6fe; }
+.bs-completed   { background:#eff6ff; color:#1d4ed8; border-color:#bfdbfe; }
+.bs-noshow      { background:#fff1f2; color:#9f1239; border-color:#fda4af; }
+.bs-cancelled   { background:#fff1f2; color:#be123c; border-color:#fecdd3; }
+.bs-proposed    { background:#fdf4ff; color:#7e22ce; border-color:#e9d5ff; }
+.bs-requested   { background:#f5f3ff; color:#7c3aed; border-color:#ddd6fe; }
+.bs-default     { background:#E6EEF8; color:#64748b; border-color:#e2e8f0; }
+
+/* TOAST */
+.toast-wrap { position:fixed; top:22px; right:28px; z-index:99999; min-width:300px; border-radius:14px; padding:15px 18px; font-size:14px; font-weight:500; box-shadow:0 8px 32px rgba(0,0,0,.14); animation:toastIn .35s ease; display:flex; align-items:flex-start; gap:10px; }
+.toast-wrap.success { background:#f0fdf4; border:1.5px solid #bbf7d0; color:#15803d; }
+.toast-wrap.danger  { background:#fff1f2; border:1.5px solid #fecdd3; color:#be123c; }
+@keyframes toastIn { from{opacity:0;transform:translateY(-14px) scale(.96)} to{opacity:1;transform:none} }
+
+/* DETAIL MODAL */
+.dmodal-bd { position:fixed; inset:0; background:rgba(15,23,42,.5); z-index:99998; display:none; align-items:center; justify-content:center; padding:16px; opacity:0; transition:opacity .18s; }
+.dmodal-bd.open { display:flex; }
+.dmodal { background:#fff; border-radius:20px; width:100%; max-width:560px; max-height:88vh; display:flex; flex-direction:column; box-shadow:0 24px 64px rgba(0,0,0,.2); overflow:hidden; transform:scale(.95) translateY(10px); transition:transform .2s,opacity .2s; opacity:0; }
+.dmodal-bd.open .dmodal { transform:none; opacity:1; }
+.dmodal-hdr { padding:20px 24px; border-bottom:1px solid #f1f5f9; display:flex; align-items:center; justify-content:space-between; }
+.dmdl-close { width:32px; height:32px; border-radius:50%; border:1.5px solid #e2e8f0; background:#E6EEF8; cursor:pointer; display:flex; align-items:center; justify-content:center; color:#64748b; font-size:15px; }
+.dmdl-close:hover { background:#fee2e2; border-color:#fca5a5; color:#e11d48; }
+.dmodal-body { overflow-y:auto; padding:22px 24px; flex:1; }
+.dmodal-foot { padding:16px 24px; border-top:1px solid #f1f5f9; }
+.info-g { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:16px; }
+.info-i label { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; color:#94a3b8; display:block; margin-bottom:3px; }
+.info-i .v { font-size:14px; font-weight:600; color:#0f172a; }
+.info-i.full { grid-column:1/-1; }
+.hero-svc { text-align:center; background:linear-gradient(135deg,#eff6ff,#dbeafe); border-radius:14px; padding:16px; margin-bottom:16px; }
+.hero-svc .sn { font-size:20px; font-weight:800; color:var(--secondary); }
+.hero-svc .sd { font-size:13px; color:#64748b; margin-top:2px; }
+.btn-act { padding:10px 18px; border-radius:50px; border:none; font-weight:700; font-size:13px; font-family:inherit; cursor:pointer; transition:.2s; }
+.btn-act:hover { opacity:.88; transform:translateY(-1px); }
+.btn-act.g { background:#16a34a; color:#fff; }
+.btn-act.b { background:var(--secondary); color:#fff; }
+.btn-act.r { background:#e11d48; color:#fff; }
+.btn-act.o { background:#ea580c; color:#fff; }
+.btn-act.gray { background:#f1f5f9; color:#475569; border:1.5px solid #e2e8f0; }
+
+.sidebar::-webkit-scrollbar { width: 5px; }
+.sidebar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 10px; }
+.sidebar::-webkit-scrollbar-track { background: transparent; }
+
+        /* ====== WHITE SIDEBAR THEME ====== */
+        .sidebar {
+            background: #ffffff !important;
+            width: var(--sidebar-width, 260px) !important;
+            height: 100vh !important;
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            padding: 28px 20px 24px !important;
+            z-index: 1000 !important;
+            display: flex !important;
+            flex-direction: column !important;
+            border-right: 1px solid #eef2f6 !important;
+            box-shadow: none !important;
+            overflow-y: auto !important;
+        }
+
+        .sidebar-brand {
+            display: flex !important;
+            align-items: center !important;
+            gap: 12px !important;
+            margin-bottom: 24px !important;
+            padding: 0 4px !important;
+            text-decoration: none !important;
+        }
+
+        .sidebar-brand-icon {
+            width: 44px !important;
+            height: 44px !important;
+            min-width: 44px !important;
+            border-radius: 13px !important;
+            background: #2563eb !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            color: #ffffff !important;
+            font-size: 20px !important;
+            flex-shrink: 0 !important;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+        }
+
+        .sidebar-brand span {
+            font-weight: 800 !important;
+            color: #182032 !important;
+            font-size: 22px !important;
+            letter-spacing: -0.4px !important;
+        }
+
+        .sidebar-user {
+            margin-bottom: 24px !important;
+            padding: 15px 18px !important;
+            border-radius: 14px !important;
+            background: #f8fafc !important;
+            border: 1px solid #eef2f6 !important;
+        }
+
+        .sidebar-user .welcome {
+            font-size: 13px !important;
+            color: #64748b !important;
+            font-weight: 500 !important;
+            line-height: 1.3 !important;
+        }
+
+        .sidebar-user .uname {
+            font-weight: 700 !important;
+            color: #0f172a !important;
+            font-size: 15.5px !important;
+            margin-top: 3px !important;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+        }
+
+        .sidebar a {
+            display: flex !important;
+            align-items: center !important;
+            gap: 14px !important;
+            padding: 12px 16px !important;
+            border-radius: 12px !important;
+            color: #334155 !important;
+            text-decoration: none !important;
+            margin-bottom: 4px !important;
+            font-weight: 600 !important;
+            font-size: 14.5px !important;
+            transition: all 0.2s ease !important;
+            letter-spacing: -0.1px !important;
+        }
+
+        .sidebar a i {
+            width: 22px !important;
+            text-align: center !important;
+            font-size: 16px !important;
+            color: #64748b !important;
+            transition: color 0.2s !important;
+            flex-shrink: 0 !important;
+        }
+
+        .sidebar a:hover {
+            background: #f8fafc !important;
+            color: #0f172a !important;
+        }
+
+        .sidebar a:hover i {
+            color: #2563eb !important;
+        }
+
+        .sidebar a.active {
+            background: #2563eb !important;
+            color: #ffffff !important;
+            font-weight: 700 !important;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+        }
+
+        .sidebar a.active i {
+            color: #ffffff !important;
+        }
+
+        .sidebar .sidebar-logout {
+            margin-top: auto !important;
+            padding-top: 20px !important;
+            border-top: 1px solid #f1f5f9 !important;
+        }
+
+        .sidebar .sidebar-logout a {
+            color: #dc2626 !important;
+            font-weight: 600 !important;
+            margin-bottom: 0 !important;
+        }
+
+        .sidebar .sidebar-logout a i {
+            color: #dc2626 !important;
+        }
+
+        .sidebar .sidebar-logout a:hover {
+            background: #fef2f2 !important;
+            color: #b91c1c !important;
+        }
+
+        .sidebar::-webkit-scrollbar { width: 5px; }
+        .sidebar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.06); border-radius: 10px; }
+        .sidebar::-webkit-scrollbar-track { background: transparent; }
+</style>
+    <link rel="stylesheet" href="assets/pragmavet.css">
+    <link href="assets/global-style.css" rel="stylesheet">
+</head>
+<body>
+
+<?php if (isset($_SESSION['message'])): ?>
+<div class="toast-wrap <?php echo $_SESSION['msg_type']==='success'?'success':'danger'; ?>" id="toastMsg">
+    <i class="fa <?php echo $_SESSION['msg_type']==='success'?'fa-check-circle':'fa-exclamation-circle'; ?>" style="font-size:17px;margin-top:1px;flex-shrink:0;"></i>
+    <div><?php echo $_SESSION['message']; unset($_SESSION['message'],$_SESSION['msg_type']); ?></div>
+    <button onclick="this.parentElement.remove()" style="background:none;border:none;cursor:pointer;margin-left:auto;font-size:15px;color:inherit;opacity:.5;">&#x2715;</button>
+</div>
+<?php endif; ?>
+
+<!-- SIDEBAR -->
+<?php include("includes/admin_sidebar.php"); ?>
+
+<div class="main-content">
+    <?php if ($counts['Reschedule Requested'] > 0): ?>
+    <div style="background:linear-gradient(135deg,#7c3aed,#9333ea); color:#fff; padding:16px 24px; border-radius:16px; margin-bottom:24px; display:flex; align-items:center; justify-content:space-between; gap:15px; box-shadow:0 10px 25px rgba(124,58,237,0.15);">
+        <div style="display:flex; align-items:center; gap:15px;">
+            <div style="width:42px; height:42px; background:rgba(255,255,255,0.2); border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:20px;">
+                <i class="fa fa-calendar-alt"></i>
+            </div>
+            <div>
+                <div style="font-weight:800; font-size:15px; letter-spacing:0.3px;">Shift Requests Pending</div>
+                <div style="font-size:13px; opacity:0.9;">There are <b><?php echo $counts['Reschedule Requested']; ?></b> pet owners requesting to change their schedules.</div>
+            </div>
+        </div>
+        <button onclick="document.querySelector('[data-filter=\'Reschedule Requested\']').click()" style="background:#fff; color:#7c3aed; border:none; padding:10px 20px; border-radius:50px; font-weight:800; font-size:13px; cursor:pointer; transition:0.2s; box-shadow:0 4px 12px rgba(0,0,0,0.1);" onmouseover="this.style.transform='scale(1.05)'" onmouseout="this.style.transform='scale(1)'">
+            Review Requests
+        </button>
+    </div>
+    <?php endif; ?>
+
+    <!-- Scope Guidance / Operations Link -->
+    <div class="alert alert-info border-0 shadow-sm rounded-4 p-3 mb-4 d-flex align-items-center justify-content-between flex-wrap gap-2" style="background:#eff6ff;color:#1e40af;">
+        <div class="d-flex align-items-center gap-2">
+            <i class="fa fa-info-circle fs-5"></i>
+            <span class="small fw-semibold"><strong>Admin Scope:</strong> Monitoring appointment requests, doctor caseload assignments, lifecycle status, and historical consultation logs.</span>
+        </div>
+        <a href="staff_dashboard.php?tab=appointments" class="btn btn-sm btn-primary rounded-pill px-3 fw-bold shadow-sm" style="font-size:12px;">
+            <i class="fa fa-id-badge me-1"></i> Open Vet Staff Intake Operations
+        </a>
+    </div>
+
+    <!-- Page header -->
+    <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-3">
+        <div>
+            <span class="badge bg-primary bg-opacity-10 text-primary fw-bold px-3 py-1.5 rounded-pill mb-2" style="font-size: 11px;">
+                <i class="fa fa-calendar-check me-1"></i> APPOINTMENT MONITORING
+            </span>
+            <h2 style="font-weight:800;font-size:24px;color:#0f172a;margin:0;letter-spacing:-.5px;">Appointment Monitoring Hub</h2>
+            <p style="color:#94a3b8;font-size:14px;margin:2px 0 0;">Track appointment requests, consultation progression, doctor assignments, and patient history.</p>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;">
+            <button onclick="window.print()" class="btn btn-sm btn-outline-secondary rounded-pill px-3 py-2 fw-bold" style="font-size:13px;">
+                <i class="fa fa-print me-1"></i> Print Desk Sheet
+            </button>
+            <button id="btnToggleCalendarView" onclick="toggleAdminCalendarView()" class="btn btn-sm btn-outline-primary rounded-pill px-3 py-2 fw-bold" style="font-size:13px;">
+                <i class="fa fa-calendar-alt me-1"></i> Visual Calendar View
+            </button>
+            <button onclick="document.getElementById('bookApptModal').style.display='flex'" style="background:#2563eb;color:#fff;border:none;padding:10px 20px;border-radius:50px;font-weight:700;font-size:13px;cursor:pointer;display:flex;align-items:center;gap:7px;box-shadow:0 4px 14px rgba(37,99,235,0.28);">
+                <i class="fa fa-plus-circle"></i> Book Appointment
+            </button>
+        </div>
+    </div>
+
+    <!-- Stat Cards -->
+    <div class="row g-3 mb-4">
+        <?php
+        $stats = [
+            ['label'=>'Total','count'=>$counts['all'],       'icon'=>'fa-list-alt',       'bg'=>'#eff6ff','ic'=>'#2563eb'],
+            ['label'=>'Pending','count'=>$counts['Pending'], 'icon'=>'fa-clock',           'bg'=>'#fff7ed','ic'=>'#ea580c'],
+            ['label'=>'Requests','count'=>$counts['Reschedule Requested'], 'icon'=>'fa-calendar-plus', 'bg'=>'#f5f3ff','ic'=>'#7c3aed'],
+            ['label'=>'Approved','count'=>$counts['Approved'],'icon'=>'fa-check-circle',  'bg'=>'#f0fdf4','ic'=>'#16a34a'],
+            ['label'=>'Completed','count'=>$counts['Completed'],'icon'=>'fa-star',         'bg'=>'#eff6ff','ic'=>'#2563eb'],
+            ['label'=>'No Show','count'=>$counts['No Show'], 'icon'=>'fa-user-slash',    'bg'=>'#fff1f2','ic'=>'#9f1239'],
+            ['label'=>'Cancelled','count'=>$counts['Cancelled'],'icon'=>'fa-times-circle','bg'=>'#fff1f2','ic'=>'#be123c'],
+        ];
+        foreach ($stats as $s): ?>
+        <div class="col">
+            <div class="stat-card">
+                <div class="stat-icon" style="background:<?php echo $s['bg']; ?>;">
+                    <i class="fa <?php echo $s['icon']; ?>" style="color:<?php echo $s['ic']; ?>;"></i>
+                </div>
+                <div>
+                    <div style="font-size:22px;font-weight:800;color:#0f172a;"><?php echo $s['count']; ?></div>
+                    <div style="font-size:12px;color:#94a3b8;font-weight:600;"><?php echo $s['label']; ?></div>
+                </div>
+            </div>
+        </div>
+        <?php endforeach; ?>
+    </div>
+
+    <!-- VISUAL FULLCALENDAR CONTAINER (Hidden by default) -->
+    <div id="adminCalendarWrapper" class="card-main mb-4 p-4" style="display:none;">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <h5 class="fw-bold text-dark m-0"><i class="fa fa-calendar-alt text-primary me-2"></i>Visual Appointment Schedule</h5>
+            <div class="small text-muted">Click any event to view appointment details</div>
+        </div>
+        <div id="adminFullCalendar" style="min-height: 600px;"></div>
+    </div>
+
+    <!-- Main appointments card -->
+    <div class="card-main" id="adminTableWrapper">
+        <div class="card-toolbar">
+            <h5 style="font-weight:800;font-size:15px;color:#0f172a;margin:0;flex-shrink:0;"><i class="fa fa-clipboard-list text-primary me-2"></i> All Appointments</h5>
+
+            <!-- Live search -->
+            <div class="search-w" style="flex:1;">
+                <span class="si"><i class="fa fa-search"></i></span>
+                <input type="text" id="apptSearch" placeholder="Search client, pet, service, doctor…" style="width:100%;">
+            </div>
+
+            <!-- Filter tabs -->
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                <button class="ftab active" data-filter="all">All <span class="cnt"><?php echo $counts['all']; ?></span></button>
+                <button class="ftab" data-filter="Pending">Pending <span class="cnt"><?php echo $counts['Pending']; ?></span></button>
+                <button class="ftab" data-filter="Reschedule Requested">Resched Req <span class="cnt" style="background:#7c3aed;color:#fff;"><?php echo $counts['Reschedule Requested']; ?></span></button>
+                <button class="ftab" data-filter="Approved">Approved <span class="cnt"><?php echo $counts['Approved']; ?></span></button>
+                <button class="ftab" data-filter="Completed">Completed <span class="cnt"><?php echo $counts['Completed']; ?></span></button>
+                <button class="ftab" data-filter="No Show">No Show <span class="cnt" style="background:#9f1239;color:#fff;"><?php echo $counts['No Show']; ?></span></button>
+                <button class="ftab" data-filter="Cancelled">Cancelled <span class="cnt"><?php echo $counts['Cancelled']; ?></span></button>
+            </div>
+        </div>
+
+        <div style="overflow-x:auto;">
+        <?php if (count($rows) > 0): ?>
+        <table class="appt-table" id="apptTable">
+            <thead>
+                <tr>
+                    <th data-sort-method="number" style="cursor:pointer;"># <i class="fa fa-sort ms-1" style="font-size:10px;opacity:.5;"></i></th>
+                    <th style="cursor:pointer;">Client / Pet <i class="fa fa-sort ms-1" style="font-size:10px;opacity:.5;"></i></th>
+                    <th style="cursor:pointer;">Service <i class="fa fa-sort ms-1" style="font-size:10px;opacity:.5;"></i></th>
+                    <th style="cursor:pointer;">Schedule <i class="fa fa-sort ms-1" style="font-size:10px;opacity:.5;"></i></th>
+                    <th style="cursor:pointer;">Assigned Doctor <i class="fa fa-sort ms-1" style="font-size:10px;opacity:.5;"></i></th>
+                    <th style="cursor:pointer;">Location <i class="fa fa-sort ms-1" style="font-size:10px;opacity:.5;"></i></th>
+                    <th style="cursor:pointer;">Status <i class="fa fa-sort ms-1" style="font-size:10px;opacity:.5;"></i></th>
+                    <th style="cursor:pointer;">Booked <i class="fa fa-sort ms-1" style="font-size:10px;opacity:.5;"></i></th>
+                    <th data-sort-method="none">Action</th>
+                </tr>
+            </thead>
+            <tbody id="apptBody">
+            <?php foreach ($rows as $row):
+                $status = $row['status'];
+                $bsCls = match(true) {
+                    $status === 'Pending'              => 'bs-pending',
+                    $status === 'Approved'             => 'bs-approved',
+                    $status === 'Checked In'           => 'bs-checkin',
+                    $status === 'In Progress'          => 'bs-inprogress',
+                    $status === 'Completed'            => 'bs-completed',
+                    $status === 'No Show'              => 'bs-noshow',
+                    $status === 'Reschedule Proposed'  => 'bs-proposed',
+                    $status === 'Reschedule Requested' => 'bs-requested',
+                    str_contains($status,'Cancel') || str_contains($status,'Reject') => 'bs-cancelled',
+                    default => 'bs-default'
+                };
+                $dot = match(true) {
+                    $status === 'Pending'              => '#ea580c',
+                    $status === 'Approved'             => '#16a34a',
+                    $status === 'Checked In'           => '#0891b2',
+                    $status === 'In Progress'          => '#7c3aed',
+                    $status === 'Completed'            => '#2563eb',
+                    $status === 'No Show'              => '#9f1239',
+                    $status === 'Reschedule Proposed'  => '#7e22ce',
+                    $status === 'Reschedule Requested' => '#7c3aed',
+                    str_contains($status,'Cancel') || str_contains($status,'Reject') => '#be123c',
+                    default => '#94a3b8'
+                };
+                $rowData = htmlspecialchars(json_encode($row, JSON_HEX_TAG|JSON_HEX_QUOT|JSON_HEX_AMP), ENT_QUOTES);
+            ?>
+            <tr class="appt-row" data-status="<?php echo htmlspecialchars($status); ?>" onclick="openModal(<?php echo $rowData; ?>)">
+                <td style="font-size:12px;color:#94a3b8;font-weight:600;">#<?php echo $row['id']; ?></td>
+                <td>
+                    <?php
+                    $appt_pets_html = '';
+                    if ($row['_type'] === 'Appointment') {
+                        include_once("includes/pet_data_helper.php");
+                        $appt_pets = function_exists('getAppointmentPets') ? getAppointmentPets($conn, $row['id']) : [];
+                        if (!empty($appt_pets)) {
+                            $appt_pets_html = '<div style="display:flex;flex-direction:column;gap:3px;">';
+                            foreach (array_slice($appt_pets, 0, 2) as $ap) {
+                                $pic = !empty($ap['display_picture']) ? $ap['display_picture'] : null;
+                                $appt_pets_html .= '<div style="display:flex;align-items:center;gap:6px;">';
+                                if ($pic && file_exists('uploads/pets/' . $pic)) {
+                                    $appt_pets_html .= '<img src="uploads/pets/' . htmlspecialchars($pic) . '" style="width:22px;height:22px;border-radius:50%;object-fit:cover;border:1.5px solid #e2e8f0;flex-shrink:0;">';
+                                } else {
+                                    $init = strtoupper(substr($ap['display_name'], 0, 1));
+                                    $appt_pets_html .= '<div style="width:22px;height:22px;border-radius:50%;background:linear-gradient(135deg,#e0f2fe,#bae6fd);display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:#2563eb;flex-shrink:0;">' . $init . '</div>';
+                                }
+                                $appt_pets_html .= '<a href="#" onclick="openQuickPetEmr(\'' . htmlspecialchars(addslashes($ap['display_name'])) . '\', ' . (int)$row['user_id'] . ', event)" class="fw-bold text-decoration-none text-primary" style="font-size:12px;" title="Click for Quick EMR Preview">' . htmlspecialchars($ap['display_name']) . '</a></div>';
+                            }
+                            if (count($appt_pets) > 2) {
+                                $extra = count($appt_pets) - 2;
+                                $appt_pets_html .= '<div style="font-size:11px;color:#94a3b8;padding-left:28px;">+' . $extra . ' more</div>';
+                            }
+                            $appt_pets_html .= '</div>';
+                        } else {
+                            $appt_pets_html = '<a href="#" onclick="openQuickPetEmr(\'' . htmlspecialchars(addslashes($row['pet_name'])) . '\', ' . (int)$row['user_id'] . ', event)" class="fw-bold text-decoration-none text-primary" style="font-size:12px;" title="Click for Quick EMR Preview"><i class="fa fa-paw me-1"></i>' . htmlspecialchars($row['pet_name']) . '</a>';
+                        }
+                    } else {
+                        $appt_pets_html = '<a href="#" onclick="openQuickPetEmr(\'' . htmlspecialchars(addslashes($row['pet_name'] ?? 'Boarding')) . '\', ' . (int)$row['user_id'] . ', event)" class="fw-bold text-decoration-none text-primary" style="font-size:12px;" title="Click for Quick EMR Preview"><i class="fa fa-paw me-1"></i>' . htmlspecialchars($row['pet_name'] ?? 'Boarding') . '</a>';
+                    }
+                    ?>
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <div class="av" style="background:linear-gradient(135deg,#e0f2fe,#bae6fd);"><i class="fa fa-paw" style="color:#2563eb;"></i></div>
+                        <div>
+                            <div style="font-weight:700;color:#0f172a;"><?php echo htmlspecialchars($row['client_name']); ?></div>
+                            <?php echo $appt_pets_html; ?>
+                        </div>
+                    </div>
+                </td>
+                <td style="font-weight:600;color:#334155;max-width:160px;"><?php echo htmlspecialchars($row['service_type']); ?></td>
+                <td>
+                    <div style="font-weight:600;color:#0f172a;font-size:13px;"><i class="far fa-calendar-alt" style="color:#94a3b8;margin-right:4px;"></i><?php echo date("M d, Y", strtotime($row['appointment_date'])); ?></div>
+                    <div style="font-size:12px;color:#64748b;"><i class="far fa-clock" style="margin-right:3px;"></i><?php echo date("h:i A", strtotime($row['appointment_time'])); ?></div>
+                    <?php if (($status === 'Reschedule Requested' || $status === 'Reschedule Proposed') && !empty($row['proposed_reschedule_date'])): ?>
+                    <div style="margin-top:5px; background:#f5f3ff; color:#7c3aed; padding:3px 8px; border-radius:6px; font-size:10px; font-weight:800; border:1px solid #ddd6fe; display:inline-flex; align-items:center; gap:4px;">
+                        <i class="fa fa-exchange-alt"></i> Shift: <?php echo date("M d", strtotime($row['proposed_reschedule_date'])); ?>
+                    </div>
+                    <?php endif; ?>
+                </td>
+
+                <!-- INLINE DOCTOR RE-ASSIGNMENT DROPDOWN -->
+                <td onclick="event.stopPropagation();">
+                    <?php if ($row['_type'] === 'Appointment'): ?>
+                        <form method="POST" class="m-0">
+                            <input type="hidden" name="apt_id" value="<?= $row['id'] ?>">
+                            <input type="hidden" name="update_doctor_assignment" value="1">
+                            <select name="assign_doctor_id" onchange="this.form.submit()" class="form-select form-select-sm border-0 bg-light text-dark fw-bold shadow-sm" style="font-size:12px; border-radius:8px; cursor:pointer; width:auto; max-width:150px; padding: 4px 24px 4px 8px;">
+                                <option value="" <?= empty($row['doctor_id']) ? 'selected' : '' ?>>-- Unassigned --</option>
+                                <?php foreach ($all_doctors as $doc): ?>
+                                    <option value="<?= $doc['id'] ?>" <?= ((int)($row['doctor_id'] ?? 0) === (int)$doc['id']) ? 'selected' : '' ?>>
+                                        Dr. <?= htmlspecialchars($doc['fullname']) ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </form>
+                    <?php else: ?>
+                        <span class="badge bg-secondary bg-opacity-10 text-secondary border border-secondary border-opacity-25 rounded-pill px-2.5 py-1 fw-bold" style="font-size:11px;">
+                            <i class="fa fa-hotel me-1"></i> Clinic (Boarding)
+                        </span>
+                    <?php endif; ?>
+                </td>
+
+                <td>
+                    <?php if ($row['service_location'] === 'Home Service'): ?>
+                    <span style="background:#e0f2fe;color:#0369a1;padding:3px 8px;border-radius:6px;font-size:11px;font-weight:600;"><i class="fa fa-home me-1"></i>Home</span>
+                    <?php else: ?>
+                    <span style="background:#f1f5f9;color:#475569;padding:3px 8px;border-radius:6px;font-size:11px;font-weight:600;"><i class="fa fa-hospital me-1"></i>On-Site</span>
+                    <?php endif; ?>
+                </td>
+                <td>
+                    <span class="bs <?php echo $bsCls; ?>">
+                        <span style="width:7px;height:7px;border-radius:50%;background:<?php echo $dot; ?>;flex-shrink:0;"></span>
+                        <?php echo htmlspecialchars($status); ?>
+                    </span>
+                </td>
+                <td style="font-size:12px;color:#94a3b8;"><?php echo date("M d, Y", strtotime($row['created_at'])); ?></td>
+
+                <!-- ACTION COLUMN: EYE ICON ONLY -->
+                <td onclick="event.stopPropagation();" class="text-center">
+                    <button type="button" class="btn btn-sm rounded-circle" style="width:32px;height:32px;padding:0; background:#2563eb; color:#fff; border:none; box-shadow:0 4px 10px rgba(37,99,235,0.35); transition:transform 0.2s;" onmouseover="this.style.transform='scale(1.1)'" onmouseout="this.style.transform='scale(1)'" title="View Details" onclick="openModal(<?php echo $rowData; ?>); return false;">
+                        <i class="fa fa-eye"></i>
+                    </button>
+                </td>
+            </tr>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+        <div id="noResult" style="display:none;text-align:center;padding:48px;color:#94a3b8;">
+            <i class="fa fa-search" style="font-size:36px;display:block;margin-bottom:10px;opacity:.3;"></i>
+            No appointments match your search or filter.
+        </div>
+        <?php else: ?>
+        <div style="text-align:center;padding:60px 20px;color:#94a3b8;">
+            <i class="fa fa-calendar-times" style="font-size:48px;display:block;margin-bottom:14px;opacity:.3;"></i>
+            <div style="font-weight:700;font-size:16px;color:#475569;margin-bottom:6px;">No Appointments Found</div>
+            <div style="font-size:13px;">No appointments match the current filter.</div>
+        </div>
+        <?php endif; ?>
+        </div>
+    </div>
+</div>
+
+<!-- â”€â”€ DETAIL MODAL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+<div class="dmodal-bd" id="detailBd">
+    <div class="dmodal">
+        <div class="dmodal-hdr">
+            <h5 style="font-weight:800;font-size:16px;color:#0f172a;margin:0;display:flex;align-items:center;gap:9px;">
+                <span style="width:34px;height:34px;border-radius:9px;background:#eff6ff;display:inline-flex;align-items:center;justify-content:center;color:#2563eb;font-size:14px;"><i class="fa fa-calendar-day"></i></span>
+                Appointment Details
+            </h5>
+            <button class="dmdl-close" onclick="closeModal()">&#x2715;</button>
+        </div>
+        <div class="dmodal-body">
+            <div class="hero-svc">
+                <div class="sn" id="dm-svc"></div>
+                <div class="sd" id="dm-dt"></div>
+            </div>
+            <div style="text-align:center;margin-bottom:16px;" id="dm-status-w"></div>
+            <div class="info-g">
+                <div class="info-i"><label><i class="fa fa-user me-1"></i>Client</label><div class="v" id="dm-client"></div></div>
+                <div class="info-i"><label><i class="fa fa-paw me-1"></i>Pet</label><div class="v" id="dm-pet"></div></div>
+                <div class="info-i"><label><i class="fa fa-user-md me-1"></i>Doctor</label><div class="v" id="dm-doctor"></div></div>
+                <div class="info-i"><label><i class="fa fa-map-marker-alt me-1"></i>Location</label><div class="v" id="dm-loc"></div></div>
+                <div class="info-i"><label><i class="fa fa-tag me-1"></i>Booked On</label><div class="v" id="dm-created"></div></div>
+                <div class="info-i"><label><i class="fa fa-id-badge me-1"></i>Appt ID</label><div class="v" id="dm-id"></div></div>
+                                <div class="info-i full" id="dm-addr-w" style="display:none;"><label><i class="fa fa-home me-1"></i>Home Address</label><div class="v" id="dm-addr" style="font-size:13px;font-weight:500;"></div></div>
+                
+                <div class="info-i full" id="dm-audit-w" style="display:none; background:#f0f9ff; padding:12px; border-radius:10px; border:1px dashed #bae6fd; margin-top:8px;">
+                    <label style="color:#0369a1; font-size:11px; text-transform:uppercase; font-weight:800; margin-bottom:4px;"><i class="fa fa-history me-1"></i> Audit Trail</label>
+                    <div class="v" id="dm-audit" style="font-size:13px; font-weight:500; color:#0c4a6e; white-space:pre-wrap;"></div>
+                </div>
+            </div>
+
+            <!-- Admin actions form -->
+            <div id="dm-actions" style="display:none !important;">
+                <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:#94a3b8;margin-bottom:12px;">Administrative Actions</p>
+                <form method="POST" id="adminActForm">
+                    <input type="hidden" name="apt_id" id="dm-apt-id">
+                    <input type="hidden" name="appt_type" id="dm-appt-type">
+
+                    <!-- Approve button (Pending only) -->
+                    <div id="dm-approve-w" style="display:none;margin-bottom:15px;">
+                        <button type="submit" name="admin_manage_appt" value="approve" class="btn-act g w-100 d-block" onclick="return confirm('Approve this appointment?');">
+                            <i class="fa fa-check me-1"></i> Approve Appointment
+                        </button>
+                        <div style="text-align:center; margin:12px 0; display:flex; align-items:center; gap:10px;">
+                            <div style="flex:1; height:1px; background:#f1f5f9;"></div>
+                            <span style="font-size:10px; font-weight:800; color:#94a3b8; text-transform:uppercase; letter-spacing:0.1em;">Or propose a shift</span>
+                            <div style="flex:1; height:1px; background:#f1f5f9;"></div>
+                        </div>
+                    </div>
+
+                    <!-- Complete button (Approved only) -->
+                    <div id="dm-complete-w" style="display:none;margin-bottom:10px;">
+                        <button type="submit" name="admin_manage_appt" value="complete" class="btn-act b w-100 d-block" onclick="return confirm('Mark as Completed?');">
+                            <i class="fa fa-star me-1"></i> Mark as Completed
+                        </button>
+                    </div>
+
+                    <!-- Message field for cancel/reschedule -->
+                    <div id="dm-msg-w" class="mb-3">
+                        <label style="font-size:11px;font-weight:700;color:#64748b;display:block;margin-bottom:5px;">Message to Client (for Cancel / Reschedule)</label>
+                        <textarea name="admin_message" class="form-control" rows="2" placeholder="Explain reason or instructions…" style="border-radius:10px;font-size:13px;font-family:inherit;resize:none;border:1.5px solid #e2e8f0;padding:10px;"></textarea>
+                    </div>
+
+                    <!-- Reschedule row -->
+                    <div id="dm-resched-w" style="background:#f8fafc; border-radius:12px; padding:12px; margin-bottom:12px; border:1px solid #e2e8f0;">
+                        <label style="font-size:11px;font-weight:700;color:#64748b;display:block;margin-bottom:8px;">Propose New Schedule</label>
+                        <div class="d-flex gap-2">
+                            <input type="text" name="new_date" id="dm-resched-input" class="form-control flatpickr-dt" placeholder="Pick new date &amp; time…" style="border-radius:10px;font-size:13px;flex:1;border:1.5px solid #e2e8f0;padding:10px;">
+                            <button type="submit" name="admin_manage_appt" value="reschedule" class="btn-act o" onclick="return confirm('Send reschedule proposal to client?');">
+                                <i class="fa fa-calendar-check me-1"></i> Propose
+                            </button>
+                        </div>
+                    </div>
+
+                    <button type="submit" name="admin_manage_appt" value="cancel" class="btn-act r w-100 d-block" onclick="return confirm('Permanently cancel this appointment?');">
+                        <i class="fa fa-times-circle me-1"></i> Cancel / Reject
+                    </button>
+                </form>
+            </div>
+        </div>
+        <div class="dmodal-foot d-flex gap-2 justify-content-end">
+            <button class="btn-act gray" onclick="closeModal()">Close</button>
+            
+        </div>
+    </div>
+</div>
+
+<!-- â”€â”€ BOOK APPOINTMENT MODAL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+<!-- ------------------------------------------------------ -->
+<div id="bookApptModal" style="display:none;position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:99999;align-items:center;justify-content:center;padding:16px;">
+    <div style="background:#fff;border-radius:20px;width:100%;max-width:600px;max-height:90vh;overflow-y:auto;box-shadow:0 24px 64px rgba(0,0,0,.2);">
+        <div style="padding:22px 28px;border-bottom:1px solid #f1f5f9;display:flex;justify-content:space-between;align-items:center;background:linear-gradient(135deg,#0f172a,#2563eb);border-radius:20px 20px 0 0;">
+            <div>
+                <h5 style="color:#fff;font-weight:800;margin:0;"><i class="fa fa-calendar-plus me-2"></i>Book Appointment</h5>
+                <p style="color:rgba(255,255,255,.7);font-size:12px;margin:2px 0 0;">Walk-in — auto-approved immediately</p>
+            </div>
+            <button onclick="document.getElementById('bookApptModal').style.display='none'" style="background:rgba(255,255,255,.15);border:none;color:#fff;width:32px;height:32px;border-radius:50%;cursor:pointer;font-size:16px;">&times;</button>
+        </div>
+        <div style="padding:24px 28px;">
+            <form method="POST">
+
+                <!-- Owner Search -->
+                <div style="margin-bottom:16px;">
+                    <label style="font-size:11px;font-weight:800;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px;"><i class="fa fa-search me-1"></i>Search Pet Owner</label>
+                    <input type="text" id="ownerSearch" placeholder="Type owner name…" oninput="filterOwners()" autocomplete="off"
+                        style="width:100%;padding:11px 14px;border:1.5px solid #e2e8f0;border-radius:10px;font-size:14px;font-family:inherit;outline:none;">
+                    <div id="ownerDropdown" style="display:none;border:1.5px solid #e2e8f0;border-radius:10px;margin-top:4px;max-height:200px;overflow-y:auto;background:#fff;box-shadow:0 8px 24px rgba(0,0,0,.08);">
+                        <?php foreach ($owners_map as $uid => $owner): ?>
+                        <div class="owner-opt" data-uid="<?= $uid ?>" data-name="<?= htmlspecialchars($owner['fullname']) ?>" data-pets="<?= htmlspecialchars(json_encode($owner['pets']), ENT_QUOTES) ?>"
+                            onclick="selectOwner(this)"
+                            style="padding:10px 14px;cursor:pointer;font-size:13px;font-weight:600;border-bottom:1px solid #f1f5f9;">
+                            <i class="fa fa-user me-2 text-primary"></i><?= htmlspecialchars($owner['fullname']) ?>
+                            <span style="color:#94a3b8;font-weight:400;"> &middot; <?= count($owner['pets']) ?> pet(s)</span>
+                        </div>
+                        <?php endforeach; ?>
+                    </div>
+                    <input type="hidden" name="walkin_user_id" id="walkin_user_id" required>
+                </div>
+
+                <!-- Pet -->
+                <div style="margin-bottom:16px;">
+                    <label style="font-size:11px;font-weight:800;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px;"><i class="fa fa-paw me-1"></i>Pet</label>
+                    <input type="hidden" name="walkin_pet_name" id="walkin_pet_name" required>
+                    <select id="walkin_pet_select" onchange="petSelected(this)" style="width:100%;padding:11px 14px;border:1.5px solid #e2e8f0;border-radius:10px;font-size:13px;font-family:inherit;">
+                        <option value="">— Select owner first —</option>
+                    </select>
+                    <!-- Inline Add Pet (shown when owner has no pets) -->
+                    <div id="addPetInline" style="display:none;margin-top:10px;background:#f0fdf4;border:1.5px solid #bbf7d0;border-radius:12px;padding:14px;">
+                        <p style="font-size:12px;font-weight:700;color:#15803d;margin:0 0 10px;"><i class="fa fa-plus-circle me-1"></i>No pets found — add one now</p>
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+                            <div><label style="font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;">Pet Name *</label><input type="text" id="inline_pet_name" oninput="syncInlinePet()" placeholder="e.g. Buddy" style="width:100%;padding:8px 10px;border:1.5px solid #bbf7d0;border-radius:8px;font-size:13px;font-family:inherit;"></div>
+                            <div><label style="font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;">Species *</label><input type="text" name="inline_pet_species" id="inline_pet_species" oninput="syncInlinePet()" placeholder="Dog, Cat…" style="width:100%;padding:8px 10px;border:1.5px solid #bbf7d0;border-radius:8px;font-size:13px;font-family:inherit;"></div>
+                            <div><label style="font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;">Breed</label><input type="text" name="inline_pet_breed" id="inline_pet_breed" oninput="syncInlinePet()" placeholder="Aspin" style="width:100%;padding:8px 10px;border:1.5px solid #bbf7d0;border-radius:8px;font-size:13px;font-family:inherit;"></div>
+                            <div><label style="font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;">Age (yrs)</label><input type="number" name="inline_pet_age" id="inline_pet_age" oninput="syncInlinePet()" min="0" value="0" style="width:100%;padding:8px 10px;border:1.5px solid #bbf7d0;border-radius:8px;font-size:13px;font-family:inherit;"></div>
+                        </div>
+                        <input type="hidden" name="do_add_pet" id="h_do_add_pet" value="0">
+                    </div>
+                </div>
+
+                <!-- Service -->
+                <div style="margin-bottom:16px;">
+                    <label style="font-size:11px;font-weight:800;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px;"><i class="fa fa-stethoscope me-1"></i>Service</label>
+                    <select name="walkin_service" required style="width:100%;padding:11px 14px;border:1.5px solid #e2e8f0;border-radius:10px;font-size:13px;font-family:inherit;">
+                        <option value="">Select service…</option>
+                        <option>General Checkup</option>
+                        <option>Vaccination and Deworming</option>
+                        <option>Dental Prophylaxis</option>
+                        <option>Laboratory Test</option>
+                        <option>Surgical Procedure</option>
+                        <option>Confinement</option>
+                        <option>Grooming</option>
+                        <option>Follow-up Consultation</option>
+                    </select>
+                </div>
+
+                <!-- Date + Time -->
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">
+                    <div>
+                        <label style="font-size:11px;font-weight:800;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px;"><i class="fa fa-calendar me-1"></i>Date</label>
+                        <input type="date" name="walkin_date" required min="<?= date('Y-m-d') ?>" style="width:100%;padding:11px 14px;border:1.5px solid #e2e8f0;border-radius:10px;font-size:13px;font-family:inherit;">
+                    </div>
+                    <div>
+                        <label style="font-size:11px;font-weight:800;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px;"><i class="fa fa-clock me-1"></i>Time</label>
+                        <input type="time" name="walkin_time" required style="width:100%;padding:11px 14px;border:1.5px solid #e2e8f0;border-radius:10px;font-size:13px;font-family:inherit;">
+                    </div>
+                </div>
+
+                <!-- Doctor -->
+                <div style="margin-bottom:16px;">
+                    <label style="font-size:11px;font-weight:800;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px;"><i class="fa fa-user-md me-1"></i>Assign Doctor</label>
+                    <select name="walkin_doctor" style="width:100%;padding:11px 14px;border:1.5px solid #e2e8f0;border-radius:10px;font-size:13px;font-family:inherit;">
+                        <option value="">â€” Unassigned â€”</option>
+                        <?php foreach ($doctors_list as $doc): ?>
+                        <option value="<?= $doc['id'] ?>"><?= htmlspecialchars($doc['fullname']) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <!-- Location -->
+                <div style="margin-bottom:16px;">
+                    <label style="font-size:11px;font-weight:800;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px;"><i class="fa fa-map-marker-alt me-1"></i>Location</label>
+                    <select name="walkin_location" style="width:100%;padding:11px 14px;border:1.5px solid #e2e8f0;border-radius:10px;font-size:13px;font-family:inherit;">
+                        <option value="On-Site">On-Site (Clinic)</option>
+                        <option value="Home Service">Home Service</option>
+                    </select>
+                </div>
+
+
+                <button type="submit" name="book_walkin_appt" value="1" style="width:100%;padding:14px;background:linear-gradient(135deg,#2563eb,#3b82f6);color:#fff;border:none;border-radius:12px;font-weight:800;font-size:15px;cursor:pointer;">
+                    <i class="fa fa-check-circle me-2"></i>Book & Approve Appointment
+                </button>
+            </form>
+        </div>
+    </div>
+</div>
+
+<script>
+function filterOwners() {
+    var q = document.getElementById('ownerSearch').value.toLowerCase().trim();
+    var dd = document.getElementById('ownerDropdown');
+    var opts = dd.querySelectorAll('.owner-opt');
+    dd.style.display = q.length > 0 ? 'block' : 'none';
+    opts.forEach(function(o) {
+        var ownerName = o.dataset.name.toLowerCase();
+        var pets = JSON.parse(o.dataset.pets || '[]');
+        var petMatch = pets.some(p => p.name.toLowerCase().includes(q));
+        o.style.display = (ownerName.includes(q) || petMatch) ? 'block' : 'none';
+    });
+}
+function selectOwner(el) {
+    document.getElementById('ownerSearch').value = el.dataset.name;
+    document.getElementById('walkin_user_id').value = el.dataset.uid;
+    document.getElementById('ownerDropdown').style.display = 'none';
+    var pets = JSON.parse(el.dataset.pets || '[]');
+    var sel = document.getElementById('walkin_pet_select');
+    var addInline = document.getElementById('addPetInline');
+    document.getElementById('walkin_pet_name').value = '';
+    if (pets.length === 0) {
+        sel.innerHTML = '<option value="">â€” No pets registered â€”</option>';
+        sel.style.display = 'none';
+        addInline.style.display = 'block';
+        document.getElementById('h_do_add_pet').value = '1';
+    } else {
+        sel.style.display = 'block';
+        addInline.style.display = 'none';
+        document.getElementById('h_do_add_pet').value = '0';
+        sel.innerHTML = '<option value="">â€” Select registered pet â€”</option>';
+        pets.forEach(function(p) {
+            var o = document.createElement('option');
+            o.value = p.name;
+            o.textContent = p.name + ' (' + (p.species || '?') + ')';
+            sel.appendChild(o);
+        });
+    }
+}
+function petSelected(sel) {
+    if (sel.value) document.getElementById('walkin_pet_name').value = sel.value;
+}
+function syncInlinePet() {
+    var name = document.getElementById('inline_pet_name').value;
+    document.getElementById('walkin_pet_name').value = name;
+}
+document.addEventListener('click', function(e) {
+    if (!e.target.closest('#ownerSearch') && !e.target.closest('#ownerDropdown')) {
+        document.getElementById('ownerDropdown').style.display = 'none';
+    }
+});
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+<script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tablesort/5.2.1/tablesort.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tablesort/5.2.1/sorts/tablesort.number.min.js"></script>
+<script>
+// Toast auto-dismiss
+(function(){ var t=document.getElementById('toastMsg'); if(t) setTimeout(function(){ t.style.opacity='0'; t.style.transform='translateY(-14px)'; setTimeout(function(){t.remove();},400); },4500); })();
+
+// Init plugins
+document.addEventListener('DOMContentLoaded',function(){
+    flatpickr('.flatpickr-dt',{ enableTime:true, dateFormat:'Y-m-d H:i', minDate:'today' });
+    var t = document.getElementById('apptTable');
+    if(t) new Tablesort(t, { descending: true });
+});
+
+// Live search + filter tabs
+(function(){
+    var inp    = document.getElementById('apptSearch');
+    var body   = document.getElementById('apptBody');
+    var noRes  = document.getElementById('noResult');
+    var activeF = 'all';
+    var tsInstance = null;
+
+    function matchStatus(rowStatus, filter) {
+        if (filter === 'all') return true;
+        var rs = (rowStatus || '').toLowerCase();
+        var f  = filter.toLowerCase();
+        if (f === 'cancelled') return rs.includes('cancel') || rs.includes('reject');
+        return rs === f;
+    }
+
+    function apply(){
+        if (!body) return;
+        var q   = inp ? inp.value.toLowerCase().trim() : '';
+        var rows = body.querySelectorAll('.appt-row');
+        var vis  = 0;
+        rows.forEach(function(r){
+            var sm = matchStatus(r.dataset.status, activeF);
+            var tm = !q || r.innerText.toLowerCase().includes(q);
+            var show = sm && tm;
+            r.style.display = show ? '' : 'none';
+            if (show) vis++;
+        });
+        if (noRes) noRes.style.display = vis === 0 ? 'block' : 'none';
+    }
+
+    if (inp) inp.addEventListener('input', apply);
+
+    document.querySelectorAll('.ftab').forEach(function(btn){
+        btn.addEventListener('click', function(){
+            document.querySelectorAll('.ftab').forEach(function(b){ b.classList.remove('active'); });
+            btn.classList.add('active');
+            activeF = btn.dataset.filter;
+            apply();
+        });
+    });
+})();
+
+// Helpers
+function esc(s){ return s?String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'):'-'; }
+function fmtDate(d){ if(!d) return '-'; var o=new Date(d+'T00:00:00'); return o.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}); }
+function fmtTime(t){ if(!t) return ''; var p=t.split(':'); var h=parseInt(p[0]),m=p[1],ap=h>=12?'PM':'AM'; h=h%12||12; return h+':'+m+' '+ap; }
+function fmtFull(s){ if(!s) return '-'; return new Date(s).toLocaleString('en-US',{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit',hour12:true}); }
+function statusBadge(s){
+    var cls='bs-default',dot='#94a3b8';
+    if(s==='Pending'){cls='bs-pending';dot='#ea580c';}
+    else if(s==='Approved'){cls='bs-approved';dot='#16a34a';}
+    else if(s==='Completed'){cls='bs-completed';dot='#2563eb';}
+    else if(s==='Reschedule Proposed'){cls='bs-proposed';dot='#7e22ce';}
+    else if(s==='Reschedule Requested'){cls='bs-requested';dot='#7c3aed';}
+    else if(s.includes('Cancel')||s.includes('Reject')){cls='bs-cancelled';dot='#be123c';}
+    return '<span class="bs '+cls+'" style="font-size:14px;padding:7px 18px;"><span style="width:9px;height:9px;border-radius:50%;background:'+dot+';flex-shrink:0;"></span>'+esc(s)+'</span>';
+}
+
+function openModal(d){
+    document.getElementById('dm-svc').textContent     = d.service_type || 'Appointment';
+    document.getElementById('dm-dt').textContent      = fmtDate(d.appointment_date) + (d.appointment_time ? ' at '+fmtTime(d.appointment_time) : '');
+    document.getElementById('dm-status-w').innerHTML  = statusBadge(d.status);
+    document.getElementById('dm-client').textContent  = d.client_name || '-';
+    document.getElementById('dm-pet').textContent     = d.pet_name || '-';
+    document.getElementById('dm-doctor').textContent  = d.doctor_name || 'Unassigned';
+    document.getElementById('dm-loc').textContent     = d.service_location || '-';
+    document.getElementById('dm-created').textContent = fmtFull(d.created_at);
+    document.getElementById('dm-id').textContent      = '#' + d.id;
+    document.getElementById('dm-apt-id').value        = d.id;
+
+    var addrW = document.getElementById('dm-addr-w');
+    if(d.service_location==='Home Service' && d.home_address){ addrW.style.display='block'; document.getElementById('dm-addr').textContent=d.home_address; }
+    else addrW.style.display='none';
+
+    // Show Audit Trail (Always visible)
+    var auditW = document.getElementById('dm-audit-w');
+    auditW.style.display = 'block';
+    if (d.admin_message && d.admin_message.trim() !== '') {
+        document.getElementById('dm-audit').textContent = d.admin_message;
+        document.getElementById('dm-audit').style.color = '#0c4a6e';
+        document.getElementById('dm-audit').style.fontStyle = 'normal';
+    } else {
+        document.getElementById('dm-audit').textContent = "No audit logs available for this appointment yet.";
+        document.getElementById('dm-audit').style.color = '#94a3b8';
+        document.getElementById('dm-audit').style.fontStyle = 'italic';
+    }
+
+    // Actions visibility
+    var actW = document.getElementById('dm-actions');
+    var approveW  = document.getElementById('dm-approve-w');
+    var completeW = document.getElementById('dm-complete-w');
+    var msgW      = document.getElementById('dm-msg-w');
+
+    var showActions = !['Completed','Cancelled','Rejected'].includes(d.status);
+    /* actW display hidden */
+    /* approveW display hidden */
+    /* completeW display hidden */
+    /* msgW display hidden */
+    
+    // Reschedule section styling for Pending
+    var reschedW_area = document.getElementById('dm-resched-w');
+    if (d.status === 'Pending') {
+        reschedW_area.style.border = '1.5px dashed #ea580c';
+        reschedW_area.style.background = '#fffaf5';
+    } else {
+        reschedW_area.style.border = '1px solid #e2e8f0';
+        reschedW_area.style.background = '#f8fafc';
+    }
+
+
+    // Client Reschedule Actions
+    var reschedW = document.getElementById('dm-client-resched-w');
+    if(!reschedW) {
+        reschedW = document.createElement('div');
+        reschedW.id = 'dm-client-resched-w';
+        reschedW.style.marginTop = '15px';
+        approveW.parentNode.insertBefore(reschedW, completeW);
+    }
+    if(d.status === 'Reschedule Requested') {
+        reschedW.style.display = 'none';
+        reschedW.innerHTML = '<div style="background:#f5f3ff; border:1.5px solid #ddd6fe; border-radius:12px; padding:15px; margin-bottom:15px;">' +
+            '<div style="font-size:11px; font-weight:800; color:#7c3aed; text-transform:uppercase; margin-bottom:5px;"><i class="fa fa-info-circle me-1"></i> Client Requested Reschedule</div>' +
+            '<div style="font-size:14px; color:#1e1b4b; font-weight:700; margin-bottom:4px;">Proposed: ' + fmtDate(d.proposed_reschedule_date) + ' at ' + fmtTime(d.proposed_reschedule_time) + '</div>' +
+            '<div style="font-size:13px; color:#4c1d95;">Reason: ' + esc(d.admin_message) + '</div>' +
+            '<div style="display:flex; gap:8px; margin-top:12px;">' +
+                '<button onclick="adminManage(\'accept_client_resched\')" class="btn-action green" style="flex:1;"><i class="fa fa-check me-1"></i> Accept Shift</button>' +
+                '<button onclick="adminManage(\'decline_client_resched\')" class="btn-action red" style="flex:1;"><i class="fa fa-times me-1"></i> Decline</button>' +
+            '</div>' +
+        '</div>';
+    } else {
+        reschedW.style.display = 'none';
+    }
+
+    var archBtn = document.getElementById('dm-archive-btn');
+    if(archBtn) archBtn.style.display = (['Completed','Cancelled','Rejected'].includes(d.status) && !parseInt(d.is_archived)) ? 'inline-flex' : 'none';
+    window._modalAptId = d.id;
+    window._modalApptType = d._type || 'Appointment';
+    
+    document.getElementById('dm-appt-type').value = window._modalApptType;
+
+    var bd = document.getElementById('detailBd');
+    bd.classList.add('open');
+    setTimeout(function(){ bd.style.opacity='1'; },10);
+
+    // Re-init flatpickr on dynamic modal
+    setTimeout(function(){
+        flatpickr('.flatpickr-dt', { enableTime:true, dateFormat:'Y-m-d H:i', minDate:'today' });
+    },100);
+}
+
+function closeModal(){
+    var bd = document.getElementById('detailBd');
+    bd.style.opacity='0';
+    setTimeout(function(){ bd.classList.remove('open'); bd.style.opacity=''; },180);
+}
+document.getElementById('detailBd').addEventListener('click',function(e){ if(e.target===this) closeModal(); });
+document.addEventListener('keydown',function(e){ if(e.key==='Escape') closeModal(); });
+
+// Also expose triggerModal for compatibility with admin.php widgets
+function triggerModal(id,title,client,pet,service,time,status,created,approved,date){
+    openModal({id:id,client_name:client,pet_name:pet,service_type:service,appointment_time:time,status:status,created_at:created,appointment_date:date,doctor_name:'',service_location:'On-Site',home_address:'',is_archived:0});
+}
+
+function archiveFromModal(){
+    Swal.fire({
+        title: 'Archive Record?',
+        text: 'This will move the record to the Archive page.',
+        icon: 'warning',
+        showCancelButton: true,
+        confirmButtonColor: '#475569',
+        cancelButtonColor: '#94a3b8',
+        confirmButtonText: 'Yes, Archive'
+    }).then((result) => {
+        if (result.isConfirmed) {
+            var f=document.createElement('form'); f.method='POST'; f.style.display='none';
+            f.innerHTML='<input name="archive_appt" value="1"><input name="apt_id" value="'+window._modalAptId+'"><input name="appt_type" value="'+(window._modalApptType || 'Appointment')+'">';
+            document.body.appendChild(f); f.submit();
+        }
+    });
+}
+
+function adminManage(cmd) {
+    var f = document.getElementById('adminActForm');
+    if (!f) return;
+    var cmdInp = f.querySelector('input[name="admin_manage_appt"]');
+    if (!cmdInp) {
+        cmdInp = document.createElement('input');
+        cmdInp.type = 'hidden';
+        cmdInp.name = 'admin_manage_appt';
+        f.appendChild(cmdInp);
+    }
+    cmdInp.value = cmd;
+    var msg = "";
+    if (cmd === 'accept_client_resched') msg = "Accept the client's reschedule request?";
+    else if (cmd === 'decline_client_resched') msg = "Decline the client's reschedule request?";
+    if (msg && !confirm(msg)) return;
+    f.submit();
+}
+
+// QUICK PET EMR PREVIEW
+const PET_EMR_DATA = <?= json_encode($pets_emr_list) ?>;
+
+function openQuickPetEmr(petName, userId, event) {
+    if (event) event.stopPropagation();
+    const key = (userId + '_' + petName.trim()).toLowerCase();
+    const pet = PET_EMR_DATA[key] || null;
+
+    document.getElementById('emrPetName').textContent = petName;
+    document.getElementById('emrOwnerName').textContent = pet ? 'Owner: ' + pet.owner_name : 'Owner Verified';
+    document.getElementById('emrSpeciesBreed').textContent = pet ? (pet.species + ' (' + (pet.breed || 'Mixed') + ')') : 'Canine / Feline';
+    document.getElementById('emrGenderWeight').textContent = pet ? ((pet.gender || 'Unknown') + ' • ' + (pet.weight ? pet.weight + ' kg' : 'Standard')) : 'Recorded';
+    document.getElementById('emrAllergies').textContent = (pet && pet.allergies && pet.allergies.trim()) ? pet.allergies : 'No known food or drug allergies reported.';
+    document.getElementById('emrInstructions').textContent = (pet && pet.special_instructions && pet.special_instructions.trim()) ? pet.special_instructions : 'Standard clinic observation and checkup routine.';
+    document.getElementById('emrLastVac').textContent = (pet && pet.last_vaccination) ? pet.last_vaccination : 'Up-to-date';
+    document.getElementById('emrNextVac').textContent = (pet && pet.next_vaccination) ? pet.next_vaccination : 'Scheduled';
+
+    const dlBtn = document.getElementById('emrDownloadPdfBtn');
+    if (dlBtn) {
+        if (pet && pet.id) {
+            dlBtn.href = 'download_emr.php?pet_id=' + pet.id;
+            dlBtn.classList.remove('disabled');
+            dlBtn.style.display = 'inline-flex';
+        } else {
+            dlBtn.href = '#';
+            dlBtn.classList.add('disabled');
+        }
+    }
+
+    const modalEl = document.getElementById('quickPetEmrModal');
+    if (modalEl) {
+        const modal = new bootstrap.Modal(modalEl);
+        modal.show();
+    }
+}
+</script>
+
+<!-- QUICK PET EMR MODAL -->
+<div class="modal fade" id="quickPetEmrModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content rounded-4 border-0 shadow-lg">
+            <div class="modal-header border-0 pb-0" style="background:#f8fafc; border-radius: 16px 16px 0 0; padding: 20px 24px;">
+                <div class="d-flex align-items-center gap-3">
+                    <div style="width: 44px; height: 44px; border-radius: 14px; background: #eff6ff; color: #2563eb; display: flex; align-items: center; justify-content: center; font-size: 20px; flex-shrink: 0;">
+                        <i class="fa fa-file-medical"></i>
+                    </div>
+                    <div>
+                        <h5 class="modal-title fw-bold text-dark m-0" id="emrPetName" style="font-size: 18px;">Pet Medical Record</h5>
+                        <span class="text-muted small" id="emrOwnerName">Owner: --</span>
+                    </div>
+                </div>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body p-4">
+                <div class="row g-3 mb-3">
+                    <div class="col-6">
+                        <div class="p-3 bg-light rounded-3 border" style="border-color:#e2e8f0 !important;">
+                            <span class="text-muted d-block small fw-bold" style="font-size: 10.5px;">SPECIES / BREED</span>
+                            <span class="fw-bold text-dark" id="emrSpeciesBreed" style="font-size: 13.5px;">--</span>
+                        </div>
+                    </div>
+                    <div class="col-6">
+                        <div class="p-3 bg-light rounded-3 border" style="border-color:#e2e8f0 !important;">
+                            <span class="text-muted d-block small fw-bold" style="font-size: 10.5px;">GENDER / WEIGHT</span>
+                            <span class="fw-bold text-dark" id="emrGenderWeight" style="font-size: 13.5px;">--</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="mb-3">
+                    <h6 class="fw-bold text-danger small text-uppercase mb-1.5" style="font-size: 11px; letter-spacing: 0.5px;"><i class="fa fa-triangle-exclamation me-1"></i> Allergies & Critical Notes</h6>
+                    <div class="p-3 rounded-3 bg-danger bg-opacity-10 border border-danger border-opacity-25 text-danger fw-bold small" id="emrAllergies" style="font-size: 12.5px;">
+                        No known allergies recorded.
+                    </div>
+                </div>
+
+                <div class="mb-3">
+                    <h6 class="fw-bold text-dark small text-uppercase mb-1.5" style="font-size: 11px; letter-spacing: 0.5px;"><i class="fa fa-notes-medical text-primary me-1"></i> Special Care & Instructions</h6>
+                    <div class="p-3 rounded-3 bg-light text-muted small border" id="emrInstructions" style="font-size: 12.5px; border-color:#e2e8f0 !important;">
+                        Standard clinical care.
+                    </div>
+                </div>
+
+                <div>
+                    <h6 class="fw-bold text-dark small text-uppercase mb-1.5" style="font-size: 11px; letter-spacing: 0.5px;"><i class="fa fa-syringe text-success me-1"></i> Immunization Record</h6>
+                    <div class="d-flex justify-content-between align-items-center p-3 rounded-3 bg-success bg-opacity-10 border border-success border-opacity-25 text-success small fw-bold" style="font-size: 12px;">
+                        <span><i class="fa fa-check-circle me-1"></i> Last Given: <span id="emrLastVac">--</span></span>
+                        <span>Next Due: <span id="emrNextVac">--</span></span>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer border-0 bg-light rounded-bottom-4 d-flex justify-content-between align-items-center">
+                <a href="#" id="emrDownloadPdfBtn" target="_blank" class="btn btn-primary rounded-pill px-4 fw-bold">
+                    <i class="fa fa-file-pdf me-1"></i> Download EMR (PDF)
+                </a>
+                <button type="button" class="btn btn-secondary rounded-pill px-4 fw-bold" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<?php
+$calendar_events_json = [];
+if (isset($rows) && is_array($rows)) {
+    foreach ($rows as $r) {
+        $s_date = $r['appointment_date'] ?? date('Y-m-d');
+        $s_time = !empty($r['appointment_time']) ? substr($r['appointment_time'], 0, 5) : '09:00';
+        $full_iso = $s_date . 'T' . $s_time;
+
+        $color = match(true) {
+            $r['status'] === 'Approved'             => '#16a34a',
+            $r['status'] === 'Pending'              => '#ea580c',
+            $r['status'] === 'Checked In'           => '#0891b2',
+            $r['status'] === 'Completed'            => '#2563eb',
+            $r['status'] === 'No Show'              => '#9f1239',
+            str_contains($r['status'], 'Cancel')    => '#be123c',
+            default => '#7c3aed'
+        };
+
+        $calendar_events_json[] = [
+            'title' => ($r['pet_name'] ?? 'Pet') . ' (' . ($r['client_name'] ?? '') . ')',
+            'start' => $full_iso,
+            'backgroundColor' => $color,
+            'borderColor' => $color,
+            'extendedProps' => ['rawData' => $r]
+        ];
+    }
+}
+?>
+<script>
+const ADMIN_CALENDAR_EVENTS = <?= json_encode($calendar_events_json) ?>;
+
+function toggleAdminCalendarView() {
+    var wrapper = document.getElementById('adminCalendarWrapper');
+    var tableWrapper = document.getElementById('adminTableWrapper');
+    var btn = document.getElementById('btnToggleCalendarView');
+
+    if (wrapper.style.display === 'none') {
+        wrapper.style.display = 'block';
+        if (tableWrapper) tableWrapper.style.display = 'none';
+        btn.innerHTML = '<i class="fa fa-table me-1"></i> Switch to Table View';
+        btn.classList.replace('btn-outline-primary', 'btn-primary');
+
+        if (!window.adminCalendarObj) {
+            var calendarEl = document.getElementById('adminFullCalendar');
+            window.adminCalendarObj = new FullCalendar.Calendar(calendarEl, {
+                initialView: 'dayGridMonth',
+                headerToolbar: {
+                    left: 'prev,next today',
+                    center: 'title',
+                    right: 'dayGridMonth,timeGridWeek,timeGridDay'
+                },
+                events: ADMIN_CALENDAR_EVENTS,
+                eventClick: function(info) {
+                    if (info.event.extendedProps && info.event.extendedProps.rawData) {
+                        openModal(info.event.extendedProps.rawData);
+                    }
+                }
+            });
+            window.adminCalendarObj.render();
+        } else {
+            window.adminCalendarObj.render();
+        }
+    } else {
+        wrapper.style.display = 'none';
+        if (tableWrapper) tableWrapper.style.display = 'block';
+        btn.innerHTML = '<i class="fa fa-calendar-alt me-1"></i> Visual Calendar View';
+        btn.classList.replace('btn-primary', 'btn-outline-primary');
+    }
+}
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script src="mousetrail.js"></script>
+</body>
+</html>

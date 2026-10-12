@@ -1,0 +1,437 @@
+<?php
+session_start();
+include("dbconnection.php");
+include_once("includes/rbac_guard.php");
+
+if(!isset($_SESSION['user_id'])) {
+    header("Location: index.php");
+    exit();
+}
+
+// RBAC: Restrict strictly to doctor role
+$user_role = rbac_get_role();
+if($user_role !== 'doctor') {
+    header("Location: " . rbac_home_url($user_role));
+    exit();
+}
+// RBAC: needs the "View pharmacy stock" task
+include_once("includes/permissions.php");
+if (!pv_can($conn, 'doctor.manage_inventory')) {
+    $_SESSION['message'] = pv_denied_message('doctor.manage_inventory');
+    $_SESSION['msg_type'] = 'danger';
+    header("Location: doctor.php");
+    exit();
+}
+
+// Fetch Inventory for Pharmacy lookup
+$inventory = $conn->query("SELECT * FROM inventory ORDER BY category ASC, item_name ASC");
+$total_items = $conn->query("SELECT COALESCE(SUM(quantity),0) as total FROM inventory")->fetch_assoc()['total'] ?? 0;
+$total_sku   = $conn->query("SELECT COUNT(*) as cnt FROM inventory")->fetch_assoc()['cnt'] ?? 0;
+$low_stock   = $conn->query("SELECT COUNT(*) as count FROM inventory WHERE quantity <= COALESCE(reorder_level, 10)")->fetch_assoc()['count'] ?? 0;
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script src="theme.js?v=<?= time() ?>"></script>
+    <link rel="stylesheet" href="theme.css?v=<?= time() ?>">
+    <title>Pharmacy Stock Lookup | Doctor Workstation</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link href="https://cdn.datatables.net/1.13.7/css/dataTables.bootstrap5.min.css" rel="stylesheet">
+
+    <style>
+        :root {
+            --primary: #2563eb;
+            --secondary: #475569;
+            --dark: #0f172a;
+            --light-bg: #f8fafc;
+            --sidebar-width: 260px;
+        }
+
+        body {
+            background: #f8fafc !important;
+            font-family: 'Inter', sans-serif;
+            color: #334155;
+            overflow-x: hidden;
+        }
+
+        .main-content {
+            margin-left: 260px !important;
+            width: calc(100% - 260px) !important;
+            max-width: calc(100% - 260px) !important;
+            padding: 24px 28px !important;
+            min-height: 100vh;
+            box-sizing: border-box !important;
+        }
+
+        @media (max-width: 1200px) {
+            .main-content { padding: 20px 20px !important; }
+        }
+
+        @media (max-width: 768px) {
+            .main-content { margin-left: 0 !important; width: 100% !important; max-width: 100% !important; padding: 16px !important; }
+            .sidebar { position: relative !important; width: 100% !important; height: auto !important; }
+        }
+
+        .custom-card {
+            background: white;
+            border: none;
+            border-radius: 16px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.04);
+            padding: 24px;
+        }
+
+        .search-input-group {
+            background: white;
+            border: 1px solid #e2e8f0;
+            border-radius: 50px;
+            padding: 2px 15px;
+            display: flex;
+            align-items: center;
+            width: 300px;
+            transition: 0.3s;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.02);
+        }
+
+        .search-input-group:focus-within {
+            border-color: #2563eb;
+            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.12);
+            width: 340px;
+        }
+
+        .search-input-group i { color: #94a3b8; font-size: 14px; flex-shrink: 0; }
+        .search-input-group:focus-within i { color: #2563eb; }
+        /* the global form styles add their own border, background and shadow to inputs; keep this one flat inside the pill */
+        .search-input-group input,
+        .search-input-group input:focus {
+            border: none !important;
+            background: transparent !important;
+            box-shadow: none !important;
+            border-radius: 0 !important;
+            padding: 9px 10px !important;
+            height: auto !important;
+            min-height: 0 !important;
+            margin: 0 !important;
+            font-size: 13.5px;
+            font-weight: 500;
+            color: #0f172a;
+            width: 100%;
+            outline: none !important;
+        }
+        .search-input-group input::placeholder { color: #94a3b8; }
+        @media (max-width: 768px) { .search-input-group, .search-input-group:focus-within { width: 100%; } }
+
+        /* ====== WHITE SIDEBAR THEME ====== */
+        .sidebar {
+            background: #ffffff !important;
+            width: var(--sidebar-width, 260px) !important;
+            height: 100vh !important;
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            padding: 28px 20px 24px !important;
+            z-index: 1000 !important;
+            display: flex !important;
+            flex-direction: column !important;
+            border-right: 1px solid #eef2f6 !important;
+            box-shadow: none !important;
+            overflow-y: auto !important;
+        }
+
+        .sidebar-brand {
+            display: flex !important;
+            align-items: center !important;
+            gap: 12px !important;
+            margin-bottom: 24px !important;
+            padding: 0 4px !important;
+            text-decoration: none !important;
+        }
+
+        .sidebar-brand-icon {
+            width: 44px !important;
+            height: 44px !important;
+            min-width: 44px !important;
+            border-radius: 13px !important;
+            background: #2563eb !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            color: #ffffff !important;
+            font-size: 20px !important;
+            flex-shrink: 0 !important;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+        }
+
+        .sidebar-brand span {
+            font-weight: 800 !important;
+            color: #182032 !important;
+            font-size: 22px !important;
+            letter-spacing: -0.4px !important;
+        }
+
+        .sidebar-user {
+            margin-bottom: 24px !important;
+            padding: 15px 18px !important;
+            border-radius: 14px !important;
+            background: #f8fafc !important;
+            border: 1px solid #eef2f6 !important;
+        }
+
+        .sidebar-user .welcome {
+            font-size: 13px !important;
+            color: #64748b !important;
+            font-weight: 500 !important;
+            line-height: 1.3 !important;
+        }
+
+        .sidebar-user .uname {
+            font-weight: 700 !important;
+            color: #0f172a !important;
+            font-size: 15.5px !important;
+            margin-top: 3px !important;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+        }
+
+        .sidebar a {
+            display: flex !important;
+            align-items: center !important;
+            gap: 14px !important;
+            padding: 12px 16px !important;
+            border-radius: 12px !important;
+            color: #334155 !important;
+            text-decoration: none !important;
+            margin-bottom: 4px !important;
+            font-weight: 600 !important;
+            font-size: 14.5px !important;
+            transition: all 0.2s ease !important;
+            letter-spacing: -0.1px !important;
+        }
+
+        .sidebar a i {
+            width: 22px !important;
+            text-align: center !important;
+            font-size: 16px !important;
+            color: #64748b !important;
+            transition: color 0.2s !important;
+            flex-shrink: 0 !important;
+        }
+
+        .sidebar a:hover {
+            background: #f8fafc !important;
+            color: #0f172a !important;
+        }
+
+        .sidebar a:hover i {
+            color: #2563eb !important;
+        }
+
+        .sidebar a.active {
+            background: #2563eb !important;
+            color: #ffffff !important;
+            font-weight: 700 !important;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+        }
+
+        .sidebar a.active i {
+            color: #ffffff !important;
+        }
+
+        .sidebar .sidebar-logout {
+            margin-top: auto !important;
+            padding-top: 20px !important;
+            border-top: 1px solid #f1f5f9 !important;
+        }
+
+        .sidebar .sidebar-logout a {
+            color: #dc2626 !important;
+            font-weight: 600 !important;
+            margin-bottom: 0 !important;
+        }
+
+        .sidebar .sidebar-logout a i {
+            color: #dc2626 !important;
+        }
+
+        .sidebar .sidebar-logout a:hover {
+            background: #fef2f2 !important;
+            color: #b91c1c !important;
+        }
+
+        .sidebar::-webkit-scrollbar { width: 5px; }
+        .sidebar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.06); border-radius: 10px; }
+        .sidebar::-webkit-scrollbar-track { background: transparent; }
+    </style>
+    <link rel="stylesheet" href="assets/pragmavet.css">
+    <link href="assets/global-style.css" rel="stylesheet">
+</head>
+<body>
+
+<div class="sidebar">
+    <div class="sidebar-brand">
+        <div class="sidebar-brand-icon"><i class="fa fa-user-md"></i></div>
+        <span>PragmaVet</span>
+    </div>
+    <div class="sidebar-user">
+        <div class="welcome">Welcome Doctor,</div>
+        <div class="uname"><?php echo htmlspecialchars($_SESSION['user'] ?? $_SESSION['fullname'] ?? 'Veterinarian'); ?></div>
+    </div>
+    <a href="doctor.php" class=""><i class="fa fa-calendar-check"></i> <span>Schedule & Availability</span></a>
+    <a href="doctor_consultations.php" class=""><i class="fa fa-stethoscope"></i> <span>Active Consultations</span></a>
+    <a href="doctor_patients.php" class=""><i class="fa fa-paw"></i> <span>Patient EMR Lookup</span></a>
+    <a href="doctor_inventory.php" class="active"><i class="fa fa-boxes"></i> <span>Pharmacy Stock</span></a>
+    <?php $pv_cert_pending = (int)($conn->query("SELECT COUNT(*) c FROM certificate_requests WHERE status = 'Pending'")->fetch_assoc()['c'] ?? 0); ?>
+    <a href="admin_certificates.php" class=""><i class="fa fa-file-contract"></i> <span>Cert Requests</span><?php if ($pv_cert_pending): ?><span style="margin-left:auto;background:#ef4444;color:#fff;font-size:11px;font-weight:800;min-width:22px;height:22px;border-radius:999px;display:inline-flex;align-items:center;justify-content:center;padding:0 7px;"><?= $pv_cert_pending ?></span><?php endif; ?></a>
+    <div class="sidebar-logout">
+        <a href="logout.php"><i class="fa fa-sign-out-alt"></i> <span>Logout</span></a>
+    </div>
+</div>
+
+<?php include("includes/staff_bell.php"); ?>
+<div class="main-content">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h2 class="fw-bold m-0 text-dark">Pharmacy Stock Lookup</h2>
+            <p class="text-muted mb-0">Check real-time clinical medicine stock, batch numbers, and unit dosages before prescribing.</p>
+        </div>
+        <div class="search-input-group">
+            <i class="fa fa-search"></i>
+            <input type="text" id="customSearch" placeholder="Search Medicine or Vaccine...">
+        </div>
+    </div>
+
+    <!-- Quick Stats -->
+    <div class="row g-3 mb-4">
+        <div class="col-md-4">
+            <div class="custom-card p-3 d-flex align-items-center gap-3 shadow-sm border-0">
+                <div class="rounded-circle bg-primary bg-opacity-10 text-primary p-3 d-flex align-items-center justify-content-center" style="width: 48px; height: 48px;">
+                    <i class="fa fa-pills fs-5"></i>
+                </div>
+                <div>
+                    <div class="text-muted small fw-semibold">Total Pharmacy Stock</div>
+                    <h4 class="fw-bold m-0 text-dark"><?= number_format($total_items) ?> <span class="fs-6 text-muted fw-normal">(<?= $total_sku ?> SKUs)</span></h4>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="custom-card p-3 d-flex align-items-center gap-3 shadow-sm border-0">
+                <div class="rounded-circle bg-warning bg-opacity-10 text-warning p-3 d-flex align-items-center justify-content-center" style="width: 48px; height: 48px;">
+                    <i class="fa fa-exclamation-triangle fs-5"></i>
+                </div>
+                <div>
+                    <div class="text-muted small fw-semibold">Low Stock Items</div>
+                    <h4 class="fw-bold m-0 text-dark"><?= number_format($low_stock) ?> <span class="fs-6 text-muted fw-normal">items</span></h4>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="custom-card p-3 d-flex align-items-center gap-3 shadow-sm border-0">
+                <div class="rounded-circle bg-success bg-opacity-10 text-success p-3 d-flex align-items-center justify-content-center" style="width: 48px; height: 48px;">
+                    <i class="fa fa-check-circle fs-5"></i>
+                </div>
+                <div>
+                    <div class="text-muted small fw-semibold">Available for Prescribing</div>
+                    <h4 class="fw-bold m-0 text-dark"><?= number_format(max(0, $total_sku - $low_stock)) ?> <span class="fs-6 text-muted fw-normal">SKUs ready</span></h4>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="custom-card">
+        <?php if($inventory && $inventory->num_rows > 0): ?>
+        <div class="table-responsive">
+            <table id="inventoryTable" class="table table-borderless align-middle mb-0" style="font-size: 13.5px;">
+                <thead class="table-light">
+                    <tr>
+                        <th>Item & Category</th>
+                        <th>Batch / Lot No.</th>
+                        <th>Available Stock</th>
+                        <th>Unit of Measure</th>
+                        <th>Selling Price (&#8369;)</th>
+                        <th>Expiry Safeguard</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php while($row = $inventory->fetch_assoc()): ?>
+                    <?php 
+                        $qty = (int)$row['quantity'];
+                        $reorder = (int)($row['reorder_level'] ?? 10);
+                        $batch = htmlspecialchars($row['batch_number'] ?? '');
+                        $lot = htmlspecialchars($row['lot_number'] ?? '');
+                        $uom = htmlspecialchars($row['unit_of_measure'] ?? 'piece');
+                        $expiry_raw = $row['expiry_date'];
+                        $is_no_expiry = empty($expiry_raw) || $expiry_raw === '1970-01-01' || $expiry_raw === '0000-00-00';
+                        $is_expired = !$is_no_expiry && strtotime($expiry_raw) < time();
+
+                        if ($qty == 0) {
+                            $stock_status = "<span class='badge bg-dark text-white rounded-pill px-2.5 py-1 fw-bold' style='font-size: 11px;'>Out of Stock</span>";
+                        } elseif ($qty <= $reorder) {
+                            $stock_status = "<span class='badge bg-danger bg-opacity-10 text-danger border border-danger border-opacity-25 rounded-pill px-2.5 py-1 fw-bold' style='font-size: 11px;'>$qty (Low)</span>";
+                        } else {
+                            $stock_status = "<span class='badge bg-success bg-opacity-10 text-success border border-success border-opacity-25 rounded-pill px-2.5 py-1 fw-bold' style='font-size: 11px;'>$qty Available</span>";
+                        }
+                    ?>
+                    <tr>
+                        <td>
+                            <div class="fw-bold text-dark"><?= htmlspecialchars($row['item_name']) ?></div>
+                            <span class="badge bg-primary bg-opacity-10 text-primary border border-primary border-opacity-25 rounded-pill px-2 py-0.5" style="font-size: 10.5px;">
+                                <?= htmlspecialchars($row['category']) ?>
+                            </span>
+                        </td>
+                        <td>
+                            <?php if(!empty($batch) || !empty($lot)): ?>
+                                <div class="small font-monospace">
+                                    <?php if(!empty($batch)): ?><span class="badge bg-light text-dark border">B: <?= $batch ?></span><?php endif; ?>
+                                    <?php if(!empty($lot)): ?><span class="badge bg-light text-dark border">L: <?= $lot ?></span><?php endif; ?>
+                                </div>
+                            <?php else: ?>
+                                <span class="text-muted small font-monospace">—</span>
+                            <?php endif; ?>
+                        </td>
+                        <td><?= $stock_status ?></td>
+                        <td><span class="badge bg-light text-secondary border font-monospace"><?= $uom ?></span></td>
+                        <td class="fw-bold text-dark">&#8369;<?= number_format($row['price_per_unit'], 2) ?></td>
+                        <td>
+                            <?php if($is_no_expiry): ?>
+                                <span class="badge bg-secondary bg-opacity-10 text-secondary border border-secondary border-opacity-25 rounded-pill px-2 py-0.5" style="font-size: 10.5px;">Not Set</span>
+                            <?php elseif($is_expired): ?>
+                                <span class="badge bg-danger bg-opacity-10 text-danger border border-danger border-opacity-25 rounded-pill px-2 py-0.5" style="font-size: 10.5px;">Expired (<?= date("M d, Y", strtotime($expiry_raw)) ?>)</span>
+                            <?php else: ?>
+                                <span class="text-muted small fw-semibold"><?= date("M d, Y", strtotime($expiry_raw)) ?></span>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                    <?php endwhile; ?>
+                </tbody>
+            </table>
+        </div>
+        <?php else: ?>
+            <div class="text-center py-5">
+                <i class="fa fa-boxes fa-4x text-muted opacity-25 mb-3"></i>
+                <h5 class="text-muted">Pharmacy inventory is empty.</h5>
+            </div>
+        <?php endif; ?>
+    </div>
+</div>
+
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.7/js/jquery.dataTables.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.7/js/dataTables.bootstrap5.min.js"></script>
+<script>
+$(document).ready(function() {
+    var table = $('#inventoryTable').DataTable({
+        "dom": "rtip",
+        "language": { "search": "", "searchPlaceholder": "Search pharmacy..." }
+    });
+    $('#customSearch').on('keyup', function () {
+        table.search(this.value).draw();
+    });
+});
+</script>
+</body>
+</html>

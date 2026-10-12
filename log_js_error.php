@@ -1,0 +1,1 @@
+<?php file_put_contents('js_errors.txt', $_GET['err'] . "\n", FILE_APPEND); ?>

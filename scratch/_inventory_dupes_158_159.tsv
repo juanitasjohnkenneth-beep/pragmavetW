@@ -1,0 +1,3 @@
+id	item_name	category	quantity	price_per_unit	expiry_date	batch_number	lot_number	unit_of_measure	reorder_level	supplier	cost_price	created_at
+158	50?60 mL syringes	Consumables	100	45.00	2031-12-24	NULL	NULL	piece	10	NULL	29.00	2026-09-24 23:25:47
+159	Needles 18G?27G	Consumables	100	6.00	2032-01-25	NULL	NULL	piece	10	NULL	4.00	2026-09-24 23:25:47

@@ -1,0 +1,637 @@
+<?php
+session_start();
+include("dbconnection.php");
+include_once("includes/rbac_guard.php");
+
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\Exception;
+require 'PHPMailer/src/Exception.php';
+require 'PHPMailer/src/PHPMailer.php';
+require 'PHPMailer/src/SMTP.php';
+
+// RBAC Access Guard
+$user_role = rbac_get_role();
+if (!isset($_SESSION['user_id']) || !in_array($user_role, ['admin', 'clinic_owner', 'owner'])) {
+    header("Location: " . rbac_home_url($user_role));
+    exit();
+}
+
+$users_q = $conn->query("SELECT id, fullname, email FROM users WHERE role='user' ORDER BY fullname ASC");
+
+// Handle Form Submission
+if (isset($_POST['send_email'])) {
+    $target = $_POST['target_user'];
+    $subject = trim($_POST['subject']);
+    $raw_msg = $_POST['message']; // allow html but secure it
+    $formatted_msg = nl2br(htmlspecialchars($raw_msg));
+
+    $mail = new PHPMailer(true);
+    try {
+        $mail->isSMTP();
+        $mail->Host = 'smtp.gmail.com';
+        $mail->SMTPAuth = true;
+        $mail->Username = 'timferrer1@gmail.com';
+        $mail->Password = 'azrpmoxxzvhucetu';
+        $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
+        $mail->Port = 587;
+
+        $mail->setFrom('timferrer1@gmail.com', 'PragmaVet Hub');
+        $mail->isHTML(true);
+        $mail->Subject = $subject;
+
+        $mail->Body = '
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            </head>
+            <body style="margin: 0; padding: 0; background-color: #E6EEF8; -webkit-font-smoothing: antialiased;">
+                <center class="wrapper" style="width: 100%; table-layout: fixed; background-color: #E6EEF8; padding-bottom: 40px;">
+                    <div style="padding: 40px 0;">
+                        <table class="main" width="100%" style="background-color: #ffffff; margin: 0 auto; width: 100%; max-width: 600px; border-spacing: 0; font-family: Inter, Helvetica, Arial, sans-serif; color: #334155; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.03); border: 1px solid #E2E8F0;">
+                            
+                            <!-- HEADER -->
+                            <tr>
+                                <td class="header-td" style="background-color: #2563eb; padding: 30px 40px; text-align: center;">
+                                    <h1 style="color: #ffffff; margin: 0; font-size: 20px; font-weight: 700; letter-spacing: -0.5px;">PragmaVet Animal Clinic &ndash; Imus Branch</h1>
+                                </td>
+                            </tr>
+
+                            <!-- BODY -->
+                            <tr>
+                                <td class="body-td" style="padding: 40px;">
+                                    
+                                    <p style="font-size: 16px; color: #1E293B; font-weight: 600; margin: 0 0 24px 0;">Dear Valued Client,</p>
+                                    
+                                    <div style="font-size: 15px; color: #334155; line-height: 1.6; margin-bottom: 32px;">
+                                        ' . $formatted_msg . '
+                                    </div>
+                                    
+
+                                    <!-- CONTACT SECTION -->
+                                    <div style="border-top: 1px solid #E2E8F0; padding-top: 24px;">
+                                        <p style="margin: 0 0 12px 0; font-size: 14px; color: #475569;">📍 <strong style="color: #0F172A; margin-left: 6px;">Address:</strong> Imus, Cavite, Philippines</p>
+                                        <p style="margin: 0 0 12px 0; font-size: 14px; color: #475569;">📞 <strong style="color: #0F172A; margin-left: 6px;">Landline:</strong> <a href="tel:+63461234567" style="color: #3b82f6; text-decoration: none; font-weight: 600; margin-left: 4px;">(046) 123-4567</a></p>
+                                        <p style="margin: 0; font-size: 14px; color: #475569;">📱 <strong style="color: #0F172A; margin-left: 6px;">Mobile:</strong> <a href="tel:+639171234567" style="color: #3b82f6; text-decoration: none; font-weight: 600; margin-left: 4px;">0917-123-4567</a></p>
+                                    </div>
+
+                                </td>
+                            </tr>
+                        </table>
+
+                        <!-- FOOTER -->
+                        <table width="100%" style="max-width: 600px; margin: 0 auto;">
+                            <tr>
+                                <td style="text-align: center; padding: 30px 20px;">
+                                    <h3 style="font-size: 12px; font-weight: 700; color: #64748B; text-transform: uppercase; letter-spacing: 0.8px; margin: 0 0 8px 0;">About PragmaVet</h3>
+                                    <p style="color: #64748B; font-size: 13px; font-family: Inter, Helvetica, sans-serif; line-height: 1.5; margin: 0 0 24px 0;">We provide compassionate, state-of-the-art veterinary care. Your pet\'s health and happiness are our top priority.</p>
+                                    <p style="color: #64748B; font-size: 13px; font-family: Inter, Helvetica, sans-serif; margin: 0 0 8px 0;">Thank you for trusting PragmaVet with your pet\'s healthcare needs.</p>
+                                    <p style="color: #94A3B8; font-size: 11px; font-family: Inter, Helvetica, sans-serif; margin: 0;">This is an official automated communication. Please do not reply directly to this address.</p>
+                                </td>
+                            </tr>
+                        </table>
+                    </div>
+                </center>
+                <script src="mousetrail.js"></script>
+            </body>
+            </html>
+        ';
+
+        if ($target === 'ALL') {
+            // Mass broadcast via BCC
+            $all_u = $conn->query("SELECT id, email FROM users WHERE role='user'");
+            $stmt_notif = $conn->prepare("INSERT INTO notifications(user_id, message) VALUES(?, ?)");
+            $notif_msg = "You received a secure message from PragmaVet Clinic: " . htmlspecialchars($subject);
+            while ($u = $all_u->fetch_assoc()) {
+                $mail->addBCC($u['email']);
+                // Also notify dashboard
+                $stmt_notif->bind_param("is", $u['id'], $notif_msg);
+                $stmt_notif->execute();
+            }
+            $_SESSION['message'] = "Mass Broadcast successfully dispatched to all clients.";
+        } else {
+            // Unicast
+            $u_q = $conn->query("SELECT id, email, fullname FROM users WHERE id=" . intval($target));
+            if ($u_q && $u_q->num_rows > 0) {
+                $u = $u_q->fetch_assoc();
+                $mail->addAddress($u['email'], $u['fullname']);
+
+                // Also notify dashboard
+                $uid = $u['id'];
+                $notif_msg = "You received a secure message from PragmaVet Clinic: " . htmlspecialchars($subject);
+                $ins_n = $conn->prepare("INSERT INTO notifications(user_id, message) VALUES(?, ?)");
+                $ins_n->bind_param("is", $uid, $notif_msg);
+                $ins_n->execute();
+
+                $_SESSION['message'] = "Email successfully dispatched to " . htmlspecialchars($u['fullname']) . ".";
+            } else {
+                throw new Exception("Target validation error.");
+            }
+        }
+
+        $mail->send();
+        $_SESSION['msg_type'] = "success";
+
+    } catch (Exception $e) {
+        $_SESSION['message'] = "Mailer Error: " . $mail->ErrorInfo;
+        $_SESSION['msg_type'] = "danger";
+    }
+
+    header("Location: admin_emails.php");
+    exit();
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <script src="theme.js?v=<?= time() ?>"></script>
+    <link rel="stylesheet" href="theme.css?v=<?= time() ?>">
+
+    <title>Email Dispatch | Admin</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
+        rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet" />
+    <style>
+        :root {
+            --primary: #2563eb;
+            --secondary: #3b82f6;
+            --dark: #1e40af;
+            --light-bg: #E6EEF8;
+            --sidebar-width: 260px;
+        }
+
+        body {
+            background: var(--light-bg);
+            font-family: 'Inter', sans-serif;
+            color: #333;
+            overflow-x: hidden;
+        }
+
+        /* SIDEBAR MATCHING REST OF SYSTEM */
+        .sidebar {
+            background: #0f172a;
+            width: var(--sidebar-width);
+            height: 100vh;
+            position: fixed;
+            top: 0;
+            left: 0;
+            padding: 24px 16px;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 5px 0 20px rgba(0, 0, 0, .2);
+            overflow-y: auto;
+        }
+
+        .sidebar h4 {
+            color: #ffffff;
+            font-weight: 800;
+            font-size: 22px;
+            margin-bottom: 30px;
+            letter-spacing: 0.5px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .sidebar a {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 16px;
+            border-radius: 8px;
+            color: #94a3b8;
+            text-decoration: none;
+            margin-bottom: 4px;
+            font-weight: 600;
+            font-size: 15px;
+            transition: .2s;
+        }
+
+        .sidebar a i {
+            width: 30px;
+            font-size: 18px;
+        }
+
+        .sidebar a:hover,
+        .sidebar a.active {
+            background: #2563eb;
+            color: #ffffff;
+        }
+
+        /* MAIN CONTENT */
+        .main-content {
+            margin-left: 260px !important;
+            width: calc(100% - 260px) !important;
+            max-width: calc(100% - 260px) !important;
+            padding: 24px 28px !important;
+            min-height: 100vh;
+            box-sizing: border-box !important;
+        }
+
+        @media (max-width: 1200px) {
+            .main-content {
+                padding: 20px 20px !important;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .main-content {
+                margin-left: 0 !important;
+                width: 100% !important;
+                max-width: 100% !important;
+                padding: 16px !important;
+            }
+            .sidebar {
+                position: relative !important;
+                width: 100% !important;
+                height: auto !important;
+            }
+        }
+
+        .custom-card {
+            background: white;
+            border: none;
+            border-radius: 20px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.03);
+            padding: 40px;
+        }
+
+        /* FORM ELEMENTS */
+        .form-label {
+            font-weight: 700;
+            color: var(--primary);
+            font-size: 12px;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+
+        .form-control,
+        .form-select {
+            border: 2px solid #edf2f6;
+            border-radius: 12px;
+            padding: 12px 15px;
+            transition: 0.3s;
+            font-size: 15px;
+        }
+
+        .form-control:focus,
+        .form-select:focus {
+            border-color: var(--secondary);
+            box-shadow: 0 0 0 0.2rem rgba(74, 127, 196, 0.1);
+        }
+
+        .btn-primary-custom {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            border: none;
+            padding: 15px 30px;
+            border-radius: 50px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            color: white;
+            transition: 0.3s;
+            box-shadow: 0 10px 20px rgba(37, 99, 235, 0.15);
+        }
+
+        .btn-primary-custom:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 15px 25px rgba(37, 99, 235, 0.2);
+        }
+
+        /* SELECT2 UI OVERRIDES */
+        .select2-container--default .select2-selection--single {
+            border: 2px solid #edf2f6;
+            border-radius: 12px;
+            height: auto;
+            padding: 10px 15px;
+            font-size: 15px;
+            transition: 0.3s;
+        }
+
+        .select2-container--default .select2-selection--single .select2-selection__arrow {
+            height: 100%;
+            top: 0;
+            right: 15px;
+        }
+
+        .select2-container--default.select2-container--focus .select2-selection--single {
+            border-color: var(--secondary);
+            border: 2px solid var(--secondary);
+        }
+
+        .alert-container {
+            position: fixed;
+            top: 30px;
+            right: 40px;
+            z-index: 9999;
+            animation: slideDown 0.5s ease-out forwards;
+        }
+
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .sidebar::-webkit-scrollbar {
+            width: 5px;
+        }
+
+        .sidebar::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+        }
+
+        .sidebar::-webkit-scrollbar-track {
+            background: transparent;
+        }
+    
+        /* ====== WHITE SIDEBAR THEME ====== */
+        .sidebar {
+            background: #ffffff !important;
+            width: var(--sidebar-width, 260px) !important;
+            height: 100vh !important;
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            padding: 28px 20px 24px !important;
+            z-index: 1000 !important;
+            display: flex !important;
+            flex-direction: column !important;
+            border-right: 1px solid #eef2f6 !important;
+            box-shadow: none !important;
+            overflow-y: auto !important;
+        }
+
+        .sidebar-brand {
+            display: flex !important;
+            align-items: center !important;
+            gap: 12px !important;
+            margin-bottom: 24px !important;
+            padding: 0 4px !important;
+            text-decoration: none !important;
+        }
+
+        .sidebar-brand-icon {
+            width: 44px !important;
+            height: 44px !important;
+            min-width: 44px !important;
+            border-radius: 13px !important;
+            background: #2563eb !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            color: #ffffff !important;
+            font-size: 20px !important;
+            flex-shrink: 0 !important;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+        }
+
+        .sidebar-brand span {
+            font-weight: 800 !important;
+            color: #182032 !important;
+            font-size: 22px !important;
+            letter-spacing: -0.4px !important;
+        }
+
+        .sidebar-user {
+            margin-bottom: 24px !important;
+            padding: 15px 18px !important;
+            border-radius: 14px !important;
+            background: #f8fafc !important;
+            border: 1px solid #eef2f6 !important;
+        }
+
+        .sidebar-user .welcome {
+            font-size: 13px !important;
+            color: #64748b !important;
+            font-weight: 500 !important;
+            line-height: 1.3 !important;
+        }
+
+        .sidebar-user .uname {
+            font-weight: 700 !important;
+            color: #0f172a !important;
+            font-size: 15.5px !important;
+            margin-top: 3px !important;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+        }
+
+        .sidebar a {
+            display: flex !important;
+            align-items: center !important;
+            gap: 14px !important;
+            padding: 12px 16px !important;
+            border-radius: 12px !important;
+            color: #334155 !important;
+            text-decoration: none !important;
+            margin-bottom: 4px !important;
+            font-weight: 600 !important;
+            font-size: 14.5px !important;
+            transition: all 0.2s ease !important;
+            letter-spacing: -0.1px !important;
+        }
+
+        .sidebar a i {
+            width: 22px !important;
+            text-align: center !important;
+            font-size: 16px !important;
+            color: #64748b !important;
+            transition: color 0.2s !important;
+            flex-shrink: 0 !important;
+        }
+
+        .sidebar a:hover {
+            background: #f8fafc !important;
+            color: #0f172a !important;
+        }
+
+        .sidebar a:hover i {
+            color: #2563eb !important;
+        }
+
+        .sidebar a.active {
+            background: #2563eb !important;
+            color: #ffffff !important;
+            font-weight: 700 !important;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+        }
+
+        .sidebar a.active i {
+            color: #ffffff !important;
+        }
+
+        .sidebar .sidebar-logout {
+            margin-top: auto !important;
+            padding-top: 20px !important;
+            border-top: 1px solid #f1f5f9 !important;
+        }
+
+        .sidebar .sidebar-logout a {
+            color: #dc2626 !important;
+            font-weight: 600 !important;
+            margin-bottom: 0 !important;
+        }
+
+        .sidebar .sidebar-logout a i {
+            color: #dc2626 !important;
+        }
+
+        .sidebar .sidebar-logout a:hover {
+            background: #fef2f2 !important;
+            color: #b91c1c !important;
+        }
+
+        .sidebar::-webkit-scrollbar { width: 5px; }
+        .sidebar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.06); border-radius: 10px; }
+        .sidebar::-webkit-scrollbar-track { background: transparent; }
+</style>
+    <link rel="stylesheet" href="assets/pragmavet.css">
+    <link href="assets/global-style.css" rel="stylesheet">
+</head>
+
+<body>
+
+    <?php if (isset($_SESSION['message'])): ?>
+        <div class="alert-container">
+            <div class="alert alert-<?php echo $_SESSION['msg_type']; ?> shadow-lg text-dark"
+                style="border-radius: 12px; border: none; font-weight: 500;">
+                <?php echo $_SESSION['message'];
+                unset($_SESSION['message'], $_SESSION['msg_type']); ?>
+            </div>
+        </div>
+    <?php endif; ?>
+
+    <!-- Admin Sidebar -->
+    <?php include("includes/admin_sidebar.php"); ?>
+
+    <div class="main-content">
+        <div class="mb-5">
+            <h2 class="fw-bold text-dark m-0" style="letter-spacing: -1px; font-size: 2.5rem;">Broadcast Engine</h2>
+            <p class="text-muted mt-2" style="font-size: 1.1rem;">Draft and dispatch custom HTML-structured emails
+                securely to clinic clients.</p>
+        </div>
+
+        <div class="row">
+            <div class="col-xl-8 col-lg-10">
+                <div class="custom-card">
+                    <form method="POST">
+
+                        <div class="row g-4 mb-4">
+                            <div class="col-md-6">
+                                <label class="form-label"><i class="fa fa-bullseye me-1 text-secondary"></i> TARGET
+                                    AUDIENCE</label>
+                                <select name="target_user" class="form-select" required>
+                                    <option value="" disabled selected>Select Recipient Target...</option>
+                                    <option value="ALL" class="text-primary fw-bold">--- BROADCAST TO ALL CLIENTS ---
+                                    </option>
+                                    <?php
+                                    if ($users_q && $users_q->num_rows > 0) {
+                                        while ($u = $users_q->fetch_assoc()) {
+                                            echo "<option value='" . $u['id'] . "'>" . htmlspecialchars($u['fullname']) . " (" . htmlspecialchars($u['email']) . ")</option>";
+                                        }
+                                    }
+                                    ?>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label"><i class="fa fa-tag me-1 text-secondary"></i> SUBJECT
+                                    LINE</label>
+                                <input type="text" name="subject" class="form-control"
+                                    placeholder="e.g. Clinic Holiday Hours Update" required>
+                            </div>
+                        </div>
+
+                        <div class="mb-5">
+                            <label class="form-label"><i class="fa fa-align-left me-1 text-secondary"></i> MESSAGE
+                                ENVELOPE (HTML/PLAIN TEXT)</label>
+                            <textarea name="message" class="form-control" rows="10"
+                                placeholder="Draft your secure communication here... Multiple lines are highly supported."
+                                required></textarea>
+                            <div class="form-text mt-2"><i class="fa fa-info-circle me-1"></i> Linebreaks will render
+                                correctly in the recipient's inbox automatically.</div>
+                        </div>
+
+                        <div class="text-end border-top pt-4">
+                            <button type="submit" name="send_email" class="btn btn-primary-custom px-5">
+                                <i class="fa fa-paper-plane me-2"></i> Ignite Sub-Routine
+                            </button>
+                        </div>
+
+                    </form>
+                </div>
+            </div>
+
+            <div class="col-xl-4 col-lg-12 mt-4 mt-xl-0">
+                <div class="custom-card bg-primary text-white border-0"
+                    style="background: linear-gradient(135deg, var(--primary), var(--secondary)) !important;">
+                    <h5 class="fw-bold mb-3"><i class="fa fa-shield-alt me-2"></i> Mail Engine Status</h5>
+                    <p class="small opacity-75 mb-4">The PragmaVet Automated Delivery System is currently online and
+                        securely connected to SMTP.</p>
+                    <div class="d-flex align-items-center mb-3">
+                        <div style="width: 40px; height: 40px; border-radius: 50%; background: rgba(255,255,255,0.2);"
+                            class="d-flex justify-content-center align-items-center me-3">
+                            <i class="fa fa-check"></i>
+                        </div>
+                        <div>
+                            <div class="fw-bold">Connection Secured</div>
+                            <div class="small opacity-75">TLS Encrypted Link</div>
+                        </div>
+                    </div>
+                    <div class="d-flex align-items-center">
+                        <div style="width: 40px; height: 40px; border-radius: 50%; background: rgba(255,255,255,0.2);"
+                            class="d-flex justify-content-center align-items-center me-3">
+                            <i class="fa fa-server"></i>
+                        </div>
+                        <div>
+                            <div class="fw-bold">SMTP Relay</div>
+                            <div class="small opacity-75">smtp.gmail.com:587</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
+    <script>
+        $(document).ready(function () {
+            $('select[name="target_user"]').select2({
+                placeholder: "Search for a specific client...",
+                width: '100%'
+            });
+        });
+    </script>
+
+    <!-- Auto Dismiss Alerts -->
+    <script>
+        setTimeout(function () {
+            let alerts = document.querySelectorAll('.alert-container');
+            alerts.forEach(a => {
+                a.style.transition = 'opacity 0.5s ease-out, transform 0.5s ease-out';
+                a.style.opacity = '0';
+                a.style.transform = 'translateY(-20px)';
+                setTimeout(() => a.remove(), 500);
+            });
+        }, 2000);
+    </script>
+                <script src='mousetrail.js'></script>
+</body>
+
+</html>

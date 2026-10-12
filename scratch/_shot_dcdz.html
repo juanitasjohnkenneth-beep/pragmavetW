@@ -1,0 +1,801 @@
+
+Notice: session_start(): Ignoring session_start() because a session is already active in C:\xampp\htdocs\pragmavet\doctor_consultations.php on line 2
+<!DOCTYPE html>
+<html lang="en">
+<head><base href="http://localhost/pragmavet/"><style>#pragmaReminderModal{display:none!important}</style>
+<title>Consultations | VetAdmin</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+<style>
+:root {
+    --primary: #2563eb;
+    --secondary: #475569;
+    --dark: #0f172a;
+    --light-bg: #f8fafc;
+    --sidebar-width:260px;
+}
+body { background: #f8fafc !important; font-family: 'Inter', sans-serif; color: #334155; }
+
+.main-content {
+    margin-left: 260px !important;
+    width: calc(100% - 260px) !important;
+    max-width: calc(100% - 260px) !important;
+    padding: 24px 28px !important;
+    min-height: 100vh;
+    box-sizing: border-box !important;
+}
+
+@media (max-width: 1200px) {
+    .main-content { padding: 20px 20px !important; }
+}
+
+@media (max-width: 768px) {
+    .main-content { margin-left: 0 !important; width: 100% !important; max-width: 100% !important; padding: 16px !important; }
+    .sidebar { position: relative !important; width: 100% !important; height: auto !important; }
+}
+
+/* ── Consultation window ── */
+.modal .modal-content { border-radius:20px !important; overflow:hidden; }
+.modal .modal-body { background:#fff; }
+.modal .form-label.small { color:#334155; font-size:11.5px; letter-spacing:.04em; }
+.dc-opt { font-weight:500; color:#94a3b8; text-transform:none; letter-spacing:0; }
+.modal .form-control, .modal .form-select { border:1.5px solid #e2e8f0 !important; border-radius:12px !important; box-shadow:none !important; font-size:14px; }
+.modal .form-control:focus { border-color:#2563eb !important; box-shadow:0 0 0 4px rgba(37,99,235,.12) !important; }
+.modal .form-control[readonly] { background:#f8fafc !important; }
+.dc-summary { background:linear-gradient(135deg,#eff6ff,#f8fbff); border:1px solid #dbeafe; border-radius:14px; }
+.dc-charges { background:#f8fafc; border:1px solid #e2e8f0; border-radius:14px; }
+.dc-add { background:#fff !important; background-image:none !important; color:#2563eb !important; border:1px solid #bfdbfe !important; border-radius:99px !important; padding:4px 12px !important; font-weight:700 !important; font-size:12.5px !important; box-shadow:none !important; }
+.dc-add:hover { background:#eff6ff !important; }
+/* Dropzone */
+.dc-drop.dropzone { min-height:0; border:2px dashed #93c5fd; border-radius:14px; background:#f8fbff; padding:18px; transition:border-color .15s, background .15s; cursor:pointer; }
+.dc-drop.dropzone:hover, .dc-drop.dropzone.dz-drag-hover { border-color:#2563eb; background:#eff6ff; }
+.dc-drop .dz-message { margin:4px 0; display:flex; flex-direction:column; align-items:center; gap:4px; color:#475569; font-size:13px; }
+.dc-drop .dz-message .dz-button { display:flex; flex-direction:column; align-items:center; gap:4px; margin:0 auto; padding:0; background:none !important; background-image:none !important; border:0 !important; box-shadow:none !important; color:#475569 !important; font:inherit; }
+.dc-drop .dz-message i { font-size:28px; color:#2563eb; margin-bottom:2px; }
+.dc-drop .dz-message b { color:#1e3a8a; font-size:14px; }
+.dc-drop.dz-started .dz-message { display:none; }
+.dc-drop .dz-preview { margin:4px; }
+.dc-drop .dz-preview .dz-image { border-radius:12px; }
+.dc-drop .dz-preview.dz-file-preview .dz-image { background:linear-gradient(135deg,#dbeafe,#bfdbfe); }
+.dc-drop .dz-preview .dz-progress { display:none; }
+.dc-drop .dz-preview .dz-remove { color:#dc2626; font-size:12px; font-weight:700; text-decoration:none; margin-top:4px; }
+.dc-drop .dz-preview .dz-error-message { background:#dc2626; border-radius:8px; }
+/* ── Consultations: PragmaVet blue ── */
+.dc-eyebrow { display:inline-flex; align-items:center; gap:6px; background:#eff6ff; color:#2563eb; font-size:11px; font-weight:800; letter-spacing:.4px; text-transform:uppercase; padding:4px 12px; border-radius:99px; margin-bottom:8px; }
+.dc-chip { display:inline-flex; align-items:center; gap:7px; background:#fff; border:1px solid #e8edf3; border-radius:99px; padding:8px 14px; font-size:13px; color:#475569; box-shadow:0 2px 8px rgba(15,23,42,.04); }
+.dc-chip b { color:#0f172a; }
+.dc-chip-red { background:#fef2f2; border-color:#fecaca; color:#b91c1c; } .dc-chip-red b { color:#b91c1c; }
+.dc-card { border:1px solid #e8edf3 !important; border-radius:18px !important; box-shadow:0 2px 12px rgba(15,23,42,.04) !important; }
+.dc-head { display:flex; align-items:center; gap:12px; margin-bottom:18px; }
+.dc-head h5 { font-size:16px; font-weight:800; margin:0; color:#0f172a; }
+.dc-head span:not(.dc-ic) { font-size:12px; color:#94a3b8; }
+.dc-ic { width:40px; height:40px; border-radius:12px; display:inline-flex; align-items:center; justify-content:center; font-size:16px; flex-shrink:0; }
+.dc-item { background:#fff; border:1px solid #e8edf3; border-radius:14px; padding:14px 16px; margin-bottom:10px; transition:box-shadow .15s, border-color .15s; }
+.dc-item:hover { border-color:#bfdbfe; box-shadow:0 6px 18px rgba(37,99,235,.08); }
+.dc-item-over { border-left:4px solid #dc2626; }
+.dc-av { width:34px; height:34px; border-radius:10px; background:linear-gradient(135deg,#dbeafe,#bfdbfe); color:#1d4ed8; font-weight:800; display:inline-flex; align-items:center; justify-content:center; flex-shrink:0; }
+.dc-av-sm { width:30px; height:30px; font-size:13px; }
+.dc-rec { background:#2563eb !important; background-image:none !important; color:#fff !important; border:0 !important; border-radius:10px !important; padding:9px 12px !important; font-weight:700 !important; box-shadow:0 4px 12px rgba(37,99,235,.22) !important; }
+.dc-rec:hover { background:#1d4ed8 !important; }
+.dc-rx { background:#fff !important; background-image:none !important; color:#2563eb !important; border:1px solid #bfdbfe !important; border-radius:10px !important; padding:6px 12px !important; font-weight:700 !important; font-size:12.5px !important; box-shadow:none !important; white-space:nowrap; }
+.dc-rx:hover { background:#eff6ff !important; }
+.dc-lab { display:inline-flex; align-items:center; background:#ecfeff; color:#0e7490; border:1px solid #a5f3fc; border-radius:99px; padding:3px 10px; font-size:11.5px; font-weight:700; text-decoration:none; }
+.dc-empty { text-align:center; color:#94a3b8; padding:32px 10px; font-size:13.5px; }
+.dc-empty i { display:block; font-size:28px; opacity:.45; margin-bottom:8px; }
+.modal .btn-primary { background:#2563eb !important; background-image:none !important; border:0 !important; color:#fff !important; box-shadow:0 6px 16px rgba(37,99,235,.25) !important; }
+.modal .btn-primary:hover { background:#1d4ed8 !important; }
+.modal .modal-header.bg-light { background:linear-gradient(135deg,#1d4ed8,#2563eb 60%,#3b82f6) !important; color:#fff; }
+.modal .modal-header.bg-light h5 { color:#fff !important; -webkit-text-fill-color:#fff; }
+.modal .modal-header.bg-light .btn-close { filter:invert(1) grayscale(1) brightness(2); }
+.card-premium {
+    background: white; border: none; border-radius: 16px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.04); padding: 24px; margin-bottom: 24px;
+}
+.form-control, .form-select { border-radius: 12px; border: 1px solid #e2e8f0; padding: 10px 14px; }
+.table-custom thead th { background: #f8fafc; color: #64748b; text-transform: uppercase; font-size: 11px; font-weight: 700; border-bottom: 2px solid #e2e8f0; }
+
+/* ====== WHITE SIDEBAR THEME ====== */
+.sidebar {
+    background: #ffffff !important;
+    width: var(--sidebar-width, 260px) !important;
+    height: 100vh !important;
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    padding: 28px 20px 24px !important;
+    z-index: 1000 !important;
+    display: flex !important;
+    flex-direction: column !important;
+    border-right: 1px solid #eef2f6 !important;
+    box-shadow: none !important;
+    overflow-y: auto !important;
+}
+
+.sidebar-brand {
+    display: flex !important;
+    align-items: center !important;
+    gap: 12px !important;
+    margin-bottom: 24px !important;
+    padding: 0 4px !important;
+    text-decoration: none !important;
+}
+
+.sidebar-brand-icon {
+    width: 44px !important;
+    height: 44px !important;
+    min-width: 44px !important;
+    border-radius: 13px !important;
+    background: #2563eb !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    color: #ffffff !important;
+    font-size: 20px !important;
+    flex-shrink: 0 !important;
+    box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+}
+
+.sidebar-brand span {
+    font-weight: 800 !important;
+    color: #182032 !important;
+    font-size: 22px !important;
+    letter-spacing: -0.4px !important;
+}
+
+.sidebar-user {
+    margin-bottom: 24px !important;
+    padding: 15px 18px !important;
+    border-radius: 14px !important;
+    background: #f8fafc !important;
+    border: 1px solid #eef2f6 !important;
+}
+
+.sidebar-user .welcome {
+    font-size: 13px !important;
+    color: #64748b !important;
+    font-weight: 500 !important;
+    line-height: 1.3 !important;
+}
+
+.sidebar-user .uname {
+    font-weight: 700 !important;
+    color: #0f172a !important;
+    font-size: 15.5px !important;
+    margin-top: 3px !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+}
+
+.sidebar a {
+    display: flex !important;
+    align-items: center !important;
+    gap: 14px !important;
+    padding: 12px 16px !important;
+    border-radius: 12px !important;
+    color: #334155 !important;
+    text-decoration: none !important;
+    margin-bottom: 4px !important;
+    font-weight: 600 !important;
+    font-size: 14.5px !important;
+    transition: all 0.2s ease !important;
+    letter-spacing: -0.1px !important;
+}
+
+.sidebar a i {
+    width: 22px !important;
+    text-align: center !important;
+    font-size: 16px !important;
+    color: #64748b !important;
+    transition: color 0.2s !important;
+    flex-shrink: 0 !important;
+}
+
+.sidebar a:hover {
+    background: #f8fafc !important;
+    color: #0f172a !important;
+}
+
+.sidebar a:hover i {
+    color: #2563eb !important;
+}
+
+.sidebar a.active {
+    background: #2563eb !important;
+    color: #ffffff !important;
+    font-weight: 700 !important;
+    box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+}
+
+.sidebar a.active i {
+    color: #ffffff !important;
+}
+
+.sidebar .sidebar-logout {
+    margin-top: auto !important;
+    padding-top: 20px !important;
+    border-top: 1px solid #f1f5f9 !important;
+}
+
+.sidebar .sidebar-logout a {
+    color: #dc2626 !important;
+    font-weight: 600 !important;
+    margin-bottom: 0 !important;
+}
+
+.sidebar .sidebar-logout a i {
+    color: #dc2626 !important;
+}
+
+.sidebar .sidebar-logout a:hover {
+    background: #fef2f2 !important;
+    color: #b91c1c !important;
+}
+
+.sidebar::-webkit-scrollbar { width: 5px; }
+.sidebar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.06); border-radius: 10px; }
+.sidebar::-webkit-scrollbar-track { background: transparent; }
+</style>
+    <link rel="stylesheet" href="assets/pragmavet.css">
+    <link href="assets/global-style.css" rel="stylesheet">
+</head>
+<body>
+
+
+<!-- SIDEBAR -->
+<div class="sidebar">
+    <div class="sidebar-brand">
+        <div class="sidebar-brand-icon"><i class="fa fa-user-md"></i></div>
+        <span>PragmaVet</span>
+    </div>
+    <div class="sidebar-user">
+        <div class="welcome">Welcome Doctor,</div>
+        <div class="uname">Test User</div>
+    </div>
+    <a href="doctor.php" class=""><i class="fa fa-calendar-check"></i> <span>Schedule & Availability</span></a>
+    <a href="doctor_consultations.php" class="active"><i class="fa fa-stethoscope"></i> <span>Active Consultations</span></a>
+    <a href="doctor_patients.php" class=""><i class="fa fa-paw"></i> <span>Patient EMR Lookup</span></a>
+    <a href="doctor_inventory.php" class=""><i class="fa fa-boxes"></i> <span>Pharmacy Stock</span></a>
+        <a href="admin_certificates.php" class=""><i class="fa fa-file-contract"></i> <span>Cert Requests</span><span style="margin-left:auto;background:#ef4444;color:#fff;font-size:11px;font-weight:800;min-width:22px;height:22px;border-radius:999px;display:inline-flex;align-items:center;justify-content:center;padding:0 7px;">1</span></a>
+    <div class="sidebar-logout">
+        <a href="logout.php"><i class="fa fa-sign-out-alt"></i> <span>Logout</span></a>
+    </div>
+</div>
+
+<style>.pv-nav-btn, .pv-nav-backdrop { display: none; }</style>
+<link rel="stylesheet" href="assets/pv-responsive.css?v=7" media="(max-width: 991.98px)">
+<script src="assets/pv-responsive.js?v=7" async></script>
+<button type="button" class="sbell-fab" id="sbellLink" onclick="sbellToggle(event)" title="Notifications" aria-label="Notifications">
+    <i class="fa fa-bell"></i>
+    <span class="sbell-count" id="sbellBadge" style="display:none;">0</span>
+</button>
+
+<div class="sbell-backdrop" id="sbellBackdrop" onclick="sbellClose()"></div>
+<aside class="sbell-panel" id="sbellPanel" aria-label="Notifications">
+    <div class="sbell-head">
+        <div><h6>Notifications</h6><div class="sbell-sub" id="sbellSub">Loading…</div></div>
+        <div class="d-flex gap-2 align-items-center">
+            <button type="button" class="sbell-mark" onclick="sbellMarkAll()" title="Mark all as read"><i class="fa fa-check-double me-1"></i>Mark all read</button>
+            <button type="button" class="sbell-x" onclick="sbellClose()" title="Close"><i class="fa fa-xmark"></i></button>
+        </div>
+    </div>
+    <div class="sbell-list" id="sbellList"></div>
+</aside>
+
+<style>
+    /* Floating bell — top-right of the screen */
+    .sbell-fab { position:fixed; top:22px; right:26px; z-index:2010; width:48px; height:48px; border-radius:50%; border:1px solid #e2e8f0; background:#fff !important; color:#334155 !important;
+                 display:flex; align-items:center; justify-content:center; font-size:19px; box-shadow:0 8px 24px rgba(15,23,42,.12) !important; cursor:pointer; transition:transform .15s, box-shadow .15s, color .15s; padding:0; }
+    .sbell-fab:hover { transform:translateY(-2px); color:#2563eb !important; box-shadow:0 12px 28px rgba(37,99,235,.2) !important; }
+    .sbell-fab.active { background:#2563eb !important; color:#fff !important; border-color:#2563eb; }
+    .sbell-fab.ring i { animation:sbellRing 1s ease 2; transform-origin:50% 0; }
+    @keyframes sbellRing { 0%,100%{transform:rotate(0)} 20%{transform:rotate(16deg)} 40%{transform:rotate(-14deg)} 60%{transform:rotate(9deg)} 80%{transform:rotate(-5deg)} }
+    .sbell-count { position:absolute; top:-4px; right:-4px; min-width:21px; height:21px; border-radius:999px; background:#ef4444; color:#fff; font-size:11px; font-weight:800; display:flex; align-items:center; justify-content:center; padding:0 6px; border:2px solid #fff; }
+    /* keep page headers clear of the bell */
+    .main-wrapper > .top-action-bar, .main-wrapper > .d-flex:first-child { padding-right:70px; }
+    /* Vet pages: the bell sits in the page header next to the other buttons, so it never covers them */
+    .sbell-fab.sbell-inline { position:relative; top:auto; right:auto; margin-left:4px; flex-shrink:0; }
+    .main-wrapper:not(:has(> .top-action-bar)):not(:has(> .d-flex:first-child)) { padding-top:84px; }
+    .sbell-backdrop { position:fixed; inset:0; background:rgba(15,23,42,.18); z-index:1990; opacity:0; pointer-events:none; transition:opacity .2s; }
+    .sbell-backdrop.open { opacity:1; pointer-events:auto; }
+    .sbell-panel { position:fixed; top:80px; right:26px; width:390px; max-width:calc(100vw - 32px); max-height:calc(100vh - 100px); background:#fff; z-index:2000; border-radius:18px; border:1px solid #e8edf3;
+                   box-shadow:0 20px 50px rgba(15,23,42,.18); transform:translateY(-8px) scale(.98); transform-origin:top right; opacity:0; pointer-events:none; transition:transform .2s ease, opacity .2s ease; display:flex; flex-direction:column; overflow:hidden; }
+    .sbell-panel.open { transform:none; opacity:1; pointer-events:auto; }
+    .sbell-head { padding:20px 18px 14px; border-bottom:1px solid #f1f5f9; display:flex; justify-content:space-between; align-items:flex-start; gap:10px; }
+    .sbell-head h6 { font-weight:800; font-size:17px; color:#0f172a; margin:0; }
+    .sbell-sub { font-size:12px; color:#64748b; margin-top:2px; }
+    .sbell-mark { border:none; background:#eff6ff !important; color:#2563eb !important; font-size:12px; font-weight:700; border-radius:999px; padding:6px 11px; box-shadow:none !important; white-space:nowrap; }
+    .sbell-x { border:none; background:#f1f5f9 !important; color:#64748b !important; width:30px; height:30px; border-radius:50%; display:flex; align-items:center; justify-content:center; padding:0; box-shadow:none !important; }
+    .sbell-list { flex:1; overflow-y:auto; padding:8px; }
+    .sbell-item { display:flex; gap:11px; padding:12px; border-radius:14px; cursor:pointer; transition:background .15s; position:relative; }
+    .sbell-item:hover { background:#f8fafc; }
+    .sbell-item.unread { background:#f5f9ff; }
+    .sbell-item.unread::after { content:''; position:absolute; top:16px; right:12px; width:8px; height:8px; border-radius:50%; background:#2563eb; }
+    .sbell-ic { width:36px; height:36px; border-radius:11px; display:flex; align-items:center; justify-content:center; flex-shrink:0; font-size:14px; }
+    .sbell-msg { font-size:13px; color:#334155; line-height:1.4; padding-right:14px; }
+    .sbell-item.unread .sbell-msg { color:#0f172a; font-weight:600; }
+    .sbell-time { font-size:11.5px; color:#94a3b8; margin-top:3px; }
+    .sbell-empty { text-align:center; color:#94a3b8; padding:50px 20px; font-size:13px; }
+    .sbell-empty i { font-size:34px; opacity:.35; display:block; margin-bottom:10px; }
+    @media (max-width: 768px) { .sbell-fab { top:12px; right:12px; } .sbell-panel { top:70px; right:8px; left:8px; width:auto; } }
+</style>
+<script>
+(function () {
+    var open = false, data = [];
+    function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+    function plain(html) { var d = document.createElement('div'); d.innerHTML = html || ''; return d.textContent || ''; }
+    function ago(ts) {
+        var d = new Date(String(ts).replace(' ', 'T')), s = (Date.now() - d.getTime()) / 1000;
+        if (isNaN(s)) return '';
+        if (s < 60) return 'Just now';
+        if (s < 3600) return Math.floor(s / 60) + ' min ago';
+        if (s < 86400) return Math.floor(s / 3600) + ' h ago';
+        if (s < 172800) return 'Yesterday';
+        return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    }
+    function kind(t) {
+        t = t.toLowerCase();
+        if (t.indexOf('boarding') > -1) return ['fa-hotel', '#0891b2'];
+        if (t.indexOf('declined') > -1 || t.indexOf('cancel') > -1) return ['fa-circle-xmark', '#dc2626'];
+        if (t.indexOf('paid') > -1 || t.indexOf('fee') > -1) return ['fa-coins', '#16a34a'];
+        if (t.indexOf('stock') > -1 || t.indexOf('report') > -1) return ['fa-boxes-stacked', '#ea580c'];
+        if (t.indexOf('accepted') > -1) return ['fa-circle-check', '#16a34a'];
+        if (t.indexOf('new appointment') > -1 || t.indexOf('reschedule') > -1) return ['fa-calendar-plus', '#2563eb'];
+        return ['fa-bell', '#7c3aed'];
+    }
+    function setBadge(n) {
+        var b = document.getElementById('sbellBadge'); b.textContent = n; b.style.display = n > 0 ? '' : 'none';
+        document.getElementById('sbellSub').textContent = n > 0 ? n + ' unread' : 'You’re all caught up';
+    }
+    function render() {
+        var box = document.getElementById('sbellList');
+        if (!data.length) { box.innerHTML = '<div class="sbell-empty"><i class="fa fa-bell-slash"></i>No notifications yet.</div>'; return; }
+        box.innerHTML = data.map(function (n, i) {
+            var t = plain(n.message), k = kind(t);
+            return '<div class="sbell-item' + (n.is_read == 0 ? ' unread' : '') + '" data-i="' + i + '">'
+                 + '<div class="sbell-ic" style="background:' + k[1] + '14;color:' + k[1] + ';"><i class="fa ' + k[0] + '"></i></div>'
+                 + '<div><div class="sbell-msg">' + esc(t) + '</div><div class="sbell-time">' + ago(n.created_at) + '</div></div></div>';
+        }).join('');
+        box.querySelectorAll('.sbell-item').forEach(function (el) {
+            el.onclick = function () {
+                var n = data[+el.dataset.i];
+                fetch('api_notifications.php?action=mark_one&id=' + encodeURIComponent(n.id)).finally(function () {
+                    if (n.link) location.href = n.link; else { n.is_read = 1; render(); load(); }
+                });
+            };
+        });
+    }
+    function load() {
+        return fetch('api_notifications.php?action=fetch').then(function (r) { return r.json(); }).then(function (d) {
+            if (!d || !d.notifications) return;
+            var u = parseInt(d.unread_count, 10) || 0, b = document.getElementById('sbellLink');
+            if (window._sbellLast !== undefined && u > window._sbellLast) { b.classList.remove('ring'); void b.offsetWidth; b.classList.add('ring'); }
+            window._sbellLast = u;
+            data = d.notifications; setBadge(u);
+            if (open) render();
+        }).catch(function () {});
+    }
+    window.sbellToggle = function (e) { e.preventDefault(); open ? sbellClose() : sbellOpen(); };
+    window.sbellOpen = function () {
+        open = true; render();
+        document.getElementById('sbellPanel').classList.add('open');
+        document.getElementById('sbellBackdrop').classList.add('open');
+        document.getElementById('sbellLink').classList.add('active');
+        load();
+    };
+    window.sbellClose = function () {
+        open = false;
+        document.getElementById('sbellPanel').classList.remove('open');
+        document.getElementById('sbellBackdrop').classList.remove('open');
+        document.getElementById('sbellLink').classList.remove('active');
+    };
+    window.sbellMarkAll = function () {
+        fetch('api_notifications.php?action=mark_read').finally(function () { data.forEach(function (n) { n.is_read = 1; }); setBadge(0); render(); });
+    };
+    // Vet pages (.main-content header): move the bell into the header, after its buttons / search box
+    document.addEventListener('DOMContentLoaded', function () {
+        var hdr = document.querySelector('.main-content > .d-flex:first-child'), fab = document.getElementById('sbellLink');
+        if (!hdr || !fab || hdr.children.length < 2) return;
+        var last = hdr.lastElementChild, wrap = document.createElement('div');
+        wrap.className = 'd-flex align-items-center gap-2';
+        hdr.replaceChild(wrap, last);
+        wrap.appendChild(last);
+        wrap.appendChild(fab);
+        fab.classList.add('sbell-inline');
+    });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && open) sbellClose(); });
+    load();
+    setInterval(load, 30000);
+})();
+</script>
+<div class="main-content">
+    <div class="d-flex justify-content-between align-items-end flex-wrap gap-3 mb-4">
+        <div>
+            <span class="dc-eyebrow"><i class="fa fa-stethoscope"></i> Doctor Workstation</span>
+            <h2 class="fw-bold m-0 text-dark">Active Consultations</h2>
+            <p class="text-muted mb-0">Record diagnoses, treatments, lab results and prescriptions for your patients.</p>
+        </div>
+        <div class="d-flex gap-2 flex-wrap">
+            <span class="dc-chip"><i class="fa fa-user-clock" style="color:#2563eb;"></i> <b>1</b> waiting</span>
+            <span class="dc-chip dc-chip-red"><i class="fa fa-triangle-exclamation"></i> <b>1</b> overdue</span>            <span class="dc-chip"><i class="fa fa-file-medical" style="color:#16a34a;"></i> <b>2</b> recent records</span>
+        </div>
+    </div>
+
+    <div class="row">
+        <!-- PENDING CONSULTATIONS -->
+        <div class="col-xl-5">
+            <div class="card-premium dc-card">
+                <div class="dc-head"><span class="dc-ic" style="background:#eff6ff;color:#2563eb;"><i class="fa fa-clipboard-list"></i></span><div><h5>Ready for Consultation</h5><span>Patients waiting for your medical record</span></div></div>
+                
+                                                        <div class="d-flex align-items-center gap-2 mt-2 mb-2">
+                        <i class="fa fa-triangle-exclamation" style="color:#dc2626;"></i>
+                        <span class="fw-bold text-uppercase" style="font-size:12px;letter-spacing:.06em;color:#dc2626;">Overdue</span>
+                        <span class="badge rounded-pill" style="background:#dc26261a;color:#dc2626;">1</span>
+                    </div>
+                    <p class="small text-muted mb-2">Past their date and never completed. Staff handle No Shows and rescheduling.</p>                    <div class="mb-3">
+                                            <div class="dc-item dc-item-over">
+                            <div class="d-flex justify-content-between align-items-center mb-2 gap-2">
+                                <div class="d-flex align-items-center gap-2" style="min-width:0;"><span class="dc-av">M</span><h6 class="mb-0 fw-bold text-truncate">max</h6></div>
+                                <span class="badge bg-danger-subtle text-danger border border-danger-subtle">
+                                    Apr 29 · 12:30 PM                                </span>
+                            </div>
+                            <p class="mb-2 text-muted small"><i class="fa fa-tag me-1"></i> Vaccination and Deworming                                <span class="badge bg-warning-subtle text-warning-emphasis ms-1">Unassigned</span>                            </p>
+                            <button class="btn btn-sm w-100 dc-rec" data-bs-toggle="modal" data-bs-target="#consultModal55">
+                                <i class="fa fa-notes-medical me-1"></i> Record Consultation
+                            </button>
+                        </div>
+
+                        <!-- MODAL FOR THIS APT -->
+                        <div class="modal fade" id="consultModal55" tabindex="-1">
+                            <div class="modal-dialog modal-lg modal-dialog-centered">
+                                <div class="modal-content border-0 shadow">
+                                    <div class="modal-header bg-light">
+                                        <h5 class="fw-bold mb-0">Consultation: max</h5>
+                                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                                    </div>
+                                    <div class="modal-body p-4">
+                                        <form method="POST" enctype="multipart/form-data">
+                                            <input type="hidden" name="appointment_id" value="55">
+
+                                            <!-- PET SUMMARY -->
+                                                                                        <div class="mb-3 p-3 dc-summary">
+                                                <div class="fw-bold small text-uppercase mb-2" style="letter-spacing:.05em;color:#1d4ed8;"><i class="fa fa-notes-medical me-1"></i> Patient Summary</div>
+                                                                                                <div class="">
+                                                    <div class="fw-bold text-dark">max                                                        <span class="fw-normal text-muted small">· Dog (aspin)                                                        · 2 yr · 8 kg</span>
+                                                    </div>
+                                                                                                        <div class="small text-muted mt-1"><i class="fa fa-clock-rotate-left me-1"></i><b>Last visit:</b>
+                                                        No previous records                                                    </div>
+                                                                                                    </div>
+                                                                                            </div>
+                                            
+                                            <div class="mb-3">
+                                                <label class="form-label fw-bold small"><i class="fa fa-user-doctor me-1" style="color:#2563eb;"></i> ATTENDING VETERINARIAN</label>
+                                                <input type="text" class="form-control bg-light" value="Test User" readonly tabindex="-1" style="cursor:not-allowed;">
+                                                <small class="text-muted"><i class="fa fa-lock me-1"></i>No vet was assigned; recorded under your name.</small>
+                                            </div>
+                                            <div class="mb-3">
+                                                <label class="form-label fw-bold small"><i class="fa fa-magnifying-glass me-1" style="color:#2563eb;"></i> DIAGNOSIS</label>
+                                                <textarea name="diagnosis" class="form-control" rows="3" required placeholder="Findings and diagnosis…"></textarea>
+                                            </div>
+                                            <div class="mb-3">
+                                                <label class="form-label fw-bold small"><i class="fa fa-kit-medical me-1" style="color:#2563eb;"></i> TREATMENT PLAN</label>
+                                                <textarea name="treatment" class="form-control" rows="3" required placeholder="Treatment given and care instructions…"></textarea>
+                                            </div>
+                                            
+                                            <div class="mb-3">
+                                                <label class="form-label fw-bold small"><i class="fa fa-file-medical me-1" style="color:#2563eb;"></i> LAB RESULTS / X-RAY <span class="dc-opt">(optional)</span></label>
+                                                <div class="dropzone dc-drop" data-input="labInput55"></div>
+                                                <input type="file" name="lab_result" id="labInput55" class="d-none" accept=".pdf,.jpg,.jpeg,.png">
+                                                <small class="text-muted d-block mt-1">PDF, JPG or PNG · up to 10 MB · one file per consultation</small>
+                                            </div>
+
+                                            <div class="row g-2 mb-3">
+                                                <div class="col-md-7">
+                                                    <label class="form-label fw-bold small"><i class="fa fa-prescription-bottle-medical me-1" style="color:#2563eb;"></i> PRESCRIPTION</label>
+                                                    <textarea name="prescription" class="form-control" rows="2" placeholder="e.g. Amoxicillin 250 mg, 1 tablet twice a day for 7 days"></textarea>
+                                                </div>
+                                                <div class="col-md-5">
+                                                    <label class="form-label fw-bold small"><i class="fa fa-calendar-plus me-1" style="color:#2563eb;"></i> FOLLOW-UP <span class="dc-opt">(optional)</span></label>
+                                                    <input type="date" name="followup_date" class="form-control" min="2026-10-12">
+                                                    <div class="form-check mt-2">
+                                                        <input class="form-check-input fu-book" type="checkbox" name="book_followup" value="1" id="fuBook55">
+                                                        <label class="form-check-label small" for="fuBook55">Book this follow-up appointment</label>
+                                                    </div>
+                                                    <div class="fu-time mt-2" style="display:none;">
+                                                        <input type="time" name="followup_time" class="form-control form-control-sm" step="1800" value="09:00">
+                                                        <small class="text-muted">Checked against your weekly schedule. Staff will confirm it.</small>
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                            <!-- CHARGES -->
+                                            <div class="p-3 mb-4 dc-charges">
+                                                <div class="d-flex justify-content-between align-items-center mb-2">
+                                                    <label class="form-label fw-bold small m-0"><i class="fa fa-file-invoice-dollar me-1" style="color:#2563eb;"></i> CHARGES <span class="dc-opt">sent to the front desk for billing</span></label>
+                                                    <button type="button" class="btn btn-sm dc-add" onclick="addChargeRow(this)"><i class="fa fa-plus me-1"></i>Add item</button>
+                                                </div>
+                                                <table class="table table-sm align-middle mb-2 charges-table" style="font-size:13px;">
+                                                    <thead><tr class="text-muted small"><th>Item</th><th style="width:90px;">Qty</th><th style="width:130px;">Price (₱)</th><th style="width:32px;"></th></tr></thead>
+                                                    <tbody>
+                                                        <tr>
+                                                            <td><input type="text" name="fee_name" class="form-control form-control-sm" value="Vaccination and Deworming" required></td>
+                                                            <td class="text-muted text-center">1</td>
+                                                            <td><input type="number" name="fee_price" class="form-control form-control-sm text-end charge-price" data-qty="1" readonly tabindex="-1" style="background:#f1f5f9;" min="0" step="0.01" value="800.00" oninput="updateChargeTotal(this)" required></td>
+                                                            <td></td>
+                                                        </tr>
+                                                    </tbody>
+                                                </table>
+                                                <div class="d-flex justify-content-between align-items-center">
+                                                    <small class="text-muted">Prices come from the clinic price list. Medicines given go in the prescription — the front desk dispenses and bills them.</small>
+                                                    <div class="fw-bold">Total: ₱<span class="charge-total">800.00</span></div>
+                                                </div>
+                                            </div>
+
+                                            <button type="submit" name="save_consultation" class="btn btn-primary w-100 py-3 fw-bold rounded-pill shadow-sm"><i class="fa fa-floppy-disk me-2"></i>Save Consultation</button>
+                                        </form>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                                        </div>
+                                                </div>
+        </div>
+
+        <!-- RECENT CONSULTATIONS LOG -->
+        <div class="col-xl-7">
+            <div class="card-premium dc-card">
+                <div class="dc-head"><span class="dc-ic" style="background:#f0fdf4;color:#16a34a;"><i class="fa fa-clock-rotate-left"></i></span><div><h5>Recent Clinical Records</h5><span>Your latest consultations · edit and print prescriptions</span></div></div>
+                
+                                <div class="table-responsive">
+                    <table class="table table-custom table-hover align-middle">
+                        <thead>
+                            <tr>
+                                <th>Pet & Vet</th>
+                                <th>Diagnosis</th>
+                                <th>Lab file</th>
+                                <th>Date</th>
+                                <th class="text-end">Rx Slip</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                                                        <tr>
+                                <td>
+                                    <div class="d-flex align-items-center gap-2"><span class="dc-av dc-av-sm">D</span><div><div class="fw-bold text-dark">dagapromax</div>
+                                    <div class="small text-muted">Dr. Smith (Doctor)</div></div></div>
+                                </td>
+                                <td><span class="text-truncate d-inline-block" style="max-width: 140px;" title="ADA">ADA</span></td>
+                                <td>
+                                                                            <span class="text-muted small">—</span>
+                                                                    </td>
+                                <td class="text-muted small">Oct 09</td>
+                                <td class="text-end">
+                                    <button type="button" class="btn btn-sm dc-rx" title="Review, edit and print the prescription slip"
+                                        onclick='openRxEditor({"id":10,"pet":"dagapromax","diagnosis":"ADA","treatment":"Eat 3x a day","prescription":"","followup":null})'>
+                                        <i class="fa fa-pen-to-square me-1"></i> Edit &amp; Print Rx
+                                    </button>
+                                </td>
+                            </tr>
+                                                        <tr>
+                                <td>
+                                    <div class="d-flex align-items-center gap-2"><span class="dc-av dc-av-sm">B</span><div><div class="fw-bold text-dark">buddy</div>
+                                    <div class="small text-muted">Dr. kwak</div></div></div>
+                                </td>
+                                <td><span class="text-truncate d-inline-block" style="max-width: 140px;" title="diagnpsewith ratartoui">diagnpsewith ratartoui</span></td>
+                                <td>
+                                                                            <span class="text-muted small">—</span>
+                                                                    </td>
+                                <td class="text-muted small">Oct 01</td>
+                                <td class="text-end">
+                                    <button type="button" class="btn btn-sm dc-rx" title="Review, edit and print the prescription slip"
+                                        onclick='openRxEditor({"id":9,"pet":"buddy","diagnosis":"diagnpsewith ratartoui","treatment":"eat a mouse atleast 1x a week","prescription":"","followup":null})'>
+                                        <i class="fa fa-pen-to-square me-1"></i> Edit &amp; Print Rx
+                                    </button>
+                                </td>
+                            </tr>
+                                                    </tbody>
+                    </table>
+                </div>
+                            </div>
+        </div>
+    </div>
+</div>
+
+<!-- EDIT RX MODAL -->
+<div class="modal fade" id="rxEditModal" tabindex="-1">
+    <div class="modal-dialog modal-lg modal-dialog-centered">
+        <div class="modal-content border-0 shadow">
+            <div class="modal-header bg-light">
+                <h5 class="fw-bold mb-0"><i class="fa fa-prescription me-2 text-primary"></i>Prescription Slip: <span id="rxPet"></span></h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form id="rxEditForm" class="modal-body p-4">
+                <input type="hidden" name="save_rx" value="1">
+                <input type="hidden" name="consult_id" id="rxId">
+                <div id="rxAlert"></div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold small"><i class="fa fa-magnifying-glass me-1" style="color:#2563eb;"></i> DIAGNOSIS</label>
+                    <textarea name="diagnosis" id="rxDiagnosis" class="form-control" rows="2" required></textarea>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold small">PRESCRIPTION (Rx)</label>
+                    <textarea name="prescription" id="rxPrescription" class="form-control" rows="4" placeholder="e.g. Amoxicillin 250mg — 1 tablet twice a day for 7 days"></textarea>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold small">TREATMENT PLAN / INSTRUCTIONS</label>
+                    <textarea name="treatment" id="rxTreatment" class="form-control" rows="3" required></textarea>
+                </div>
+                <div class="mb-1" style="max-width:260px;">
+                    <label class="form-label fw-bold small">RECOMMENDED FOLLOW-UP</label>
+                    <input type="date" name="followup_date" id="rxFollowup" class="form-control">
+                </div>
+            </form>
+            <div class="modal-footer border-0 px-4 pb-4">
+                <a href="#" id="rxPrintOnly" target="_blank" class="btn btn-link text-muted me-auto px-0">Print without changes</a>
+                <button type="button" class="btn btn-light border rounded-pill px-3" onclick="saveRx(false)"><i class="fa fa-save me-1"></i> Save</button>
+                <button type="button" class="btn btn-primary rounded-pill px-4 fw-bold" onclick="saveRx(true)"><i class="fa fa-print me-1"></i> Save &amp; Print</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<datalist id="priceList">
+            <option value="Consultation" label="₱500.00"></option>
+            <option value="General Checkup" label="₱500.00"></option>
+            <option value="Deworming" label="₱800.00"></option>
+            <option value="Vaccination and Deworming" label="₱800.00"></option>
+            <option value="Laboratory Test" label="₱950.00"></option>
+            <option value="Dental Cleaning" label="₱1,500.00"></option>
+            <option value="Dental Prophylaxis" label="₱1,500.00"></option>
+            <option value="Grooming" label="₱500.00"></option>
+            <option value="Surgery" label="₱500.00"></option>
+            <option value="Confinement" label="₱2,000.00"></option>
+            <option value="Pet Boarding" label="₱800.00"></option>
+            <option value="3-in-1 Vaccine" label="₱500.00"></option>
+            <option value="Complete Blood Count (CBC)" label="₱950.00"></option>
+            <option value="Blood Chemistry" label="₱950.00"></option>
+            <option value="Urinalysis" label="₱950.00"></option>
+            <option value="Fecalysis" label="₱950.00"></option>
+            <option value="X-ray" label="₱700.00"></option>
+            <option value="Ultrasound" label="₱950.00"></option>
+            <option value="Skin Scraping" label="₱950.00"></option>
+    </datalist>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+// ── Consultation charges ──
+var PRICE_LIST = {};
+PRICE_LIST["Consultation"] = 500;
+PRICE_LIST["General Checkup"] = 500;
+PRICE_LIST["Deworming"] = 800;
+PRICE_LIST["Vaccination and Deworming"] = 800;
+PRICE_LIST["Laboratory Test"] = 950;
+PRICE_LIST["Dental Cleaning"] = 1500;
+PRICE_LIST["Dental Prophylaxis"] = 1500;
+PRICE_LIST["Grooming"] = 500;
+PRICE_LIST["Surgery"] = 500;
+PRICE_LIST["Confinement"] = 2000;
+PRICE_LIST["Pet Boarding"] = 800;
+PRICE_LIST["3-in-1 Vaccine"] = 500;
+PRICE_LIST["Complete Blood Count (CBC)"] = 950;
+PRICE_LIST["Blood Chemistry"] = 950;
+PRICE_LIST["Urinalysis"] = 950;
+PRICE_LIST["Fecalysis"] = 950;
+PRICE_LIST["X-ray"] = 700;
+PRICE_LIST["Ultrasound"] = 950;
+PRICE_LIST["Skin Scraping"] = 950;
+
+function addChargeRow(btn) {
+    var tbody = btn.closest('.p-3').querySelector('.charges-table tbody');
+    var tr = document.createElement('tr');
+    tr.innerHTML = '<td><input type="text" name="item_name[]" class="form-control form-control-sm" list="priceList" placeholder="Service or procedure" oninput="fillChargePrice(this)"></td>'
+        + '<td><input type="number" name="item_qty[]" class="form-control form-control-sm text-center charge-qty" value="1" min="1" oninput="updateChargeTotal(this)"></td>'
+        + '<td><input type="number" name="item_price[]" class="form-control form-control-sm text-end charge-price" value="0.00" readonly tabindex="-1" style="background:#f1f5f9;"></td>'
+        + '<td><button type="button" class="btn btn-sm text-danger p-0" title="Remove" onclick="var t=this.closest(\'table\');this.closest(\'tr\').remove();updateChargeTotal(t)"><i class="fa fa-times-circle"></i></button></td>';
+    tbody.appendChild(tr);
+    tr.querySelector('input').focus();
+}
+
+function fillChargePrice(input) {
+    if (PRICE_LIST.hasOwnProperty(input.value)) {
+        input.closest('tr').querySelector('.charge-price').value = PRICE_LIST[input.value].toFixed(2);
+        updateChargeTotal(input);
+    }
+}
+
+function updateChargeTotal(el) {
+    var box = el.closest('.p-3');
+    var total = 0;
+    box.querySelectorAll('.charges-table tbody tr').forEach(function(tr) {
+        var price = parseFloat(tr.querySelector('.charge-price').value) || 0;
+        var q = tr.querySelector('.charge-qty');
+        total += price * (q ? (parseInt(q.value) || 1) : 1);
+    });
+    box.querySelector('.charge-total').textContent = total.toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+// Show the follow-up time only when booking it
+document.addEventListener('change', function(e) {
+    if (e.target.classList.contains('fu-book')) {
+        var wrap = e.target.closest('.col-md-5');
+        wrap.querySelector('.fu-time').style.display = e.target.checked ? 'block' : 'none';
+        wrap.querySelector('input[name="followup_date"]').required = e.target.checked;
+    }
+});
+
+function openRxEditor(c) {
+    document.getElementById('rxPet').textContent = c.pet || '';
+    document.getElementById('rxId').value = c.id;
+    document.getElementById('rxDiagnosis').value = c.diagnosis || '';
+    document.getElementById('rxTreatment').value = c.treatment || '';
+    document.getElementById('rxPrescription').value = c.prescription || '';
+    document.getElementById('rxFollowup').value = c.followup || '';
+    document.getElementById('rxPrintOnly').href = 'print_rx.php?id=' + c.id;
+    document.getElementById('rxAlert').innerHTML = '';
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('rxEditModal')).show();
+}
+
+function saveRx(andPrint) {
+    var form = document.getElementById('rxEditForm');
+    if (!form.reportValidity()) return;
+    var id = document.getElementById('rxId').value;
+    // Open the print tab now (inside the click) so pop-up blockers allow it
+    var win = andPrint ? window.open('', '_blank') : null;
+    fetch('doctor_consultations.php', { method: 'POST', body: new FormData(form) })
+        .then(function(r) { return r.json(); })
+        .then(function(res) {
+            if (!res.ok) throw new Error(res.error || 'Could not save changes.');
+            if (win) win.location = 'print_rx.php?id=' + id;
+            location.reload();
+        })
+        .catch(function(err) {
+            if (win) win.close();
+            document.getElementById('rxAlert').innerHTML = '<div class="alert alert-danger py-2 small">' + err.message.replace(/</g, '&lt;') + '</div>';
+        });
+}
+</script>
+    <script src="mousetrail.js"></script>
+<script>
+// Opened from Patient EMR Lookup (?open=<appointment id>): show that patient's consultation form
+(function () {
+    var id = new URLSearchParams(location.search).get('open');
+    var el = id && /^\d+$/.test(id) ? document.getElementById('consultModal' + id) : null;
+    if (el) window.addEventListener('load', function () { bootstrap.Modal.getOrCreateInstance(el).show(); history.replaceState(null, '', 'doctor_consultations.php'); });
+})();
+</script>
+<link rel="stylesheet" href="https://unpkg.com/dropzone@5.9.3/dist/min/dropzone.min.css">
+<script src="https://unpkg.com/dropzone@5.9.3/dist/min/dropzone.min.js"></script>
+<script>
+// Lab result drop box: Dropzone shows the file; the file itself is copied into the form's hidden <input name="lab_result">
+// so the consultation still saves in one normal form submit (no separate upload).
+if (window.Dropzone) {
+    Dropzone.autoDiscover = false;
+    document.querySelectorAll('.dc-drop').forEach(function (el) {
+        var input = document.getElementById(el.dataset.input);
+        if (!input) return;
+        var dz = new Dropzone(el, {
+            url: '#', autoProcessQueue: false, maxFiles: 1, maxFilesize: 10, acceptedFiles: '.pdf,.jpg,.jpeg,.png',
+            addRemoveLinks: true, thumbnailWidth: 120, thumbnailHeight: 120,
+            dictDefaultMessage: '<i class="fa fa-cloud-arrow-up"></i><b>Drop the lab result or X-ray here</b><span>or click to choose a file</span>',
+            dictRemoveFile: 'Remove', dictInvalidFileType: 'Only PDF, JPG or PNG files.',
+            dictFileTooBig: 'File is too big ({{filesize}} MB). Maximum is {{maxFilesize}} MB.', dictMaxFilesExceeded: 'Only one file per consultation.'
+        });
+        var sync = function () {
+            var dt = new DataTransfer();
+            dz.getAcceptedFiles().forEach(function (f) { dt.items.add(f); });
+            input.files = dt.files;
+        };
+        dz.on('addedfile', function () {
+            if (dz.files.length > 1) dz.removeFile(dz.files[0]); // replace the previous file
+            setTimeout(sync, 0);
+        });
+        dz.on('removedfile', sync);
+        dz.on('error', function (file) { setTimeout(function () { dz.removeFile(file); }, 3000); });
+    });
+}
+</script>
+<script>window.addEventListener("load",function(){var m=document.getElementById("consultModal55");m.classList.add("show");m.style.display="block";m.style.position="static";document.body.style.overflow="auto";});</script></body>
+</html>

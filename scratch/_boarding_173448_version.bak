@@ -1,0 +1,1324 @@
+<?php
+ob_start();
+session_start();
+include("dbconnection.php");
+include("paymongo_config.php");
+
+if (!isset($_SESSION['user_id'])) {
+    header("Location: index.php");
+    exit();
+}
+
+$user_id = $_SESSION['user_id'];
+$user_name = $_SESSION['user'];
+
+// Fetch user's pets for the booking modal dropdown
+$stmt_pets = $conn->prepare("SELECT name, species FROM pets WHERE user_id=? ORDER BY name ASC");
+$stmt_pets->bind_param("i", $user_id);
+$stmt_pets->execute();
+$pets_result = $stmt_pets->get_result();
+
+// â”€â”€ PayMongo Success Callback â€” runs after demo payment completes â”€â”€
+if (isset($_GET['pm_success'], $_GET['res_id'])) {
+    $res_id = (int) $_GET['res_id'];
+    $pay_type = $_GET['pm_success'];          // 'downpayment' or 'full'
+    $total = (float) ($_GET['total'] ?? 0);
+    $dp = (float) ($_GET['dp'] ?? 0);
+    $now = date('Y-m-d H:i:s');
+
+    // Ensure billing columns exist (safe for all MySQL versions)
+    $needed = [
+        'downpayment_amount' => "DECIMAL(10,2) NOT NULL DEFAULT 0",
+        'downpayment_status' => "VARCHAR(20) NOT NULL DEFAULT 'Unpaid'",
+        'downpayment_paid_at' => 'DATETIME DEFAULT NULL',
+        'is_boarding' => 'TINYINT(1) NOT NULL DEFAULT 0',
+    ];
+    foreach ($needed as $col => $def) {
+        $r = $conn->query("SHOW COLUMNS FROM billing LIKE '$col'");
+        if ($r && $r->num_rows === 0)
+            $conn->query("ALTER TABLE billing ADD COLUMN `$col` $def");
+    }
+
+    // Create or update billing record
+    $existing = $conn->query("SELECT id FROM billing WHERE appointment_id=$res_id");
+    if ($existing && $existing->num_rows > 0) {
+        $bill_id = $existing->fetch_assoc()['id'];
+    } else {
+        $conn->query("INSERT INTO billing(appointment_id, total_amount, downpayment_amount, is_boarding, downpayment_status, payment_status)
+                      VALUES($res_id, $total, $dp, 1, 'Unpaid', 'Unpaid')");
+        $bill_id = $conn->insert_id;
+    }
+
+    if ($pay_type === 'downpayment') {
+        $conn->query("UPDATE billing SET downpayment_status='Paid', downpayment_amount=$dp, downpayment_paid_at='$now' WHERE id=$bill_id");
+        $conn->query("UPDATE boarding_reservations SET status='Approved' WHERE id=$res_id AND user_id=$user_id");
+        $_SESSION['message'] = "âœ… Downpayment of â‚±" . number_format($dp, 2) . " confirmed! Your reservation is now approved.";
+        $_SESSION['msg_type'] = 'success';
+    } else {
+        $conn->query("UPDATE billing SET payment_status='Paid', downpayment_status='Paid', downpayment_amount=$dp, downpayment_paid_at='$now' WHERE id=$bill_id");
+        $conn->query("UPDATE boarding_reservations SET status='Approved' WHERE id=$res_id AND user_id=$user_id");
+        $_SESSION['message'] = "âœ… Full payment of â‚±" . number_format($total, 2) . " confirmed! Your reservation is approved.";
+        $_SESSION['msg_type'] = 'success';
+    }
+    header("Location: boarding.php");
+    exit();
+}
+
+// â”€â”€ PayMongo Cancel â€” clean up pending reservation â”€â”€
+if (isset($_GET['pm_cancelled'])) {
+    $res_id = (int) ($_GET['res_id'] ?? 0);
+    if ($res_id)
+        $conn->query("DELETE FROM boarding_reservations WHERE id=$res_id AND status='Pending' AND user_id=$user_id");
+    $_SESSION['message'] = "Payment was cancelled. Your reservation was not confirmed.";
+    $_SESSION['msg_type'] = 'warning';
+    header("Location: boarding.php");
+    exit();
+}
+
+// â”€â”€ Book Cage: Create reservation then redirect to demo payment â”€â”€
+if (isset($_POST['book_cage'])) {
+    $pet = trim($_POST['pet_name']);
+    $cage_no = (int) $_POST['cage_number'];
+    $date = $_POST['appointment_date'];
+    $end_date = $_POST['end_date'];
+    $time = $_POST['appointment_time'] ?? '10:00 AM';
+    $pay_type = $_POST['payment_type'] ?? 'downpayment';
+    $service = 'Pet Boarding Reservation';
+
+    // JS redirect â€” works even if headers already sent
+    function js_redirect($url)
+    {
+        echo '<!DOCTYPE html><html><head>'
+            . '<meta http-equiv="refresh" content="0;url=' . htmlspecialchars($url, ENT_QUOTES) . '">'
+            . '<script>window.location.replace(' . json_encode($url) . ');</script>'
+            . '    <link rel="stylesheet" href="assets/pragmavet.css">
+    <link href="assets/global-style.css" rel="stylesheet">
+</head><body>    <script src="mousetrail.js"></script>
+</body></html>';
+        exit();
+    }
+
+    // Validate dates
+    $days = max(1, round((strtotime($end_date) - strtotime($date)) / 86400));
+    if (strtotime($end_date) <= strtotime($date)) {
+        $_SESSION['message'] = 'Check-out must be at least 1 day after check-in.';
+        $_SESSION['msg_type'] = 'danger';
+        js_redirect('boarding.php');
+    }
+
+    // Overlap check
+    $chk = $conn->prepare("SELECT id FROM boarding_reservations WHERE cage_number=? AND status NOT IN ('Completed','Cancelled','Rejected') AND appointment_date < ? AND end_date > ?");
+    $chk->bind_param('iss', $cage_no, $end_date, $date);
+    $chk->execute();
+    if ($chk->get_result()->num_rows > 0) {
+        $_SESSION['message'] = "Cage $cage_no is already booked for those dates.";
+        $_SESSION['msg_type'] = 'danger';
+        js_redirect('boarding.php');
+    }
+
+    // Costs
+    $total = round($days * 800, 2);
+    $dp = round($total * 0.30, 2);
+    $charge = ($pay_type === 'full') ? $total : $dp;
+    $label = ($pay_type === 'full')
+        ? "Pet Boarding â€” Full Payment ($days day" . ($days > 1 ? 's' : '') . " â€” $pet)"
+        : "Pet Boarding â€” 30% Downpayment (Non-Refundable) â€” $pet";
+
+    // Insert reservation as Pending
+    $ins = $conn->prepare("INSERT INTO boarding_reservations(user_id, pet_name, service_type, appointment_date, appointment_time, end_date, cage_number, status) VALUES(?,?,?,?,?,?,?,'Pending')");
+    $ins->bind_param('isssssi', $user_id, $pet, $service, $date, $time, $end_date, $cage_no);
+    if (!$ins->execute()) {
+        $_SESSION['message'] = 'Reservation error: ' . $conn->error;
+        $_SESSION['msg_type'] = 'danger';
+        js_redirect('boarding.php');
+    }
+    $res_id = $conn->insert_id;
+
+    // Build URLs â€” billing is created AFTER payment succeeds (no billing insert here)
+    $domain = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http')
+        . '://' . $_SERVER['HTTP_HOST'] . '/pragmavet';
+    $success_url = $domain . '/boarding.php?pm_success=' . urlencode($pay_type)
+        . '&res_id=' . $res_id . '&total=' . $total . '&dp=' . $dp;
+    $cancel_url = $domain . '/boarding.php?pm_cancelled=1&res_id=' . $res_id;
+
+    // In DEMO_MODE go directly to payment_demo.php
+    $demo_url = $domain . '/payment_demo.php'
+        . '?amount=' . urlencode($charge)
+        . '&description=' . urlencode($label)
+        . '&success_url=' . urlencode($success_url)
+        . '&cancel_url=' . urlencode($cancel_url);
+
+    js_redirect($demo_url);
+}
+
+// â”€â”€ Handle Automatic Boarding Reschedule â”€â”€
+if (isset($_POST['reschedule_boarding_request'])) {
+    $apt_id = (int)$_POST['apt_id'];
+    $new_start = $_POST['new_start_date'];
+    $new_end = $_POST['new_end_date'];
+    $today = date('Y-m-d');
+
+    // 1. Fetch current reservation to check cage and current date
+    $curr_q = $conn->prepare("SELECT appointment_date, cage_number FROM boarding_reservations WHERE id=? AND user_id=?");
+    $curr_q->bind_param("ii", $apt_id, $user_id);
+    $curr_q->execute();
+    $curr = $curr_q->get_result()->fetch_assoc();
+
+    if (!$curr) {
+        $_SESSION['message'] = "Reservation not found.";
+        $_SESSION['msg_type'] = "danger";
+    } elseif ($curr['appointment_date'] <= $today) {
+        $_SESSION['message'] = "Stays starting today or already in progress cannot be rescheduled.";
+        $_SESSION['msg_type'] = "warning";
+    } else {
+        $cage_no = $curr['cage_number'];
+        // 2. Overlap check for NEW dates (excluding self)
+        $chk = $conn->prepare("SELECT id FROM boarding_reservations WHERE id != ? AND cage_number=? AND status NOT IN ('Completed','Cancelled','Rejected') AND appointment_date < ? AND end_date > ?");
+        $chk->bind_param('iiss', $apt_id, $cage_no, $new_end, $new_start);
+        $chk->execute();
+        
+        if ($chk->get_result()->num_rows > 0) {
+            $_SESSION['message'] = "The cage is occupied by another guest during those new dates.";
+            $_SESSION['msg_type'] = "danger";
+        } else {
+            // 3. Update directly
+            $stmt = $conn->prepare("UPDATE boarding_reservations SET appointment_date=?, end_date=?, status='Approved', proposed_reschedule_date=NULL, proposed_reschedule_end_date=NULL, client_action_needed=0 WHERE id=? AND user_id=?");
+            $stmt->bind_param("ssii", $new_start, $new_end, $apt_id, $user_id);
+            if ($stmt->execute()) {
+                $_SESSION['message'] = "Reservation successfully updated to new dates!";
+                $_SESSION['msg_type'] = "success";
+            }
+        }
+    }
+    header("Location: boarding.php");
+    exit();
+}
+
+
+
+
+// Process Cancellation
+if (isset($_POST['cancel_boarding'])) {
+    $apt_id = $_POST['apt_id'];
+    $stmt = $conn->prepare("SELECT appointment_date FROM boarding_reservations WHERE id=? AND user_id=?");
+    $stmt->bind_param("ii", $apt_id, $user_id);
+    $stmt->execute();
+    $res = $stmt->get_result();
+    if ($res->num_rows > 0) {
+        $row = $res->fetch_assoc();
+        $drop_off = strtotime($row['appointment_date']);
+        if (($drop_off - time()) >= 86400) {
+            $conn->query("UPDATE boarding_reservations SET status='Cancelled' WHERE id=$apt_id");
+            $_SESSION['message'] = "Boarding reservation successfully cancelled.";
+            $_SESSION['msg_type'] = "success";
+        } else {
+            $_SESSION['message'] = "Cancellation failed: Must be completed at least 24 hours prior to drop-off.";
+            $_SESSION['msg_type'] = "danger";
+        }
+    }
+    header("Location: boarding.php");
+    exit();
+}
+
+// Process Extension Request
+if (isset($_POST['extend_boarding'])) {
+    $apt_id = $_POST['apt_id'];
+    $new_end_date = $_POST['new_end_date'];
+
+    $stmt = $conn->prepare("SELECT cage_number, end_date, pet_name FROM boarding_reservations WHERE id=? AND user_id=?");
+    $stmt->bind_param("ii", $apt_id, $user_id);
+    $stmt->execute();
+    $my_apt = $stmt->get_result()->fetch_assoc();
+
+    if ($my_apt && strtotime($new_end_date) > strtotime($my_apt['end_date'])) {
+        $old_end = $my_apt['end_date'];
+        $curr_cage = $my_apt['cage_number'];
+        // Update current appointment to cover extended dates and flag as Pending for approval
+        $upd = $conn->prepare("UPDATE boarding_reservations SET end_date=?, status='Pending' WHERE id=?");
+        $upd->bind_param("si", $new_end_date, $apt_id);
+
+        if ($upd->execute()) {
+            $_SESSION['message'] = "Your extension request to " . date("M d", strtotime($new_end_date)) . " has been sent to the admin for approval.";
+            $_SESSION['msg_type'] = "success";
+        } else {
+            $_SESSION['message'] = "Database Error submitting extension.";
+            $_SESSION['msg_type'] = "danger";
+        }
+    } else {
+        $_SESSION['message'] = "Invalid extension date.";
+        $_SESSION['msg_type'] = "danger";
+    }
+    header("Location: boarding.php");
+    exit();
+}
+
+// Process Reschedule Accept/Decline
+if (isset($_POST['accept_reschedule_boarding'])) {
+    $apt_id = (int) $_POST['reschedule_apt_id'];
+    $stmt = $conn->prepare("UPDATE boarding_reservations SET appointment_date = proposed_reschedule_date, end_date = proposed_reschedule_end_date, status = 'Approved', client_action_needed = 0 WHERE id = ? AND user_id = ?");
+    $stmt->bind_param("ii", $apt_id, $user_id);
+    if ($stmt->execute()) {
+        $_SESSION['message'] = "Reschedule successfully accepted. Your boarding is now Approved for the new dates.";
+        $_SESSION['msg_type'] = "success";
+        $conn->query("INSERT INTO notifications(user_id, message) VALUES(1, 'Client accepted the BOARDING reschedule proposal for appointment ID $apt_id')");
+    }
+    header("Location: boarding.php");
+    exit();
+}
+
+if (isset($_POST['decline_reschedule_boarding'])) {
+    $apt_id = (int) $_POST['reschedule_apt_id'];
+    $stmt = $conn->prepare("UPDATE boarding_reservations SET status = 'Cancelled', client_action_needed = 0 WHERE id = ? AND user_id = ?");
+    $stmt->bind_param("ii", $apt_id, $user_id);
+    if ($stmt->execute()) {
+        $_SESSION['message'] = "Reschedule declined. Boarding has been permanently cancelled.";
+        $_SESSION['msg_type'] = "danger";
+        $conn->query("INSERT INTO notifications(user_id, message) VALUES(1, 'Client DECLINED the BOARDING reschedule proposal for appointment ID $apt_id.')");
+    }
+    header("Location: boarding.php");
+    exit();
+}
+
+// Fetch Cage Count from settings
+$count_q = $conn->query("SELECT setting_value FROM clinic_settings WHERE setting_key = 'boarding_cage_count'");
+$cage_count = ($count_q && $count_q->num_rows > 0) ? (int)$count_q->fetch_assoc()['setting_value'] : 5;
+
+// Prepare base cages
+$cages = [];
+$flatpickr_disable = [];
+for($i = 1; $i <= $cage_count; $i++) {
+    $cages[$i] = [];
+    $flatpickr_disable[$i] = [];
+}
+
+// Fetch all active Boarding bookings mapped onto cages
+// Fetch all active Boarding bookings mapped onto cages
+$sql = "SELECT id, cage_number, user_id, pet_name, appointment_date, end_date, appointment_time, status, service_type, created_at, admin_message, client_action_needed, cctv_link, cctv_enabled 
+        FROM boarding_reservations 
+        WHERE cage_number IS NOT NULL 
+        AND status NOT IN ('Completed', 'Cancelled', 'Rejected')
+        AND end_date >= CURDATE()
+        ORDER BY appointment_date ASC";
+$res = $conn->query($sql);
+
+if ($res && $res->num_rows > 0) {
+    while ($row = $res->fetch_assoc()) {
+        $cNo = $row['cage_number'];
+        if (isset($cages[$cNo])) {
+            $cages[$cNo][] = $row;
+            $flatpickr_disable[$cNo][] = [
+                'from' => $row['appointment_date'],
+                'to' => $row['end_date']
+            ];
+        }
+    }
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <script src="theme.js?v=<?= time() ?>"></script>
+    <link rel="stylesheet" href="theme.css?v=<?= time() ?>">
+
+    <title>Pet Boarding Schedule | PragmaVet</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+    <link rel="stylesheet" type="text/css" href="https://npmcdn.com/flatpickr/dist/themes/material_blue.css">
+    <style>
+        :root {
+            --primary: #1E5AA8;
+            --secondary: #4A7FC4;
+            --dark: #15407A;
+            --light-bg: #E6EEF8;
+            --sidebar-width: 260px;
+        }
+
+        body {
+            background: var(--light-bg);
+            font-family: 'Inter', sans-serif;
+            color: #333;
+            overflow-x: hidden;
+        }
+
+        /* SIDEBAR */
+        .sidebar {
+            background: #0f172a;
+            width: var(--sidebar-width);
+            height: 100vh;
+            position: fixed;
+            top: 0;
+            left: 0;
+            padding: 24px 16px;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 5px 0 20px rgba(0, 0, 0, .2);
+            overflow-y: auto;
+        }
+
+        .sidebar h4 {
+            color: #ffffff;
+            font-weight: 800;
+            font-size: 22px;
+            margin-bottom: 30px;
+            letter-spacing: 0.5px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .sidebar-user {
+            padding: 15px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            margin-bottom: 30px;
+            margin-top: 20px;
+        }
+
+        .sidebar a {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 16px;
+            border-radius: 8px;
+            color: #94a3b8;
+            text-decoration: none;
+            margin-bottom: 4px;
+            font-weight: 600;
+            font-size: 15px;
+            transition: .2s;
+        }
+
+        .sidebar a i {
+            width: 30px;
+            font-size: 18px;
+        }
+
+        .sidebar a:hover,
+        .sidebar a.active {
+            background: #2563eb;
+            color: #ffffff;
+        }
+
+        .sidebar .logout-link {
+            position: absolute;
+            bottom: 30px;
+            width: calc(100% - 40px);
+            color: #ff6b6b;
+        }
+
+        /* CONTENT AREA */
+        .main-content {
+            margin-left: var(--sidebar-width);
+            padding: 40px 50px;
+            min-height: 100vh;
+        }
+
+        .page-header {
+            margin-bottom: 40px;
+        }
+
+        .page-header h2 {
+            font-weight: 800;
+            color: var(--dark);
+            margin: 0;
+            letter-spacing: -0.5px;
+        }
+
+        /* CAGE GRID */
+        .cage-card {
+            background: white;
+            border: 2px solid #edf2f6;
+            border-radius: 20px;
+            padding: 30px 20px;
+            transition: 0.3s;
+            height: 100%;
+            position: relative;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.02);
+        }
+
+        .cage-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.05);
+        }
+
+        .cage-icon {
+            font-size: 30px;
+            margin-bottom: 15px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            background: rgba(30, 90, 168, 0.05);
+            color: var(--primary);
+        }
+
+        .schedule-list {
+            max-height: 140px;
+            overflow-y: auto;
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px dashed #dbe5ec;
+        }
+
+        .booked-slot {
+            background: #fff5f5;
+            border: 1px solid #ffe3e3;
+            padding: 8px 12px;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            font-size: 13px;
+            color: #c92a2a;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .booked-slot i {
+            color: #fa5252;
+            margin-right: 5px;
+        }
+
+        .form-control,
+        .form-select {
+            border-radius: 12px;
+            padding: 12px 20px;
+            border: 1px solid #dbe5ec;
+            font-size: 15px;
+            background: #fafcff;
+        }
+
+        /* Alert Absolute */
+        .alert-container {
+            position: fixed;
+            top: 30px;
+            right: 40px;
+            z-index: 9999;
+            animation: slideDown 0.5s ease-out forwards;
+        }
+
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* Scrollbar styling for small lists */
+        .schedule-list::-webkit-scrollbar {
+            width: 4px;
+        }
+
+        .schedule-list::-webkit-scrollbar-thumb {
+            background: #dbe5ec;
+            border-radius: 4px;
+        }
+
+        .sidebar::-webkit-scrollbar {
+            width: 5px;
+        }
+
+        .sidebar::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+        }
+
+        .sidebar::-webkit-scrollbar-track {
+            background: transparent;
+        }
+    </style>
+    <link rel="stylesheet" href="assets/pragmavet.css">
+    <link href="assets/global-style.css" rel="stylesheet">
+</head>
+
+<body>
+
+    <?php if (isset($_SESSION['message'])): ?>
+        <div class="alert-container">
+            <div class="alert alert-<?php echo $_SESSION['msg_type']; ?> shadow-lg text-dark"
+                style="border-radius: 12px; border: none; font-weight: 500;">
+                <?php echo $_SESSION['message'];
+                unset($_SESSION['message'], $_SESSION['msg_type']); ?>
+            </div>
+        </div>
+    <?php endif; ?>
+
+    <!-- SIDEBAR -->
+    <div class="sidebar">
+        <div class="sidebar-brand" style="display:flex; align-items:center; gap:10px; margin-bottom: 20px;">
+            <div class="sidebar-brand-icon"><i class="fa fa-paw" style="color:#fff;font-size:18px;"></i></div>
+            <span style="font-weight:bold; color:white; font-size: 18px;">PragmaVet</span>
+        </div>
+        <div class="sidebar-user"
+            style="margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid rgba(255,255,255,0.1);">
+            <div class="welcome" style="font-size:12px; color:#A0AEC0;">Welcome back,</div>
+            <div class="uname" style="font-weight:bold; color:white; font-size:15px;">
+                <?php echo htmlspecialchars($user_name ?? ''); ?>
+            </div>
+        </div>
+        <a href="dashboard.php"><i class="fa fa-home"></i> Dashboard</a>
+        <a href="appointments.php"><i class="fa fa-calendar-check"></i> Appointments</a>
+        <a href="boarding.php" class="active"><i class="fa fa-hotel"></i> Pet Boarding</a>
+        <a href="pets.php"><i class="fa fa-notes-medical"></i> Profile & Pets</a>
+        <a href="billing.php"><i class="fa fa-file-invoice-dollar"></i> Billing</a>
+        <a href="feedback.php"><i class="fa fa-star"></i> Feedback</a>
+        <a href="settings.php"><i class="fa fa-cog"></i> Account Settings</a>
+        <div class="sidebar-logout" style="margin-top:auto;"><a href="logout.php" class="text-danger"><i
+                    class="fa fa-sign-out-alt"></i> Logout</a></div>
+    </div>
+
+    <div class="main-content">
+        <div class="page-header mb-4 d-flex justify-content-between align-items-center">
+            <div>
+                <h2>Boarding Scheduler</h2>
+                <p class="text-muted mb-0">Select an available date range for any specific cage below.</p>
+            </div>
+            <div class="d-flex align-items-center">
+                <div class="notif-bell" onclick="toggleNotifications()">
+                    <i class="fa fa-bell"></i>
+                    <span class="notif-badge" id="notifBadge" style="display:none;">0</span>
+                    <div class="notif-dropdown" id="notifDropdown">
+
+                        <div class="notif-body" id="notifList">
+                            <div class="text-center text-muted small p-3"></div>
+                        </div>
+                    </div>
+
+                </div>
+
+                <!-- Dark Mode Toggle -->
+                <button class="btn btn-sm btn-outline-secondary ms-3 rounded-circle shadow-sm" id="themeToggle"
+                    style="width: 40px; height: 40px; z-index: 100;">
+                    <i class="fa fa-moon" id="themeIcon"></i>
+                </button>
+            </div>
+        </div>
+
+        <?php
+        $modals_out = "";
+
+        $pending_query = $conn->prepare("SELECT * FROM boarding_reservations WHERE user_id=? AND status IN ('Pending', 'Reschedule Proposed') ORDER BY created_at DESC");
+        $pending_query->bind_param("i", $user_id);
+        $pending_query->execute();
+        $my_pendings = $pending_query->get_result();
+        ?>
+        <?php if ($my_pendings->num_rows > 0): ?>
+            <div class="mb-5 position-relative">
+                <!-- Glow effect behind -->
+                <div class="position-absolute w-100 h-100 rounded-4"
+                    style="background: linear-gradient(45deg, rgba(74, 127, 196,0.15), rgba(30, 90, 168,0.15)); filter: blur(20px); z-index: 0; transform: translateY(10px);">
+                </div>
+
+                <div class="bg-white rounded-4 border shadow-sm position-relative z-1 overflow-hidden"
+                    style="border-color: rgba(74, 127, 196,0.3) !important;">
+                    <div class="px-4 py-3 border-bottom d-flex align-items-center justify-content-between"
+                        style="background: linear-gradient(to right, rgba(30, 90, 168,0.02), transparent);">
+                        <h5 class="fw-bold m-0 d-flex align-items-center" style="color: #1E5AA8;">
+                            <div class="bg-primary bg-opacity-10 rounded-circle d-flex align-items-center justify-content-center me-3"
+                                style="width: 36px; height: 36px;">
+                                <i class="fa fa-bell text-primary fs-6"></i>
+                            </div>
+                            Action Required: Boarding Updates
+                        </h5>
+                        <span class="badge rounded-pill bg-danger shadow-sm px-3 py-2"><i
+                                class="fa fa-exclamation-circle me-1"></i> <?php echo $my_pendings->num_rows; ?>
+                            Pending</span>
+                    </div>
+                    <div class="p-4">
+                        <div class="d-flex flex-column gap-3">
+                            <?php while ($pend = $my_pendings->fetch_assoc()): ?>
+                                <!-- SLEEK ROW -->
+                                <div class="d-flex flex-wrap align-items-center justify-content-between p-3 rounded-4 border"
+                                    style="background: #E6EEF8; transition: all 0.2s ease; <?php echo ($pend['status'] == 'Reschedule Proposed') ? 'border-left: 4px solid #f59f00 !important; cursor:pointer;' : ''; ?>"
+                                    <?php if ($pend['status'] == 'Reschedule Proposed')
+                                        echo 'data-bs-toggle="modal" data-bs-target="#reschedModal_' . $pend['id'] . '"'; ?>
+                                    onmouseover="this.style.transform='translateY(-2px)'; this.style.boxShadow='0 10px 25px rgba(0,0,0,0.05)';"
+                                    onmouseout="this.style.transform='translateY(0)'; this.style.boxShadow='none';">
+
+                                    <div class="d-flex align-items-center gap-4 mb-2 mb-md-0">
+                                        <div class="bg-white border rounded-circle shadow-sm d-flex align-items-center justify-content-center text-primary"
+                                            style="width: 50px; height: 50px;">
+                                            <i class="fa fa-paw fs-5"></i>
+                                        </div>
+                                        <div>
+                                            <h6 class="fw-bold text-dark m-0 mb-1" style="font-size: 16px;">
+                                                <?php echo htmlspecialchars($pend['pet_name']); ?>
+                                            </h6>
+                                            <div class="text-muted small fw-medium d-flex align-items-center gap-2">
+                                                <i class="fa fa-calendar-alt opacity-50"></i>
+                                                <span><?php echo date("M j, Y", strtotime($pend['appointment_date'])); ?></span>
+                                                <i class="fa fa-arrow-right opacity-50 mx-1" style="font-size: 10px;"></i>
+                                                <span><?php echo date("M j, Y", strtotime($pend['end_date'])); ?></span>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div class="d-flex align-items-center gap-4">
+                                        <?php if ($pend['status'] == 'Reschedule Proposed'): ?>
+                                            <div class="text-end me-2">
+                                                <div class="fw-bold text-warning mb-1" style="font-size: 13px;"><i
+                                                        class="fa fa-exclamation-circle me-1"></i> Reschedule Proposed</div>
+                                                <div class="text-muted small" style="font-size: 11px;">Click row to review dates
+                                                </div>
+                                            </div>
+                                            <div class="bg-warning bg-opacity-10 text-warning rounded-circle d-flex align-items-center justify-content-center shadow-sm"
+                                                style="width: 40px; height: 40px;">
+                                                <i class="fa fa-chevron-right"></i>
+                                            </div>
+                                        <?php else: ?>
+                                            <div class="text-end me-2">
+                                                <div class="fw-bold text-secondary mb-1" style="font-size: 13px;"><i
+                                                        class="fa fa-hourglass-half me-1"></i> Waiting for Review</div>
+                                                <div class="text-muted small" style="font-size: 11px;">Pending clinic approval</div>
+                                            </div>
+                                            <form method="POST" onsubmit="return confirm('Cancel this pending request?');"
+                                                class="m-0">
+                                                <input type="hidden" name="apt_id" value="<?php echo $pend['id']; ?>">
+                                                <button type="submit" name="cancel_boarding"
+                                                    class="btn btn-white text-danger border shadow-sm rounded-circle d-flex align-items-center justify-content-center p-0"
+                                                    style="width: 40px; height: 40px; background: white;" title="Cancel Request">
+                                                    <i class="fa fa-times"></i>
+                                                </button>
+                                            </form>
+                                        <?php endif; ?>
+                                    </div>
+                                </div>
+
+                                <?php if ($pend['status'] == 'Reschedule Proposed'): ?>
+                                    <?php $modals_out .= '
+                                <div class="modal fade resched-modal-auto" id="reschedModal_' . $pend['id'] . '" tabindex="-1" data-id="' . $pend['id'] . '">
+                                    <div class="modal-dialog modal-dialog-centered">
+                                        <div class="modal-content border-0 shadow-lg" style="border-radius:20px;">
+                                            <div class="modal-header border-0 pb-0">
+                                                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                                            </div>
+                                            <div class="modal-body p-4 pt-1 text-center">
+                                                <div class="bg-primary bg-opacity-10 rounded-circle d-inline-flex justify-content-center align-items-center mb-3 text-primary" style="width: 70px; height: 70px;">
+                                                    <i class="fa fa-calendar-check" style="font-size:30px;"></i>
+                                                </div>
+                                                <h4 class="fw-bold text-dark mb-1">Reschedule Proposal</h4>
+                                                <p class="text-muted small mb-4">The clinic has proposed a new schedule for <b>' . htmlspecialchars($pend['pet_name']) . '</b>.</p>
+                                                
+                                                <div class="p-3 mb-4 bg-danger bg-opacity-10 text-dark border border-danger border-opacity-25 rounded text-start" style="font-size:14px;">
+                                                    <b class="text-danger"><i class="fa fa-exclamation-triangle"></i> Reason for Change:</b> <br>
+                                                    <span>' . htmlspecialchars($pend['admin_message'] ?? '') . '</span>
+                                                    <hr class="my-2 border-danger opacity-25">
+                                                    <div class="d-flex justify-content-between">
+                                                        <div><span class="text-muted small">New Check-in</span><br><b>' . date("M d, Y", strtotime($pend['proposed_reschedule_date'])) . '</b></div>
+                                                        <div class="text-end"><span class="text-muted small">New Check-out</span><br><b>' . date("M d, Y", strtotime($pend['proposed_reschedule_end_date'])) . '</b></div>
+                                                    </div>
+                                                </div>
+                                                
+                                                <div class="d-flex w-100 gap-2 mt-2">
+                                                    <form method="POST" class="flex-grow-1 m-0">
+                                                        <input type="hidden" name="reschedule_apt_id" value="' . $pend['id'] . '">
+                                                        <button type="submit" name="accept_reschedule_boarding" class="btn btn-primary w-100 fw-bold rounded-pill pt-2 pb-2" onclick="return confirm(\'Accept the proposed reschedule dates?\');">
+                                                            <i class="fa fa-check"></i> Accept
+                                                        </button>
+                                                    </form>
+                                                    <form method="POST" class="flex-grow-1 m-0">
+                                                        <input type="hidden" name="reschedule_apt_id" value="' . $pend['id'] . '">
+                                                        <button type="submit" name="decline_reschedule_boarding" class="btn btn-outline-danger w-100 fw-bold rounded-pill pt-2 pb-2" onclick="return confirm(\'Decline this proposal and completely Cancel?\');">
+                                                            <i class="fa fa-times"></i> Decline
+                                                        </button>
+                                                    </form>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>'; ?>
+                                <?php endif; ?>
+
+                            <?php endwhile; ?>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        <?php endif; ?>
+
+
+
+        <!-- CAGE MATRIX -->
+        <div class="row g-4 mb-5">
+            <?php
+            $today_str = date("Y-m-d");
+            $today_time = strtotime($today_str);
+
+            for ($i = 1; $i <= $cage_count; $i++):
+                $currently_occupied_by = null;
+                if (!empty($cages[$i])) {
+                    foreach ($cages[$i] as $b) {
+                        if (strtotime($b['appointment_date']) <= $today_time && strtotime($b['end_date']) > $today_time) {
+                            $currently_occupied_by = [
+                                'pet_name' => $b['pet_name'],
+                                'user_id' => $b['user_id'],
+                                'res_id' => $b['id'],
+                                'cctv_link' => $b['cctv_link'] ?? '',
+                                'cctv_enabled' => $b['cctv_enabled'] ?? 0,
+                                'status' => $b['status']
+                            ];
+                            break;
+                        }
+                    }
+                }
+                ?>
+                <div class="col-xl-4 col-md-6">
+                    <div class="card border-0 shadow-sm rounded-4 h-100 overflow-hidden <?php echo $currently_occupied_by ? ($currently_occupied_by['user_id'] == $user_id ? 'border-primary' : 'border-danger') : 'border-success'; ?>"
+                        style="border-top: 4px solid <?php echo $currently_occupied_by ? ($currently_occupied_by['user_id'] == $user_id ? '#1E5AA8' : '#dc3545') : '#198754'; ?> !important;">
+                        <div
+                            class="card-header bg-white border-0 pt-4 pb-2 d-flex justify-content-between align-items-center">
+                            <h5 class="fw-bold mb-0 text-dark">Cage 0<?php echo $i; ?></h5>
+                            <button class="btn btn-sm btn-primary rounded-pill px-3 shadow-sm fw-bold"
+                                data-bs-toggle="modal" data-bs-target="#bookCageModal"
+                                data-cage="<?php echo $i; ?>">Reserve</button>
+                        </div>
+                        <div class="card-body">
+                            <?php if ($currently_occupied_by): ?>
+                                <?php if ($currently_occupied_by['user_id'] == $user_id): ?>
+                                    <div
+                                        class="p-3 bg-primary bg-opacity-10 border border-primary border-opacity-25 rounded-3 mb-3 text-center">
+                                        <?php if (!empty($currently_occupied_by['cctv_link']) && $currently_occupied_by['cctv_enabled'] == 1): ?>
+                                            <button class="btn btn-sm btn-danger px-3 rounded-pill shadow-sm fw-bold mb-2 pulse-danger"
+                                                onclick="openCctvModal('<?php echo htmlspecialchars($currently_occupied_by['cctv_link']); ?>', '<?php echo htmlspecialchars($currently_occupied_by['pet_name']); ?>', '<?php echo $currently_occupied_by['res_id']; ?>')"><i
+                                                    class="fa fa-video me-1"></i> Watch Live</button>
+                                        <?php endif; ?>
+                                        <h6 class="fw-bold text-primary m-0"><i
+                                                class="fa fa-paw me-2"></i><?php echo htmlspecialchars($currently_occupied_by['pet_name']); ?>
+                                        </h6>
+                                    </div>
+                                <?php else: ?>
+                                    <div
+                                        class="p-3 bg-danger bg-opacity-10 border border-danger border-opacity-25 rounded-3 mb-3 text-center text-danger">
+                                        <i class="fa fa-lock fa-2x mb-2 opacity-75"></i>
+                                        <h6 class="fw-bold m-0 text-uppercase tracking-wider">OCCUPIED</h6>
+                                        <div class="small opacity-75">Unavailable</div>
+                                    </div>
+                                <?php endif; ?>
+                            <?php else: ?>
+                                <div
+                                    class="p-3 bg-success bg-opacity-10 border border-success border-opacity-25 rounded-3 mb-3 text-center text-success">
+                                    <i class="fa fa-door-open fa-2x mb-2 opacity-75"></i>
+                                    <h6 class="fw-bold m-0 text-uppercase tracking-wider">EMPTY TODAY</h6>
+                                </div>
+                            <?php endif; ?>
+
+                            <div class="small fw-bold text-muted text-uppercase mb-2"
+                                style="font-size:11px; letter-spacing:0.5px;"><i class="fa fa-calendar-alt me-1"></i>
+                                CURRENT SCHEDULE</div>
+
+                            <?php
+                            $has_schedule = false;
+                            if (!empty($cages[$i])):
+                                foreach ($cages[$i] as $b):
+                                    if (strtotime($b['end_date']) > $today_time):
+                                        $has_schedule = true;
+                                        if ($b['user_id'] == $user_id):
+                                            ?>
+                                            <div
+                                                class="p-2 border rounded-3 mb-2 bg-light d-flex justify-content-between align-items-center"
+                                                style="cursor:pointer; transition: .2s;"
+                                                onmouseover="this.style.background='#f8fafc'; this.style.borderColor='#cbd5e1';"
+                                                onmouseout="this.style.background='#f8fafc'; this.style.borderColor='#e2e8f0';"
+                                                onclick="openBoardingDetail(<?php echo htmlspecialchars(json_encode($b), ENT_QUOTES); ?>)">
+                                                <div>
+                                                    <div class="fw-bold text-dark small"><i
+                                                            class="fa fa-paw text-primary me-1"></i><?php echo htmlspecialchars($b['pet_name']); ?>
+                                                    </div>
+                                                    <div class="text-muted" style="font-size:10px;">
+                                                        <?php echo date("M d", strtotime($b['appointment_date'])); ?> -
+                                                        <?php echo date("M d", strtotime($b['end_date'])); ?>
+                                                    </div>
+                                                </div>
+                                                <span
+                                                    class="badge bg-<?php 
+                                                        echo match($b['status']) {
+                                                            'Approved' => 'success',
+                                                            'Pending' => 'warning',
+                                                            'Reschedule Requested' => 'primary',
+                                                            'Reschedule Proposed' => 'info',
+                                                            default => 'secondary'
+                                                        };
+                                                    ?> rounded-pill"
+                                                    style="font-size:10px;"><?php echo $b['status']; ?></span>
+                                            </div>
+                                        <?php else: ?>
+                                            <div
+                                                class="p-2 border border-danger border-opacity-25 rounded-3 mb-2 bg-danger bg-opacity-10 d-flex justify-content-between align-items-center text-danger">
+                                                <div>
+                                                    <div class="small fw-medium"><i class="fa fa-lock me-1"></i> Reserved Period</div>
+                                                    <div class="opacity-75" style="font-size:10px;">
+                                                        <?php echo date("M d", strtotime($b['appointment_date'])); ?> -
+                                                        <?php echo date("M d", strtotime($b['end_date'])); ?>
+                                                    </div>
+                                                </div>
+                                                <span class="small fw-bold" style="font-size:10px;">Private</span>
+                                            </div>
+                                        <?php endif;
+                                    endif;
+                                endforeach;
+                            endif;
+                            if (!$has_schedule):
+                                ?>
+                                <div class="text-center p-3 text-muted border border-dashed rounded-3 mt-2">
+                                    <i class="fa fa-inbox mb-2 opacity-50"></i>
+                                    <div class="small">Completely Available</div>
+                                </div>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                </div>
+            <?php endfor; ?>
+        </div>
+
+
+    </div> <!-- Close Main Container -->
+
+    <?php echo $modals_out; ?>
+
+    <!-- BOARDING DETAIL MODAL -->
+    <div class="modal fade" id="boardingDetailModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content border-0 shadow-lg" style="border-radius:20px;">
+                <div class="modal-header border-0 pb-0 px-4 pt-4">
+                    <h5 class="fw-bold"><i class="fa fa-info-circle text-primary me-2"></i> Reservation Details</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <div class="d-flex align-items-center gap-3 mb-4">
+                        <div class="bg-primary bg-opacity-10 rounded-circle d-flex align-items-center justify-content-center text-primary" style="width:50px; height:50px;">
+                            <i class="fa fa-paw fs-4"></i>
+                        </div>
+                        <div>
+                            <h5 class="fw-bold m-0" id="detPetName">Pet Name</h5>
+                            <div class="d-flex align-items-center gap-2">
+                                <span class="badge rounded-pill" id="detStatus">Status</span>
+                                <span class="text-muted small" style="font-size:11px;"><i class="fa fa-clock me-1"></i> Booked on <span id="detCreated">Date</span></span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row g-3 mb-4">
+                        <div class="col-6">
+                            <div class="p-3 bg-light rounded-3">
+                                <div class="text-muted small fw-bold text-uppercase" style="font-size:10px;">Check-in</div>
+                                <div class="fw-bold text-dark" id="detCheckIn">Date</div>
+                            </div>
+                        </div>
+                        <div class="col-6">
+                            <div class="p-3 bg-light rounded-3">
+                                <div class="text-muted small fw-bold text-uppercase" style="font-size:10px;">Check-out</div>
+                                <div class="fw-bold text-dark" id="detCheckOut">Date</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="d-grid gap-2" id="boardingActionArea">
+                        <!-- Buttons injected via JS -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- BOARDING RESCHEDULE MODAL -->
+    <div class="modal fade" id="boardingRescheduleModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content border-0 shadow-lg" style="border-radius:20px;">
+                <div class="modal-header border-0 px-4 pt-4">
+                    <h5 class="fw-bold"><i class="fa fa-sync text-primary me-2"></i> Instant Reschedule</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <form method="POST">
+                    <div class="modal-body p-4 pt-0">
+                        <p class="text-muted small mb-4">You can instantly change your pet's stay dates. <b>No additional fees</b> and <b>no clinic approval</b> required.</p>
+                        
+                        <input type="hidden" name="apt_id" id="reschedAptId">
+                        
+                        <div class="mb-3">
+                            <label class="form-label small fw-bold">NEW CHECK-IN DATE</label>
+                            <input type="text" name="new_start_date" id="reschedStart" class="form-control" required placeholder="Select date">
+                        </div>
+                        
+                        <div class="mb-3">
+                            <label class="form-label small fw-bold">NEW CHECK-OUT DATE</label>
+                            <input type="text" name="new_end_date" id="reschedEnd" class="form-control" required placeholder="Select date">
+                        </div>
+                    </div>
+                    <div class="modal-footer border-0 p-4 pt-0">
+                        <button type="button" class="btn btn-light rounded-pill px-4 fw-bold" data-bs-toggle="modal" data-bs-target="#boardingDetailModal">Back</button>
+                        <button type="submit" name="reschedule_boarding_request" class="btn btn-primary rounded-pill px-4 fw-bold">Confirm New Dates</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- BOOK CAGE MODAL -->
+    <div class="modal fade" id="bookCageModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable">
+            <div class="modal-content border-0 shadow-lg" style="border-radius:24px; overflow:hidden;">
+                <div class="modal-header border-0 pt-4 px-4 pb-0"
+                    style="background:linear-gradient(135deg,#0f172a,#1E5AA8);">
+                    <div>
+                        <h5 class="fw-bold mb-0 text-white d-flex align-items-center gap-2">
+                            <i class="fa fa-hotel"></i> Reserve a Cage
+                        </h5>
+                        <div class="text-white opacity-75 small mt-1">â‚±800 / day &middot; Secure via PayMongo</div>
+                    </div>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body p-4" style="max-height:75vh;overflow-y:auto;">
+                    <form method="POST" id="bookForm" action="boarding.php">
+                        <input type="hidden" name="cage_number" id="modalCageId">
+                        <input type="hidden" name="payment_type" id="paymentType" value="downpayment">
+
+                        <div class="mb-3">
+                            <label class="form-label text-muted small fw-bold text-uppercase">Select Pet</label>
+                            <select name="pet_name" class="form-select border-0 bg-light p-3 rounded-3 shadow-sm"
+                                required>
+                                <option value="">Choose pet...</option>
+                                <?php
+                                $pets_result->data_seek(0);
+                                while ($p = $pets_result->fetch_assoc())
+                                    echo "<option value=\"" . htmlspecialchars($p['name']) . "\">" . htmlspecialchars($p['name']) . "</option>";
+                                ?>
+                            </select>
+                        </div>
+
+                        <div class="row g-3 mb-3">
+                            <div class="col-6">
+                                <label class="form-label text-muted small fw-bold text-uppercase">Check-In</label>
+                                <input type="text" name="appointment_date" id="checkinDate"
+                                    class="form-control border-0 bg-light p-3 rounded-3 shadow-sm" required
+                                    placeholder="Select date">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label text-muted small fw-bold text-uppercase">Check-Out</label>
+                                <input type="text" name="end_date" id="checkoutDate"
+                                    class="form-control border-0 bg-light p-3 rounded-3 shadow-sm" required
+                                    placeholder="Select date">
+                            </div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label text-muted small fw-bold text-uppercase">Special Instructions /
+                                Diet</label>
+                            <textarea name="special_instructions"
+                                class="form-control border-0 bg-light p-3 rounded-3 shadow-sm" rows="2"
+                                placeholder="Optional notes for our caretakers..."></textarea>
+                        </div>
+
+                        <!-- PRICE CALCULATOR -->
+                        <div id="priceBox" class="rounded-3 p-3 mb-4"
+                            style="background:#f0f6ff;border:1px solid #c7d9f5;display:none;">
+                            <div class="d-flex justify-content-between mb-1 small">
+                                <span class="text-muted">Duration</span>
+                                <span class="fw-bold" id="calcDays">â€” days</span>
+                            </div>
+                            <div class="d-flex justify-content-between mb-1 small">
+                                <span class="text-muted">Rate</span>
+                                <span class="fw-bold">â‚±800 / day</span>
+                            </div>
+                            <div class="d-flex justify-content-between mb-1 small">
+                                <span class="text-muted">Total</span>
+                                <span class="fw-bold text-dark" id="calcTotal">â‚±0.00</span>
+                            </div>
+                            <hr class="my-2">
+                            <div class="d-flex justify-content-between small">
+                                <span class="text-muted">30% Downpayment <span class="badge"
+                                        style="background:#fee2e2;color:#991b1b;font-size:9px;">Non-Refundable</span></span>
+                                <span class="fw-bold text-primary" id="calcDP">â‚±0.00</span>
+                            </div>
+                        </div>
+
+                        <!-- PAYMENT BUTTONS -->
+                        <div id="payButtons" style="display:none;">
+                            <div class="d-flex align-items-center gap-2 mb-3 px-1">
+                                <span
+                                    style="font-size:10px;background:#fef3c7;color:#92400e;padding:3px 10px;border-radius:20px;font-weight:700;text-transform:uppercase;">
+                                    <i class="fa fa-flask me-1"></i>Demo Mode
+                                </span>
+                                <span class="text-muted" style="font-size:11px;">No real money charged</span>
+                            </div>
+                            <div class="d-grid gap-2">
+                                <button type="button" id="btnPayDP"
+                                    class="btn btn-primary rounded-pill py-3 fw-bold shadow"
+                                    onclick="submitPayment('downpayment')">
+                                    <i class="fa fa-shield-halved me-2"></i>Pay 30% Downpayment via GCash / Maya / Card
+                                </button>
+                                <button type="button" id="btnPayFull"
+                                    class="btn btn-outline-primary rounded-pill py-3 fw-bold"
+                                    onclick="submitPayment('full')">
+                                    <i class="fa fa-credit-card me-2"></i>Pay Full Amount via GCash / Maya / Card
+                                </button>
+                            </div>
+                            <div class="text-center mt-2" style="font-size:11px;color:#94a3b8;">
+                                <i class="fa fa-lock me-1"></i>Secured by PayMongo &middot; GCash &middot; Maya &middot;
+                                Card
+                            </div>
+                        </div>
+
+                        <!-- Hidden submit for form action -->
+                        <button type="submit" name="book_cage" id="realSubmitBtn" style="display:none;"></button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+
+
+    <!-- CCTV MODAL -->
+    <div class="modal fade" id="cctvModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content border-0 shadow-lg" style="border-radius: 24px; overflow: hidden;">
+                <div class="modal-header border-0 pt-4 px-4 pb-2"
+                    style="background: linear-gradient(135deg, #1e293b, #1E5AA8);">
+                    <h5 class="modal-title fw-bold text-white d-flex align-items-center gap-2" id="cctvModalTitle">
+                        <i class="fa fa-video"></i> Live Feed
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"
+                        aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-3">
+                    <div id="cctvStreamContainer" class="rounded-3 overflow-hidden shadow-inner"
+                        style="background: #000; min-height: 400px;">
+                        <!-- Content injected via JS -->
+                    </div>
+                </div>
+                <div class="modal-footer border-0 p-3 pt-0">
+                    <button type="button" class="btn btn-light rounded-pill px-4 fw-bold" data-bs-dismiss="modal">Close
+                        Monitor</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+
+    <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+    <script>
+        // Theme toggle logic
+        const themeToggle = document.getElementById('themeToggle');
+        const themeIcon = document.getElementById('themeIcon');
+        const body = document.body;
+
+        if (localStorage.getItem('theme') === 'dark') {
+            body.classList.add('dark-mode');
+            themeIcon.classList.replace('fa-moon', 'fa-sun');
+        }
+
+        themeToggle.addEventListener('click', () => {
+            body.classList.toggle('dark-mode');
+            if (body.classList.contains('dark-mode')) {
+                localStorage.setItem('theme', 'dark');
+                themeIcon.classList.replace('fa-moon', 'fa-sun');
+            } else {
+                localStorage.setItem('theme', 'light');
+                themeIcon.classList.replace('fa-sun', 'fa-moon');
+            }
+        });
+
+        // Setup Flatpickr disable arrays from PHP
+        const disabledDatesData = <?php echo json_encode($flatpickr_disable); ?>;
+
+        let fpCheckIn = null;
+        let fpCheckOut = null;
+
+        document.getElementById('bookCageModal').addEventListener('show.bs.modal', function (event) {
+            var button = event.relatedTarget;
+            var cage = button ? button.getAttribute('data-cage') : '';
+            document.getElementById('modalCageId').value = cage;
+            document.getElementById('priceBox').style.display = 'none';
+            document.getElementById('payButtons').style.display = 'none';
+
+            let disableArr = disabledDatesData[cage] || [];
+
+            if (fpCheckIn) fpCheckIn.destroy();
+            if (fpCheckOut) fpCheckOut.destroy();
+
+            fpCheckIn = flatpickr("#checkinDate", {
+                minDate: "today",
+                disable: disableArr,
+                dateFormat: "Y-m-d",
+                onChange: function (selectedDates) {
+                    if (selectedDates.length > 0) {
+                        let minOut = new Date(selectedDates[0]);
+                        minOut.setDate(minOut.getDate() + 1);
+                        fpCheckOut.set("minDate", minOut);
+                    }
+                    updatePrice();
+                }
+            });
+
+            fpCheckOut = flatpickr("#checkoutDate", {
+                minDate: new Date().fp_incr(1),
+                disable: disableArr,
+                dateFormat: "Y-m-d",
+                onChange: function () { updatePrice(); }
+            });
+        });
+
+        function updatePrice() {
+            var cin = document.getElementById('checkinDate').value;
+            var cout = document.getElementById('checkoutDate').value;
+            if (!cin || !cout) return;
+            var diff = (new Date(cout) - new Date(cin)) / 86400000;
+            var days = Math.max(1, Math.round(diff));
+            if (days <= 0) return;
+            var total = days * 800;
+            var dp = Math.round(total * 0.30 * 100) / 100;
+            document.getElementById('calcDays').textContent = days + ' day' + (days > 1 ? 's' : '');
+            document.getElementById('calcTotal').textContent = 'â‚±' + total.toLocaleString('en-PH', { minimumFractionDigits: 2 });
+            document.getElementById('calcDP').textContent = 'â‚±' + dp.toLocaleString('en-PH', { minimumFractionDigits: 2 });
+            document.getElementById('btnPayDP').textContent = '';
+            document.getElementById('btnPayDP').innerHTML = '<i class="fa fa-shield-halved me-2"></i>Pay Downpayment â‚±' + dp.toLocaleString('en-PH', { minimumFractionDigits: 2 }) + ' (30%) via PayMongo';
+            document.getElementById('btnPayFull').innerHTML = '<i class="fa fa-credit-card me-2"></i>Pay Full â‚±' + total.toLocaleString('en-PH', { minimumFractionDigits: 2 }) + ' via PayMongo';
+            document.getElementById('priceBox').style.display = 'block';
+            document.getElementById('payButtons').style.display = 'block';
+        }
+
+        function submitPayment(type) {
+            document.getElementById('paymentType').value = type;
+            document.getElementById('realSubmitBtn').click();
+        }
+
+
+        // CCTV Modal Logic
+        var cctvModal = null;
+        function openCctvModal(link, petName, resId) {
+            document.getElementById('cctvModalTitle').innerText = 'Live Feed: ' + petName;
+
+            // Auto-normalize: bare port URL (IP Webcam style) â†’ append /video for direct MJPEG stream
+            if (/:(8080|4747|8000|8888|1234)\/?$/.test(link)) {
+                link = link.replace(/\/?$/, '/video');
+            }
+
+            // Detect MJPEG stream
+            var isMjpeg = link.indexOf('/video') !== -1
+                || link.indexOf('.mjpg') !== -1
+                || link.indexOf('.cgi') !== -1
+                || link.indexOf('mjpeg') !== -1
+                || link.indexOf('videofeed') !== -1;
+
+            var container = document.getElementById('cctvStreamContainer');
+
+            // Build stream element
+            var streamInner = '';
+            if (isMjpeg) {
+                streamInner = '<img src="' + link + '" alt="Live Camera Feed" style="display:block;width:100%;height:100%;object-fit:contain;">';
+            } else {
+                streamInner = '<iframe src="' + link + '" frameborder="0" scrolling="no" allow="accelerometer; autoplay; encrypted-media; gyroscope; picture-in-picture" allowfullscreen style="display:block;width:100%;height:100%;border:0;overflow:hidden;"></iframe>';
+            }
+
+            // Build same layout as admin viewer
+            container.innerHTML = '<div style="width:100%;height:50vh;background:#000;border-radius:10px;overflow:hidden;display:flex;align-items:center;justify-content:center;">' + streamInner + '</div>'
+                + '<div class="d-flex gap-2 mt-2">'
+
+                + '<a href="camera_view.php?id=' + resId + '" target="_blank" class="btn btn-danger btn-sm flex-fill fw-bold"><i class="fa fa-expand me-1"></i> Fullscreen</a>'
+                + '</div>';
+
+            if (!cctvModal) {
+                cctvModal = new bootstrap.Modal(document.getElementById('cctvModal'));
+            }
+            cctvModal.show();
+        }
+        function closeCctvModal() {
+            document.getElementById('cctvStreamContainer').innerHTML = ''; // Stop video/stream
+        }
+
+        // Boarding Detail Logic
+        let boardingDetailModal = null;
+        let boardingRescheduleModal = null;
+        let reschedFpStart = null;
+        let reschedFpEnd = null;
+
+        function openBoardingDetail(data) {
+            document.getElementById('detPetName').innerText = data.pet_name;
+            document.getElementById('detCheckIn').innerText = new Date(data.appointment_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+            document.getElementById('detCheckOut').innerText = new Date(data.end_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+            document.getElementById('detCreated').innerText = new Date(data.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+            
+            const badge = document.getElementById('detStatus');
+            badge.innerText = data.status;
+            badge.className = 'badge rounded-pill ' + (data.status === 'Approved' ? 'bg-success' : (data.status === 'Pending' ? 'bg-warning text-dark' : 'bg-primary'));
+
+            const actionArea = document.getElementById('boardingActionArea');
+            actionArea.innerHTML = '';
+            
+            const today = new Date();
+            today.setHours(0,0,0,0);
+            const startDate = new Date(data.appointment_date);
+            startDate.setHours(0,0,0,0);
+
+            if (startDate > today && (data.status === 'Approved' || data.status === 'Pending')) {
+                actionArea.innerHTML = `
+                    <button class="btn btn-primary rounded-pill py-3 fw-bold" onclick="openBoardingReschedule(${data.id}, ${data.cage_number})">
+                        <i class="fa fa-sync me-2"></i> Instant Reschedule
+                    </button>
+                    <p class="text-center text-muted small mt-2 m-0">Instant update & free of charge</p>
+                `;
+            } else if (startDate <= today) {
+                actionArea.innerHTML = `
+                    <div class="alert alert-secondary border-0 rounded-4 small text-center mb-0">
+                        <i class="fa fa-lock me-1"></i> Rescheduling is disabled for stays starting today or already in progress.
+                    </div>
+                `;
+            }
+
+            if (!boardingDetailModal) boardingDetailModal = new bootstrap.Modal(document.getElementById('boardingDetailModal'));
+            boardingDetailModal.show();
+        }
+
+        function openBoardingReschedule(id, cage) {
+            if (boardingDetailModal) boardingDetailModal.hide();
+            
+            document.getElementById('reschedAptId').value = id;
+            
+            let disableArr = disabledDatesData[cage] || [];
+            
+            if (reschedFpStart) reschedFpStart.destroy();
+            if (reschedFpEnd) reschedFpEnd.destroy();
+
+            reschedFpStart = flatpickr("#reschedStart", {
+                minDate: "today",
+                disable: disableArr,
+                dateFormat: "Y-m-d",
+                onChange: function(selectedDates) {
+                    if (selectedDates.length > 0) {
+                        let minOut = new Date(selectedDates[0]);
+                        minOut.setDate(minOut.getDate() + 1);
+                        reschedFpEnd.set("minDate", minOut);
+                    }
+                }
+            });
+
+            reschedFpEnd = flatpickr("#reschedEnd", {
+                minDate: new Date().fp_incr(1),
+                disable: disableArr,
+                dateFormat: "Y-m-d"
+            });
+
+            if (!boardingRescheduleModal) boardingRescheduleModal = new bootstrap.Modal(document.getElementById('boardingRescheduleModal'));
+            boardingRescheduleModal.show();
+        }
+
+        document.getElementById('cctvModal').addEventListener('hidden.bs.modal', function () {
+            closeCctvModal();
+        });
+    </script>
+    <script src="mousetrail.js"></script>
+</body>

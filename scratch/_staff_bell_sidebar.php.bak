@@ -1,0 +1,124 @@
+<?php
+/**
+ * Vet staff notifications: sidebar item with unread badge + slide-in panel.
+ * Uses api_notifications.php (fetch / mark_one / mark_read). Included inside the staff sidebar.
+ */
+$sbell_uid = (int)($_SESSION['user_id'] ?? 0);
+$sbell_unread = (int)($conn->query("SELECT COUNT(*) c FROM notifications WHERE user_id = $sbell_uid AND is_read = 0")->fetch_assoc()['c'] ?? 0);
+?>
+<a href="#" id="sbellLink" onclick="sbellToggle(event)">
+    <i class="fa fa-bell"></i> <span>Notifications</span>
+    <span class="sb-badge" id="sbellBadge" style="background:#ef4444;<?= $sbell_unread ? '' : 'display:none;' ?>"><?= $sbell_unread ?></span>
+</a>
+
+<div class="sbell-backdrop" id="sbellBackdrop" onclick="sbellClose()"></div>
+<aside class="sbell-panel" id="sbellPanel" aria-label="Notifications">
+    <div class="sbell-head">
+        <div><h6>Notifications</h6><div class="sbell-sub" id="sbellSub">Loading…</div></div>
+        <div class="d-flex gap-2 align-items-center">
+            <button type="button" class="sbell-mark" onclick="sbellMarkAll()" title="Mark all as read"><i class="fa fa-check-double me-1"></i>Mark all read</button>
+            <button type="button" class="sbell-x" onclick="sbellClose()" title="Close"><i class="fa fa-xmark"></i></button>
+        </div>
+    </div>
+    <div class="sbell-list" id="sbellList"></div>
+</aside>
+
+<style>
+    .sbell-backdrop { position:fixed; inset:0; background:rgba(15,23,42,.25); z-index:1990; opacity:0; pointer-events:none; transition:opacity .2s; }
+    .sbell-backdrop.open { opacity:1; pointer-events:auto; }
+    .sbell-panel { position:fixed; top:0; left:260px; width:380px; max-width:calc(100vw - 260px); height:100vh; background:#fff; z-index:2000; box-shadow:12px 0 40px rgba(15,23,42,.15);
+                   transform:translateX(-12px); opacity:0; pointer-events:none; transition:transform .22s ease, opacity .22s ease; display:flex; flex-direction:column; border-right:1px solid #eef2f6; }
+    .sbell-panel.open { transform:none; opacity:1; pointer-events:auto; }
+    .sbell-head { padding:20px 18px 14px; border-bottom:1px solid #f1f5f9; display:flex; justify-content:space-between; align-items:flex-start; gap:10px; }
+    .sbell-head h6 { font-weight:800; font-size:17px; color:#0f172a; margin:0; }
+    .sbell-sub { font-size:12px; color:#64748b; margin-top:2px; }
+    .sbell-mark { border:none; background:#eff6ff !important; color:#2563eb !important; font-size:12px; font-weight:700; border-radius:999px; padding:6px 11px; box-shadow:none !important; white-space:nowrap; }
+    .sbell-x { border:none; background:#f1f5f9 !important; color:#64748b !important; width:30px; height:30px; border-radius:50%; display:flex; align-items:center; justify-content:center; padding:0; box-shadow:none !important; }
+    .sbell-list { flex:1; overflow-y:auto; padding:8px; }
+    .sbell-item { display:flex; gap:11px; padding:12px; border-radius:14px; cursor:pointer; transition:background .15s; position:relative; }
+    .sbell-item:hover { background:#f8fafc; }
+    .sbell-item.unread { background:#f5f9ff; }
+    .sbell-item.unread::after { content:''; position:absolute; top:16px; right:12px; width:8px; height:8px; border-radius:50%; background:#2563eb; }
+    .sbell-ic { width:36px; height:36px; border-radius:11px; display:flex; align-items:center; justify-content:center; flex-shrink:0; font-size:14px; }
+    .sbell-msg { font-size:13px; color:#334155; line-height:1.4; padding-right:14px; }
+    .sbell-item.unread .sbell-msg { color:#0f172a; font-weight:600; }
+    .sbell-time { font-size:11.5px; color:#94a3b8; margin-top:3px; }
+    .sbell-empty { text-align:center; color:#94a3b8; padding:50px 20px; font-size:13px; }
+    .sbell-empty i { font-size:34px; opacity:.35; display:block; margin-bottom:10px; }
+    @media (max-width: 768px) { .sbell-panel { left:0; max-width:100vw; width:100%; } }
+</style>
+<script>
+(function () {
+    var open = false, data = [];
+    function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+    function plain(html) { var d = document.createElement('div'); d.innerHTML = html || ''; return d.textContent || ''; }
+    function ago(ts) {
+        var d = new Date(String(ts).replace(' ', 'T')), s = (Date.now() - d.getTime()) / 1000;
+        if (isNaN(s)) return '';
+        if (s < 60) return 'Just now';
+        if (s < 3600) return Math.floor(s / 60) + ' min ago';
+        if (s < 86400) return Math.floor(s / 3600) + ' h ago';
+        if (s < 172800) return 'Yesterday';
+        return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    }
+    function kind(t) {
+        t = t.toLowerCase();
+        if (t.indexOf('boarding') > -1) return ['fa-hotel', '#0891b2'];
+        if (t.indexOf('declined') > -1 || t.indexOf('cancel') > -1) return ['fa-circle-xmark', '#dc2626'];
+        if (t.indexOf('paid') > -1 || t.indexOf('fee') > -1) return ['fa-coins', '#16a34a'];
+        if (t.indexOf('stock') > -1 || t.indexOf('report') > -1) return ['fa-boxes-stacked', '#ea580c'];
+        if (t.indexOf('accepted') > -1) return ['fa-circle-check', '#16a34a'];
+        if (t.indexOf('new appointment') > -1 || t.indexOf('reschedule') > -1) return ['fa-calendar-plus', '#2563eb'];
+        return ['fa-bell', '#7c3aed'];
+    }
+    function setBadge(n) {
+        var b = document.getElementById('sbellBadge'); b.textContent = n; b.style.display = n > 0 ? '' : 'none';
+        document.getElementById('sbellSub').textContent = n > 0 ? n + ' unread' : 'You’re all caught up';
+    }
+    function render() {
+        var box = document.getElementById('sbellList');
+        if (!data.length) { box.innerHTML = '<div class="sbell-empty"><i class="fa fa-bell-slash"></i>No notifications yet.</div>'; return; }
+        box.innerHTML = data.map(function (n, i) {
+            var t = plain(n.message), k = kind(t);
+            return '<div class="sbell-item' + (n.is_read == 0 ? ' unread' : '') + '" data-i="' + i + '">'
+                 + '<div class="sbell-ic" style="background:' + k[1] + '14;color:' + k[1] + ';"><i class="fa ' + k[0] + '"></i></div>'
+                 + '<div><div class="sbell-msg">' + esc(t) + '</div><div class="sbell-time">' + ago(n.created_at) + '</div></div></div>';
+        }).join('');
+        box.querySelectorAll('.sbell-item').forEach(function (el) {
+            el.onclick = function () {
+                var n = data[+el.dataset.i];
+                fetch('api_notifications.php?action=mark_one&id=' + encodeURIComponent(n.id)).finally(function () {
+                    if (n.link) location.href = n.link; else { n.is_read = 1; render(); load(); }
+                });
+            };
+        });
+    }
+    function load() {
+        return fetch('api_notifications.php?action=fetch').then(function (r) { return r.json(); }).then(function (d) {
+            if (!d || !d.notifications) return;
+            data = d.notifications; setBadge(parseInt(d.unread_count, 10) || 0);
+            if (open) render();
+        }).catch(function () {});
+    }
+    window.sbellToggle = function (e) { e.preventDefault(); open ? sbellClose() : sbellOpen(); };
+    window.sbellOpen = function () {
+        open = true; render();
+        document.getElementById('sbellPanel').classList.add('open');
+        document.getElementById('sbellBackdrop').classList.add('open');
+        document.getElementById('sbellLink').classList.add('active');
+        load();
+    };
+    window.sbellClose = function () {
+        open = false;
+        document.getElementById('sbellPanel').classList.remove('open');
+        document.getElementById('sbellBackdrop').classList.remove('open');
+        document.getElementById('sbellLink').classList.remove('active');
+    };
+    window.sbellMarkAll = function () {
+        fetch('api_notifications.php?action=mark_read').finally(function () { data.forEach(function (n) { n.is_read = 1; }); setBadge(0); render(); });
+    };
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && open) sbellClose(); });
+    load();
+    setInterval(load, 30000);
+})();
+</script>

@@ -1,0 +1,1410 @@
+<?php
+if (session_status() === PHP_SESSION_NONE) { session_start(); }
+include("dbconnection.php");
+include_once("includes/boarding_billing.php");
+include_once("paymongo_config.php");
+
+// ── AUTH ───────────────────────────────────────────────────────────────────
+if (!isset($_SESSION['user_id'])) {
+    header("Location: index.php"); exit();
+}
+$user_id   = $_SESSION['user_id'];
+$user_role = $_SESSION['role'] ?? ($_SESSION['user_role'] ?? '');
+$user_name = $_SESSION['user'] ?? 'Staff';
+
+// Only staff and admin allowed here; owner → owner_dashboard, doctor → doctor.php
+if (!in_array($user_role, ['staff', 'admin', 'clinic_owner', 'owner'])) {
+    header("Location: dashboard.php"); exit();
+}
+$is_admin    = in_array($user_role, ['admin', 'clinic_owner', 'owner']);
+$can_manage  = ($user_role === 'staff'); // staff manages; admin views only
+
+// ── Live camera helpers: can the client watch this stay right now? ─────────
+function sb_stay($conn, $id) {
+    $id = (int)$id;
+    return $conn->query("SELECT id, user_id, pet_name, status, appointment_date, end_date, cage_number, cctv_link, cctv_enabled FROM boarding_reservations WHERE id = $id")->fetch_assoc();
+}
+function sb_is_live($r) {
+    if (!$r || trim((string)$r['cctv_link']) === '' || (int)$r['cctv_enabled'] !== 1) return false;
+    if ($r['status'] === 'Checked In') return true;
+    $today = date('Y-m-d');
+    return $r['status'] === 'Approved' && $r['appointment_date'] <= $today && $r['end_date'] >= $today;
+}
+function sb_notify($conn, $user_id, $msg) {
+    $link = 'boarding.php';
+    $n = $conn->prepare("INSERT INTO notifications (user_id, message, is_read, created_at, link) VALUES (?, ?, 0, NOW(), ?)");
+    $n->bind_param("iss", $user_id, $msg, $link);
+    $n->execute();
+}
+
+// ── POST ACTION HANDLERS (staff only) ─────────────────────────────────────
+$flash_msg  = '';
+$flash_type = 'success';
+
+/**
+ * Mark the stay's invoice paid (when $method is given), release the cage, notify the client.
+ * Returns the invoice row (fresh).
+ */
+function sb_finish_checkout($conn, $apt_id, $bill, $balance, $method = null, $change = 0.0, $reference = null) {
+    if ($method && $bill) {
+        $pc = $conn->prepare("UPDATE billing SET payment_status='Paid', amount_paid=total_amount, change_amount=?, payment_method=?, reference_no=COALESCE(?, reference_no), paid_at=NOW() WHERE id=?");
+        $pc->bind_param("dssi", $change, $method, $reference, $bill['id']);
+        $pc->execute();
+    }
+    $st = $conn->prepare("UPDATE boarding_reservations SET status='Completed' WHERE id=?");
+    $st->bind_param("i", $apt_id);
+    $st->execute();
+    $q = $conn->query("SELECT b.user_id, b.pet_name, u.role FROM boarding_reservations b LEFT JOIN users u ON u.id = b.user_id WHERE b.id=" . (int)$apt_id);
+    if ($q && ($r = $q->fetch_assoc()) && in_array($r['role'], ['client', 'user'], true)) {
+        $inv = $bill['invoice_no'] ?? '';
+        if ($method && $balance > 0) $msg = "{$r['pet_name']} has been checked out. We received your payment of ₱" . number_format($balance, 2) . " ($method) for invoice $inv. Thank you for choosing PragmaVet boarding!";
+        elseif ($balance > 0)        $msg = "{$r['pet_name']} has been checked out. Your boarding balance is ₱" . number_format($balance, 2) . " (invoice $inv). Tap to pay.";
+        else                         $msg = "{$r['pet_name']} has been checked out. Your stay is fully paid. Thank you for choosing PragmaVet boarding!";
+        $link = ($balance > 0 && !$method) ? 'billing.php' : 'boarding.php';
+        $n = $conn->prepare("INSERT INTO notifications (user_id, message, is_read, created_at, link) VALUES (?, ?, 0, NOW(), ?)");
+        $n->bind_param("iss", $r['user_id'], $msg, $link);
+        $n->execute();
+    }
+    return $bill ? $conn->query("SELECT * FROM billing WHERE id = " . (int)$bill['id'])->fetch_assoc() : null;
+}
+
+// PayMongo at check-out: the client pays from their own Billing page (see release_cage below); staff only receive it.
+
+if ($can_manage && $_SERVER['REQUEST_METHOD'] === 'POST') {
+
+    // 1. APPROVE PENDING BOARDING (assign cage)
+    if (isset($_POST['boarding_action']) && $_POST['boarding_action'] === 'approve' && !empty($_POST['apt_id'])) {
+        $apt_id = (int)$_POST['apt_id'];
+        $cage   = (int)($_POST['cage_number'] ?? 0);
+        include_once("includes/boarding_rules.php");
+        $cur_b = $conn->query("SELECT status, appointment_date, end_date FROM boarding_reservations WHERE id = $apt_id")->fetch_assoc();
+        $clash = ($cur_b && $cage > 0) ? br_cage_conflict($conn, $cage, $cur_b['appointment_date'], $cur_b['end_date'], $apt_id) : null;
+        if (!$cur_b || $cur_b['status'] !== 'Pending' || $clash) {
+            $_SESSION['flash_msg']  = !$cur_b || $cur_b['status'] !== 'Pending' ? "Only pending requests can be approved."
+                                    : "Cage 0$cage is already taken for those dates ({$clash['pet_name']}). Choose another cage.";
+            $_SESSION['flash_type'] = "danger";
+            header("Location: staff_boarding.php"); exit();
+        }
+        if ($cage > 0) {
+            $audit  = "Boarding confirmed & Cage #$cage assigned by Staff: {$user_name} (" . date('M d, Y h:i A') . ")";
+            $stmt   = $conn->prepare("UPDATE boarding_reservations SET status='Approved', cage_number=?, approved_at=NOW(), admin_message=? WHERE id=?");
+            $stmt->bind_param("isi", $cage, $audit, $apt_id);
+            if ($stmt->execute()) {
+                $q = $conn->query("SELECT user_id, pet_name FROM boarding_reservations WHERE id=$apt_id");
+                if ($q && $r = $q->fetch_assoc()) {
+                    $msg = "Your boarding reservation for {$r['pet_name']} has been confirmed! Cage #$cage is reserved.";
+                    $n   = $conn->prepare("INSERT INTO notifications (user_id, message, is_read, created_at) VALUES (?, ?, 0, NOW())");
+                    $n->bind_param("is", $r['user_id'], $msg); $n->execute();
+                }
+                $_SESSION['flash_msg']  = "Boarding #$apt_id approved & Cage 0$cage assigned.";
+                $_SESSION['flash_type'] = "success";
+            }
+        }
+        header("Location: staff_boarding.php"); exit();
+    }
+
+    // 2. REJECT PENDING BOARDING
+    if (isset($_POST['boarding_action']) && $_POST['boarding_action'] === 'reject' && !empty($_POST['apt_id'])) {
+        $apt_id = (int)$_POST['apt_id'];
+        $reason = trim($_POST['reject_reason'] ?? 'No cages available at this time.');
+        $audit  = "Rejected by Staff ({$user_name}): $reason";
+        $stmt   = $conn->prepare("UPDATE boarding_reservations SET status='Rejected', admin_message=? WHERE id=?");
+        $stmt->bind_param("si", $audit, $apt_id);
+        if ($stmt->execute()) {
+            $q = $conn->query("SELECT user_id, pet_name FROM boarding_reservations WHERE id=$apt_id");
+            if ($q && $r = $q->fetch_assoc()) {
+                $msg = "Your boarding reservation for {$r['pet_name']} was declined: $reason.";
+                $n   = $conn->prepare("INSERT INTO notifications (user_id, message, is_read, created_at) VALUES (?, ?, 0, NOW())");
+                $n->bind_param("is", $r['user_id'], $msg); $n->execute();
+            }
+            $_SESSION['flash_msg']  = "Boarding #$apt_id rejected.";
+            $_SESSION['flash_type'] = "warning";
+        }
+        header("Location: staff_boarding.php"); exit();
+    }
+
+    // 3. CHECK-IN PET
+    if (isset($_POST['check_in_pet']) && !empty($_POST['apt_id'])) {
+        $apt_id = (int)$_POST['apt_id'];
+        include_once("includes/boarding_rules.php");
+        if ($why_ci = br_checkin_problem($conn, $apt_id)) {
+            $_SESSION['flash_msg']  = $why_ci;
+            $_SESSION['flash_type'] = "danger";
+            header("Location: staff_boarding.php"); exit();
+        }
+        $stmt   = $conn->prepare("UPDATE boarding_reservations SET status='Checked In' WHERE id=?");
+        $stmt->bind_param("i", $apt_id);
+        if ($stmt->execute()) {
+            if ($r = sb_stay($conn, $apt_id)) {
+                $cage = $r['cage_number'] ? ' to Cage ' . str_pad((int)$r['cage_number'], 2, '0', STR_PAD_LEFT) : '';
+                sb_notify($conn, (int)$r['user_id'], "{$r['pet_name']} has been checked in{$cage} for boarding."
+                    . (sb_is_live($r) ? " You can watch {$r['pet_name']} live — tap to open the camera." : " We'll let you know when the live camera is ready."));
+            }
+            $_SESSION['flash_msg']  = "Pet checked-in successfully! Cage is now occupied.";
+            $_SESSION['flash_type'] = "success";
+        }
+        header("Location: staff_boarding.php"); exit();
+    }
+
+    // 4. CHECK-OUT / RELEASE CAGE
+    if (isset($_POST['release_cage']) && !empty($_POST['apt_id'])) {
+        $apt_id  = (int)$_POST['apt_id'];
+        $bill    = bb_ensure_bill($conn, $apt_id);
+        $balance = bb_balance($bill);
+        if ($bill && $balance > 0 && ($_POST['pay_now'] ?? '') === 'paymongo') {
+            if ($balance < 100) {
+                $_SESSION['flash_msg']  = "PayMongo needs at least ₱100. Collect the ₱" . number_format($balance, 2) . " balance in cash instead.";
+                $_SESSION['flash_type'] = "danger";
+                header("Location: staff_boarding.php"); exit();
+            }
+            // Staff only receive payments: the client pays the balance online from their own account
+            include_once("includes/client_notify.php");
+            $owner = bb_reservation($conn, $apt_id);
+            if (!$owner || !is_pet_owner_role($owner['owner_role'] ?? '')) {
+                $_SESSION['flash_msg']  = "This is a walk-in without a client account, so a PayMongo request can't be sent. Collect the ₱" . number_format($balance, 2) . " in cash, or choose \"Client will pay later\". The pet is still checked in.";
+                $_SESSION['flash_type'] = "warning";
+                header("Location: staff_boarding.php"); exit();
+            }
+            $inv = $bill['invoice_no'] ?: '#' . (int)$bill['id'];
+            notify_user($conn, $owner['user_id'], "Please pay the ₱" . number_format($balance, 2) . " boarding balance for {$owner['pet_name']} (invoice $inv) to complete check-out. Tap to pay online with GCash, Maya or card.", 'billing.php?invoice=' . (int)$bill['id']);
+            $_SESSION['flash_msg']  = "Payment request for ₱" . number_format($balance, 2) . " sent to {$owner['fullname']}. {$owner['pet_name']} stays checked in until PayMongo confirms the payment. You'll get a notification; then open Check-Out again to release the cage (balance ₱0.00).";
+            $_SESSION['flash_type'] = "info";
+            header("Location: staff_boarding.php"); exit();
+        }
+        if ($bill && $balance > 0 && ($_POST['pay_now'] ?? '') === 'cash') {
+            $tendered = round((float)($_POST['cash_tendered'] ?? 0), 2);
+            if ($tendered < $balance) {
+                $_SESSION['flash_msg']  = "Cash received (₱" . number_format($tendered, 2) . ") is less than the balance of ₱" . number_format($balance, 2) . ". The pet was not checked out.";
+                $_SESSION['flash_type'] = "danger";
+                header("Location: staff_boarding.php"); exit();
+            }
+            sb_finish_checkout($conn, $apt_id, $bill, $balance, 'Cash', round($tendered - $balance, 2));
+            $_SESSION['flash_msg']  = "Checked out and paid in cash. Printing the receipt…";
+            $_SESSION['flash_type'] = "success";
+            header("Location: staff_receipt.php?bill=" . (int)$bill['id']); exit();
+        }
+        sb_finish_checkout($conn, $apt_id, $bill, $balance);
+        $_SESSION['flash_msg']  = $balance > 0
+            ? "Pet checked out and cage released. Balance of ₱" . number_format($balance, 2) . " left on invoice {$bill['invoice_no']} — the client was notified."
+            : "Pet checked out and cage released. The stay was already fully paid.";
+        $_SESSION['flash_type'] = "success";
+        header("Location: staff_boarding.php"); exit();
+    }
+
+    // 5. SAVE CARE NOTES
+    if (isset($_POST['save_care_notes']) && !empty($_POST['apt_id'])) {
+        $apt_id = (int)$_POST['apt_id'];
+        $notes  = trim($_POST['care_notes']);
+        $stmt   = $conn->prepare("UPDATE boarding_reservations SET care_notes=? WHERE id=?");
+        $stmt->bind_param("si", $notes, $apt_id);
+        if ($stmt->execute()) {
+            $_SESSION['flash_msg']  = "Care & feeding instructions saved!";
+            $_SESSION['flash_type'] = "success";
+        }
+        header("Location: staff_boarding.php"); exit();
+    }
+
+    // 5b. SAVE CCTV LINK
+    if (isset($_POST['save_cctv']) && !empty($_POST['apt_id'])) {
+        $apt_id = (int)$_POST['apt_id'];
+        $link   = trim($_POST['cctv_link'] ?? '');
+        // Phone camera apps show addresses like 192.168.1.5:8080/video, so add the http:// part if it is missing
+        if ($link !== '' && !preg_match('~^[a-z][a-z0-9+.-]*://~i', $link)) $link = 'http://' . $link;
+        if ($link === '' || !filter_var($link, FILTER_VALIDATE_URL)) {
+            $_SESSION['flash_msg']  = $link === '' ? "The camera link was empty, so nothing was saved. Paste the stream URL and save again." : "That camera link doesn't look like a valid address, so nothing was saved.";
+            $_SESSION['flash_type'] = "danger";
+            header("Location: staff_boarding.php"); exit();
+        }
+        $before = sb_stay($conn, $apt_id);
+        $stmt   = $conn->prepare("UPDATE boarding_reservations SET cctv_link=? WHERE id=?");
+        $stmt->bind_param("si", $link, $apt_id);
+        if ($stmt->execute()) {
+            $after = sb_stay($conn, $apt_id);
+            if (sb_is_live($after) && (!sb_is_live($before) || $before['cctv_link'] !== $after['cctv_link'])) {
+                sb_notify($conn, (int)$after['user_id'], "The live camera for {$after['pet_name']} is ready. Tap to watch {$after['pet_name']} in the clinic.");
+            }
+            $_SESSION['flash_msg']  = "CCTV Feed Link saved!" . (sb_is_live($after) ? " The client has been notified." : "");
+            $_SESSION['flash_type'] = "success";
+        }
+        header("Location: staff_boarding.php"); exit();
+    }
+
+    // 5c. AJAX TOGGLE CCTV ON
+    if (isset($_POST['turn_on_cctv_ajax'])) {
+        $apt_id = (int)$_POST['apt_id'];
+        $before = sb_stay($conn, $apt_id);
+        $conn->query("UPDATE boarding_reservations SET cctv_enabled=1 WHERE id=$apt_id");
+        $after = sb_stay($conn, $apt_id);
+        if (sb_is_live($after) && !sb_is_live($before)) {
+            sb_notify($conn, (int)$after['user_id'], "The live camera for {$after['pet_name']} is on. Tap to watch.");
+        }
+        echo json_encode(["status" => "success"]);
+        exit();
+    }
+
+    // 5d. AJAX TOGGLE CCTV OFF
+    if (isset($_POST['turn_off_cctv_ajax'])) {
+        $apt_id = (int)$_POST['apt_id'];
+        $before = sb_stay($conn, $apt_id);
+        $conn->query("UPDATE boarding_reservations SET cctv_enabled=0 WHERE id=$apt_id");
+        if (sb_is_live($before)) {
+            sb_notify($conn, (int)$before['user_id'], "The live camera for {$before['pet_name']} is paused for now. We'll notify you when it's back on.");
+        }
+        echo json_encode(["status" => "success"]);
+        exit();
+    }
+
+    // 6. RESCHEDULE / CANCEL APPROVED BOOKING
+    if (isset($_POST['boarding_manage']) && !empty($_POST['apt_id'])) {
+        $apt_id = (int)$_POST['apt_id'];
+        $cmd    = $_POST['boarding_manage'];
+        $reason = trim($_POST['admin_message'] ?? 'No reason provided.');
+
+        $apt_q = $conn->query("SELECT a.user_id, a.pet_name, a.appointment_date, a.end_date FROM boarding_reservations a WHERE a.id=$apt_id");
+        if ($apt_q && $apt_q->num_rows > 0) {
+            $apt_data = $apt_q->fetch_assoc();
+            $uid   = $apt_data['user_id'];
+            $pname = $apt_data['pet_name'];
+            $adate = date("M d", strtotime($apt_data['appointment_date']));
+            $edate = date("M d", strtotime($apt_data['end_date']));
+
+            if ($cmd === 'cancel') {
+                $audit = "Cancelled by Staff ({$user_name}): $reason";
+                $stmt  = $conn->prepare("UPDATE boarding_reservations SET status='Cancelled', admin_message=? WHERE id=?");
+                $stmt->bind_param("si", $audit, $apt_id);
+                $stmt->execute();
+                $notif_msg = "Your boarding reservation for $pname ($adate to $edate) has been cancelled by staff. Reason: $reason";
+                $_SESSION['flash_msg']  = "Reservation #$apt_id cancelled.";
+                $_SESSION['flash_type'] = "warning";
+            } elseif ($cmd === 'reschedule') {
+                $new_start = $_POST['new_start_date'];
+                $new_end   = $_POST['new_end_date'];
+                $new_sf    = date("M d, Y", strtotime($new_start));
+                $new_ef    = date("M d, Y", strtotime($new_end));
+                $audit     = "Reschedule proposed by Staff ({$user_name}). New Dates: $new_sf to $new_ef. Reason: $reason";
+                $stmt      = $conn->prepare("UPDATE boarding_reservations SET status='Reschedule Proposed', proposed_reschedule_date=?, proposed_reschedule_end_date=?, admin_message=?, client_action_needed=1 WHERE id=?");
+                $stmt->bind_param("sssi", $new_start, $new_end, $audit, $apt_id);
+                $stmt->execute();
+                $notif_msg = "The clinic proposed shifting your boarding reservation for $pname. New Dates: $new_sf to $new_ef. Reason: $reason.";
+                $_SESSION['flash_msg']  = "Reschedule proposal sent to client for #$apt_id.";
+                $_SESSION['flash_type'] = "info";
+            }
+
+            if (!empty($notif_msg)) {
+                $ins_n = $conn->prepare("INSERT INTO notifications (user_id, message, is_read, created_at) VALUES (?, ?, 0, NOW())");
+                $ins_n->bind_param("is", $uid, $notif_msg);
+                $ins_n->execute();
+            }
+        }
+        header("Location: staff_boarding.php"); exit();
+    }
+
+    // 7. REGISTER WALK-IN BOARDING
+    if (isset($_POST['add_walkin_boarding'])) {
+        $client_name = trim($_POST['client_name']);
+        $pet_name    = trim($_POST['pet_name']);
+        $cage        = (int)$_POST['cage_number'];
+        $start_date  = $_POST['appointment_date'];
+        $end_date    = $_POST['end_date'];
+        $care_notes  = trim($_POST['care_notes'] ?? '');
+
+        // Linked to a client account only when the name matches exactly ONE pet owner; otherwise it is a clinic walk-in
+        // (a partial match could hand the stay — invoice, notices and live camera — to the wrong person)
+        $reg_user_id = $user_id;
+        $chk_u = $conn->prepare("SELECT id FROM users WHERE LOWER(TRIM(fullname)) = LOWER(TRIM(?)) AND role IN ('client', 'user') LIMIT 2");
+        $chk_u->bind_param("s", $client_name); $chk_u->execute();
+        $res_u = $chk_u->get_result();
+        if ($client_name !== '' && $res_u && $res_u->num_rows === 1) {
+            $reg_user_id = $res_u->fetch_assoc()['id'];
+        }
+        include_once("includes/boarding_rules.php");
+        $db_today = $conn->query("SELECT CURDATE() d")->fetch_assoc()['d'];
+        $why_w = '';
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', (string)$start_date) || !preg_match('/^\d{4}-\d{2}-\d{2}$/', (string)$end_date) || $end_date <= $start_date) $why_w = "Check-out must be after check-in.";
+        elseif ($start_date < $db_today) $why_w = "Check-in can't be in the past.";
+        elseif ($clash = br_cage_conflict($conn, $cage, $start_date, $end_date)) $why_w = "Cage 0$cage is already taken for those dates ({$clash['pet_name']}). Choose another cage.";
+        if ($why_w) {
+            $_SESSION['flash_msg']  = $why_w;
+            $_SESSION['flash_type'] = "danger";
+            header("Location: staff_boarding.php"); exit();
+        }
+
+        $stmt = $conn->prepare("INSERT INTO boarding_reservations (user_id, pet_name, service_type, appointment_date, appointment_time, end_date, cage_number, status, care_notes, approved_at) VALUES (?, ?, 'Pet Boarding Reservation', ?, '09:00:00', ?, ?, 'Checked In', ?, NOW())");
+        $stmt->bind_param("isssis", $reg_user_id, $pet_name, $start_date, $end_date, $cage, $care_notes);
+        if ($stmt->execute()) {
+            $wb = bb_ensure_bill($conn, $conn->insert_id, $client_name);
+            $_SESSION['flash_msg']  = "Walk-in boarding registered and assigned to Cage 0$cage!"
+                . ($wb ? " Invoice {$wb['invoice_no']} issued: ₱" . number_format((float)$wb['total_amount'], 2) . " — collect it at check-out." : "");
+            $_SESSION['flash_type'] = "success";
+        }
+        header("Location: staff_boarding.php"); exit();
+    }
+}
+
+// ── READ FLASH ─────────────────────────────────────────────────────────────
+if (isset($_SESSION['flash_msg'])) {
+    $flash_msg  = $_SESSION['flash_msg'];
+    $flash_type = $_SESSION['flash_type'] ?? 'success';
+    unset($_SESSION['flash_msg'], $_SESSION['flash_type']);
+}
+
+// ── DATA QUERIES ───────────────────────────────────────────────────────────
+$count_q    = $conn->query("SELECT setting_value FROM clinic_settings WHERE setting_key = 'boarding_cage_count'");
+$cage_count = ($count_q && $count_q->num_rows > 0) ? (int)$count_q->fetch_assoc()['setting_value'] : 5;
+
+// Pending requests
+$pending_apts = $conn->query("
+    SELECT a.*, u.fullname as client_name, u.contact_number, u.email
+    FROM boarding_reservations a
+    JOIN users u ON a.user_id = u.id
+    WHERE a.status='Pending' AND (a.service_type='Pet Boarding Reservation' OR a.service_type='Pet Boarding')
+    ORDER BY a.appointment_date ASC
+");
+$pending_cnt = $pending_apts ? $pending_apts->num_rows : 0;
+
+// All cage bookings
+$cages = [];
+for ($i = 1; $i <= $cage_count; $i++) { $cages[$i] = []; }
+$sql = "SELECT a.*, u.fullname as client_name, u.contact_number, u.email,
+               p.species, p.breed, p.age, p.weight, p.gender
+        FROM boarding_reservations a
+        LEFT JOIN users u ON a.user_id = u.id
+        LEFT JOIN pets p ON a.user_id = p.user_id AND a.pet_name = p.name
+        WHERE a.cage_number IS NOT NULL
+          AND a.status NOT IN ('Completed', 'Cancelled', 'Rejected')
+        ORDER BY a.appointment_date ASC";
+$res = $conn->query($sql);
+if ($res && $res->num_rows > 0) {
+    while ($row = $res->fetch_assoc()) {
+        $cNo = (int)$row['cage_number'];
+        if (isset($cages[$cNo])) { $cages[$cNo][] = $row; }
+    }
+}
+
+// Metrics
+$today_time    = strtotime(date("Y-m-d"));
+$occupied_cnt  = $reserved_cnt = $maint_cnt = $available_cnt = 0;
+for ($i = 1; $i <= $cage_count; $i++) {
+    $has_occ = $has_res = $has_maint = false;
+    if (!empty($cages[$i])) {
+        foreach ($cages[$i] as $b) {
+            if ($b['status'] === 'Maintenance') { $has_maint = true; }
+            elseif ($b['status'] === 'Checked In' || ($b['status'] === 'Approved' && strtotime($b['appointment_date']) <= $today_time && strtotime($b['end_date']) >= $today_time)) { $has_occ = true; }
+            elseif ($b['status'] === 'Approved' && strtotime($b['appointment_date']) > $today_time) { $has_res = true; }
+        }
+    }
+    if ($has_maint) $maint_cnt++;
+    elseif ($has_occ) $occupied_cnt++;
+    elseif ($has_res) $reserved_cnt++;
+    else $available_cnt++;
+}
+
+// Sidebar stats
+$c_pending_appts    = $conn->query("SELECT COUNT(*) as c FROM appointments WHERE status='Pending' AND is_archived=0")->fetch_assoc()['c'] ?? 0;
+$c_boarding_pending = $pending_cnt;
+$c_today_appts      = $conn->query("SELECT COUNT(*) as c FROM appointments WHERE appointment_date=CURDATE() AND is_archived=0")->fetch_assoc()['c'] ?? 0;
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pet Boarding Management | PragmaVet Staff</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        :root {
+            --primary:       #2563eb;
+            --primary-dark:  #1e40af;
+            --sidebar-width: 260px;
+            --bg-color:      #F4F9FB;
+            --border-color:  #edf2f6;
+            --text-muted:    #64748b;
+        }
+        * { box-sizing: border-box; }
+        body { background: var(--bg-color); font-family: 'Inter', sans-serif; color: #334155; margin: 0; overflow-x: hidden; }
+
+        /* ── SIDEBAR (same as the staff dashboard) ── */
+        .sidebar { background:#ffffff !important; width:var(--sidebar-width, 260px) !important; height:100vh !important; position:fixed !important; top:0 !important; left:0 !important;
+                   padding:28px 20px 24px !important; z-index:1000 !important; display:flex !important; flex-direction:column !important; border-right:1px solid #eef2f6 !important; box-shadow:none !important; overflow-y:auto !important; }
+        .sidebar-brand { display:flex !important; align-items:center !important; gap:12px !important; margin-bottom:24px !important; padding:0 4px !important; }
+        .sidebar-brand-icon { width:44px !important; height:44px !important; min-width:44px !important; border-radius:13px !important; background:#2563eb !important; display:flex !important; align-items:center !important; justify-content:center !important; color:#fff !important; font-size:20px !important; box-shadow:0 4px 14px rgba(37,99,235,.28) !important; }
+        .sidebar-brand span { font-weight:800 !important; color:#182032 !important; font-size:22px !important; letter-spacing:-.4px !important; }
+        .sidebar-user { margin-bottom:24px !important; padding:15px 18px !important; border-radius:14px !important; background:#f8fafc !important; border:1px solid #eef2f6 !important; }
+        .sidebar-user .welcome { font-size:13px !important; color:#64748b !important; font-weight:500 !important; }
+        .sidebar-user .uname { font-weight:700 !important; color:#0f172a !important; font-size:15.5px !important; margin-top:3px !important; white-space:nowrap !important; overflow:hidden !important; text-overflow:ellipsis !important; }
+        .sidebar-role { display:inline-block; margin-top:6px; font-size:11px; font-weight:700; color:#2563eb; background:#eff6ff; border-radius:999px; padding:2px 10px; }
+        .sidebar > a { display:flex !important; align-items:center !important; gap:14px !important; padding:13px 18px !important; border-radius:12px !important; color:#334155 !important; text-decoration:none !important; margin-bottom:4px !important; font-weight:600 !important; font-size:15px !important; transition:all .2s ease !important; background:transparent; }
+        .sidebar > a i { width:22px !important; text-align:center !important; font-size:17px !important; color:#64748b !important; transition:color .2s !important; flex-shrink:0 !important; }
+        .sidebar > a:hover { background:#f8fafc !important; color:#0f172a !important; }
+        .sidebar > a:hover i { color:#2563eb !important; }
+        .sidebar > a.active { background:#2563eb !important; color:#fff !important; font-weight:700 !important; box-shadow:0 4px 14px rgba(37,99,235,.28) !important; }
+        .sidebar > a.active i { color:#fff !important; }
+        .sidebar .sb-badge { margin-left:auto; color:#fff; font-size:11px; font-weight:800; min-width:22px; height:22px; border-radius:999px; display:inline-flex; align-items:center; justify-content:center; padding:0 7px; }
+        .sidebar > a.active .sb-badge { background:#fff !important; color:#2563eb; }
+        .sidebar .sidebar-logout { margin-top:auto !important; padding-top:20px !important; border-top:1px solid #f1f5f9 !important; }
+        .sidebar .sidebar-logout a { display:flex !important; align-items:center !important; gap:14px !important; padding:13px 18px !important; border-radius:12px !important; color:#dc2626 !important; font-weight:600 !important; text-decoration:none !important; }
+        .sidebar .sidebar-logout a i { width:22px !important; text-align:center !important; color:#dc2626 !important; }
+        .sidebar .sidebar-logout a:hover { background:#fef2f2 !important; color:#b91c1c !important; }
+        .sidebar::-webkit-scrollbar { width:5px; } .sidebar::-webkit-scrollbar-thumb { background:rgba(0,0,0,.06); border-radius:10px; }
+
+        /* ── MAIN ── */
+        .main-wrapper { margin-left: var(--sidebar-width); padding: 28px 32px; min-height: 100vh; }
+
+        /* ── METRIC CARDS ── */
+        .metric-card { background: #fff; border-radius: 16px; padding: 20px 22px; box-shadow: 0 4px 18px rgba(15,23,42,.05); display: flex; align-items: center; gap: 16px; }
+        .metric-icon { width: 48px; height: 48px; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 20px; flex-shrink: 0; }
+
+        /* ── CAGE CARDS ── */
+        .cage-card { background: #fff; border: 1px solid #eef2f6; border-radius: 18px; padding: 20px; box-shadow: 0 4px 16px rgba(15,23,42,.04); height: 100%; transition: box-shadow .2s; }
+        .cage-card:hover { box-shadow: 0 8px 28px rgba(15,23,42,.09); }
+        .cage-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid #f1f5f9; }
+        .booked-slot { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; border: 1px solid #e2e8f0; border-radius: 9px; font-size: 12.5px; margin-bottom: 6px; background: #fafbfc; }
+
+        /* ── PANEL ── */
+        .panel { background: #fff; border-radius: 18px; padding: 24px; box-shadow: 0 4px 18px rgba(15,23,42,.05); margin-bottom: 24px; }
+        .panel-title { font-size: 16px; font-weight: 800; color: #0f172a; display: flex; align-items: center; gap: 8px; }
+
+        /* ── BADGE STATUS ── */
+        .badge-pending   { background: #fef3c7; color: #92400e; font-weight: 700; font-size: 11px; padding: 3px 8px; border-radius: 6px; }
+        .badge-approved  { background: #d1fae5; color: #065f46; font-weight: 700; font-size: 11px; padding: 3px 8px; border-radius: 6px; }
+        .badge-occupied  { background: #fee2e2; color: #991b1b; font-weight: 700; font-size: 11px; padding: 3px 8px; border-radius: 6px; }
+        .badge-maint     { background: #fef3c7; color: #78350f; font-weight: 700; font-size: 11px; padding: 3px 8px; border-radius: 6px; }
+
+        /* ── SAAS LABEL ── */
+        .saas-label { font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--text-muted); margin-bottom: 5px; display: block; }
+
+        /* ── VIEW-ONLY RIBBON ── */
+        .view-only-ribbon { background: linear-gradient(90deg, #1e40af, #2563eb); color: #fff; font-size: 11.5px; font-weight: 700; padding: 8px 18px; border-radius: 8px; display: inline-flex; align-items: center; gap: 7px; }
+
+        .modal-content { border-radius: 20px; border: none; box-shadow: 0 20px 60px rgba(0,0,0,.13); }
+        @keyframes pulseCam { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+        .pulse-cam { animation: pulseCam 1.5s infinite; }
+    </style>
+</head>
+<body>
+
+<!-- ── SIDEBAR ─────────────────────────────────────────────────────────── -->
+<aside class="sidebar" id="sidebar">
+    <div class="sidebar-brand">
+        <div class="sidebar-brand-icon"><i class="fa fa-paw"></i></div>
+        <span>PragmaVet</span>
+    </div>
+    <div class="sidebar-user">
+        <div class="welcome">Welcome back,</div>
+        <div class="uname"><?= htmlspecialchars($user_name) ?></div>
+        <span class="sidebar-role"><i class="fa fa-id-badge me-1"></i> <?= $is_admin ? 'System Administration' : 'Vet Staff' ?></span>
+    </div>
+    <a href="staff_dashboard.php?tab=calendar">
+        <i class="fa fa-calendar-alt"></i> <span>Appointment Calendar</span>
+        <?php if ($c_today_appts > 0): ?><span class="sb-badge" style="background:#2563eb;"><?= $c_today_appts ?></span><?php endif; ?>
+    </a>
+    <a href="staff_dashboard.php?tab=appointments">
+        <i class="fa fa-calendar-check"></i> <span>Appointment Requests</span>
+        <?php if ($c_pending_appts > 0): ?><span class="sb-badge" style="background:#f59e0b;"><?= $c_pending_appts ?></span><?php endif; ?>
+    </a>
+    <a href="staff_boarding.php" class="active">
+        <i class="fa fa-hotel"></i> <span>Pet Boarding Care</span>
+        <?php if ($c_boarding_pending > 0): ?><span class="sb-badge" style="background:#3b82f6;"><?= $c_boarding_pending ?></span><?php endif; ?>
+    </a>
+    <a href="staff_dashboard.php?tab=inventory"><i class="fa fa-boxes"></i> <span>Inventory Support</span></a>
+    <a href="staff_dashboard.php?tab=client_assistance"><i class="fa fa-comments"></i> <span>Client Messages</span></a>
+    <a href="admin_certificates.php"><i class="fa fa-file-contract"></i> <span>Certificates</span></a>
+    <div class="sidebar-logout"><a href="logout.php"><i class="fa fa-sign-out-alt"></i> <span>Logout</span></a></div>
+</aside>
+<?php include("includes/staff_bell.php"); ?>
+
+<!-- ── MAIN CONTENT ────────────────────────────────────────────────────── -->
+<main class="main-wrapper">
+
+    <!-- Page Header -->
+    <div class="d-flex justify-content-between align-items-start mb-4 flex-wrap gap-3">
+        <div>
+            <span class="badge bg-primary bg-opacity-10 text-primary fw-bold px-3 py-1 rounded-pill mb-2" style="font-size:11px;">
+                <i class="fa fa-hotel me-1"></i> BOARDING MANAGEMENT
+            </span>
+            <h2 class="fw-bold mb-1 text-dark" style="font-size:26px; letter-spacing:-0.5px;">Pet Boarding Care</h2>
+            <p class="text-muted mb-0" style="font-size:13.5px;">
+                <?= $can_manage
+                    ? 'Approve reservations, manage cages, check-in/out pets, and update care notes.'
+                    : 'View-only mode — boarding management is handled by Vet Staff.' ?>
+            </p>
+        </div>
+        <div class="d-flex align-items-center gap-2">
+            <?php if ($is_admin): ?>
+                <div class="view-only-ribbon">
+                    <i class="fa fa-eye"></i> Admin View — Read Only
+                </div>
+                <a href="admin_boarding.php" class="btn btn-outline-primary fw-bold rounded-pill px-3" style="font-size:13px;">
+                    <i class="fa fa-cog me-1"></i> Full Admin Panel
+                </a>
+            <?php else: ?>
+                <button class="btn btn-primary fw-bold rounded-pill px-4 py-2 shadow-sm"
+                        data-bs-toggle="modal" data-bs-target="#walkinBoardingModal"
+                        style="font-size:13.5px;">
+                    <i class="fa fa-plus-circle me-1"></i> Register Walk-in Pet
+                </button>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <!-- Flash Alert -->
+    <?php if ($flash_msg): ?>
+        <div class="alert alert-<?= $flash_type ?> alert-dismissible fade show rounded-3 shadow-sm border-0 mb-4" role="alert">
+            <i class="fa fa-<?= $flash_type === 'success' ? 'check-circle' : ($flash_type === 'warning' ? 'exclamation-triangle' : 'info-circle') ?> me-2"></i>
+            <?= htmlspecialchars($flash_msg) ?>
+            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+    <?php endif; ?>
+
+    <!-- ── METRICS ROW ── -->
+    <div class="row g-3 mb-4">
+        <div class="col-md-3 col-6">
+            <div class="metric-card">
+                <div class="metric-icon" style="background:#eff6ff; color:#2563eb;"><i class="fa fa-hotel"></i></div>
+                <div>
+                    <div class="text-muted small fw-semibold" style="font-size:12px;">Total Cages</div>
+                    <h4 class="fw-bold m-0"><?= $cage_count ?></h4>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3 col-6">
+            <div class="metric-card">
+                <div class="metric-icon" style="background:#fee2e2; color:#dc2626;"><i class="fa fa-dog"></i></div>
+                <div>
+                    <div class="text-muted small fw-semibold" style="font-size:12px;">Occupied</div>
+                    <h4 class="fw-bold m-0"><?= $occupied_cnt ?></h4>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3 col-6">
+            <div class="metric-card">
+                <div class="metric-icon" style="background:#d1fae5; color:#059669;"><i class="fa fa-door-open"></i></div>
+                <div>
+                    <div class="text-muted small fw-semibold" style="font-size:12px;">Available</div>
+                    <h4 class="fw-bold m-0"><?= $available_cnt ?></h4>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3 col-6">
+            <div class="metric-card">
+                <div class="metric-icon" style="background:#fef3c7; color:#d97706;"><i class="fa fa-clock"></i></div>
+                <div>
+                    <div class="text-muted small fw-semibold" style="font-size:12px;">Pending Requests</div>
+                    <h4 class="fw-bold m-0"><?= $pending_cnt ?></h4>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── PENDING BOARDING REQUESTS (staff manages / admin views) ── -->
+    <?php if ($pending_cnt > 0): ?>
+    <div class="panel" style="border-left: 4px solid #f59e0b;">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <div class="panel-title">
+                <i class="fa fa-clock text-warning"></i>
+                Pending Boarding Requests
+                <span class="badge bg-warning text-dark rounded-pill ms-1"><?= $pending_cnt ?></span>
+            </div>
+            <?php if ($is_admin): ?>
+                <span class="badge-maint"><i class="fa fa-lock me-1"></i>Managed by Vet Staff</span>
+            <?php endif; ?>
+        </div>
+        <div class="table-responsive">
+            <table class="table table-borderless align-middle mb-0" style="font-size:13.5px;">
+                <thead class="table-light">
+                    <tr>
+                        <th>Pet &amp; Owner</th>
+                        <th>Stay Dates</th>
+                        <th>Duration</th>
+                        <th><?= $can_manage ? 'Assign Cage' : 'Assigned Cage' ?></th>
+                        <th class="text-end"><?= $can_manage ? 'Action' : 'Status' ?></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php while ($p = $pending_apts->fetch_assoc()):
+                        $st = strtotime($p['appointment_date']);
+                        $et = strtotime($p['end_date']);
+                        $days = max(1, round(($et - $st) / 86400));
+                    ?>
+                    <tr>
+                        <td>
+                            <div class="fw-bold text-dark"><i class="fa fa-paw text-primary me-1"></i><?= htmlspecialchars($p['pet_name']) ?></div>
+                            <div class="small text-muted"><i class="fa fa-user me-1 opacity-50"></i><?= htmlspecialchars($p['client_name']) ?> (<?= htmlspecialchars($p['contact_number'] ?? 'N/A') ?>)</div>
+                        </td>
+                        <td>
+                            <span class="fw-semibold text-primary"><?= date("M d, Y", $st) ?></span>
+                            <i class="fa fa-arrow-right mx-1 text-muted" style="font-size:10px;"></i>
+                            <span class="fw-semibold text-primary"><?= date("M d, Y", $et) ?></span>
+                        </td>
+                        <td><span class="badge bg-light text-dark border font-monospace px-2"><?= $days ?> night<?= $days > 1 ? 's' : '' ?></span></td>
+                        <td>
+                            <?php if ($can_manage): ?>
+                                <form method="POST" id="approveForm_<?= $p['id'] ?>" class="m-0">
+                                    <input type="hidden" name="apt_id" value="<?= $p['id'] ?>">
+                                    <input type="hidden" name="boarding_action" value="approve">
+                                    <select name="cage_number" class="form-select form-select-sm fw-bold border-primary" style="width:140px;" required>
+                                        <option value="" disabled selected>Select Cage…</option>
+                                        <?php for ($c = 1; $c <= $cage_count; $c++): ?>
+                                            <option value="<?= $c ?>">Cage 0<?= $c ?></option>
+                                        <?php endfor; ?>
+                                    </select>
+                                </form>
+                            <?php else: ?>
+                                <span class="badge-pending">Pending</span>
+                            <?php endif; ?>
+                        </td>
+                        <td class="text-end">
+                            <?php if ($can_manage): ?>
+                                <button type="submit" form="approveForm_<?= $p['id'] ?>" class="btn btn-sm btn-primary rounded-pill px-3 fw-bold me-1">
+                                    <i class="fa fa-check me-1"></i> Approve
+                                </button>
+                                <button type="button" class="btn btn-sm btn-outline-danger rounded-pill px-3 fw-bold"
+                                    onclick="pragmaConfirm('Reject this boarding request?', 'The client will be notified. This cannot be undone.', 'danger', function(){ document.getElementById('rejectForm_<?= $p['id'] ?>').submit(); })">
+                                    <i class="fa fa-times me-1"></i> Reject
+                                </button>
+                                <form method="POST" id="rejectForm_<?= $p['id'] ?>" class="d-none">
+                                    <input type="hidden" name="apt_id" value="<?= $p['id'] ?>">
+                                    <input type="hidden" name="boarding_action" value="reject">
+                                    <input type="hidden" name="reject_reason" value="No cages available at this time.">
+                                </form>
+                            <?php else: ?>
+                                <span class="badge-pending"><i class="fa fa-clock me-1"></i>Awaiting Staff</span>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                    <?php endwhile; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <?php endif; ?>
+
+    <!-- ── CAGE MATRIX ── -->
+    <div class="panel-title mb-3">
+        <i class="fa fa-border-all text-primary"></i> Cage Availability Matrix
+        <?php if ($is_admin): ?>
+            <span class="badge-maint ms-2"><i class="fa fa-eye me-1"></i>View Only</span>
+        <?php endif; ?>
+    </div>
+    <div class="row g-4">
+        <?php
+        for ($i = 1; $i <= $cage_count; $i++):
+            $active_booking   = null;
+            $upcoming_booking = null;
+            $is_maintenance   = false;
+
+            if (!empty($cages[$i])) {
+                foreach ($cages[$i] as $b) {
+                    if ($b['status'] === 'Maintenance') {
+                        $is_maintenance = true; break;
+                    } elseif ($b['status'] === 'Checked In') {
+                        $active_booking = $b;
+                    } elseif ($b['status'] === 'Approved' && !$upcoming_booking) {
+                        $upcoming_booking = $b;
+                    }
+                }
+            }
+            $card_border = $is_maintenance ? '#fde68a' : '#eef2f6';
+        ?>
+        <div class="col-xl-4 col-md-6">
+            <div class="cage-card" style="border-color:<?= $card_border ?>;">
+                <!-- Cage Header -->
+                <div class="cage-header">
+                    <span class="fw-bold fs-6 text-dark" style="letter-spacing:-.2px;">
+                        <i class="fa fa-hotel text-primary me-2"></i>Cage 0<?= $i ?>
+                    </span>
+                    <?php if ($is_maintenance): ?>
+                        <span class="badge-maint"><i class="fa fa-wrench me-1"></i>Maintenance</span>
+                    <?php elseif ($active_booking): ?>
+                        <span class="badge-occupied"><i class="fa fa-dog me-1"></i>Occupied</span>
+                    <?php elseif ($upcoming_booking): ?>
+                        <span class="badge-approved"><i class="fa fa-calendar-check me-1"></i>Reserved</span>
+                    <?php else: ?>
+                        <span class="badge" style="background:#d1fae5;color:#065f46;font-size:11px;font-weight:700;padding:3px 8px;border-radius:6px;"><i class="fa fa-door-open me-1"></i>Available</span>
+                    <?php endif; ?>
+                </div>
+
+                <!-- Status Banner -->
+                <?php if ($is_maintenance): ?>
+                    <div class="p-3 rounded-3 text-center mb-3" style="background:#fffbeb; border:1px solid #fde68a;">
+                        <i class="fa fa-wrench text-warning me-1"></i>
+                        <span class="fw-bold text-dark" style="font-size:13px;">MAINTENANCE LOCK</span>
+                        <div class="small text-muted mt-1">Cage unavailable for bookings</div>
+                    </div>
+
+                <?php elseif ($active_booking): ?>
+                    <div class="p-3 rounded-3 mb-3" style="background:#fff1f2; border:1px solid #fecaca; position:relative;">
+                        <div class="d-flex justify-content-between mb-1">
+                            <div>
+                                <span class="badge-occupied"><i class="fa fa-dog me-1"></i>OCCUPIED</span>
+                                <?php if (!empty($active_booking['cctv_link']) && !empty($active_booking['cctv_enabled'])): ?>
+                                    <span class="badge ms-1 shadow-sm pulse-cam" style="background:#ef4444; color:#fff; font-size:10px; font-weight:700; padding:3px 8px; border-radius:6px;">
+                                        <i class="fa fa-video me-1"></i>LIVE
+                                    </span>
+                                <?php endif; ?>
+                            </div>
+                            <span class="small text-muted font-monospace">#<?= $active_booking['id'] ?></span>
+                        </div>
+                        <h6 class="fw-bold text-dark mb-1 mt-2"><i class="fa fa-paw text-primary me-1"></i><?= htmlspecialchars($active_booking['pet_name']) ?></h6>
+                        <div class="small text-muted mb-1"><i class="fa fa-user me-1 opacity-50"></i><?= htmlspecialchars($active_booking['client_name'] ?? 'Walk-In') ?></div>
+                        <div class="small fw-semibold text-danger">
+                            <i class="fa fa-calendar me-1"></i>
+                            <?= date("M d", strtotime($active_booking['appointment_date'])) ?> → <?= date("M d, Y", strtotime($active_booking['end_date'])) ?>
+                        </div>
+                        <?php if ($can_manage): ?>
+                        <div class="d-flex gap-2 mt-3 flex-wrap">
+                            <button type="button" class="btn btn-sm btn-danger fw-bold rounded-pill flex-fill"
+                                    data-bs-toggle="modal" data-bs-target="#checkoutModal_<?= $active_booking['id'] ?>">
+                                <i class="fa fa-sign-out-alt me-1"></i> Check-Out &amp; Release
+                            </button>
+                            <button class="btn btn-sm btn-outline-primary rounded-circle" style="width:32px;height:32px;padding:0;"
+                                data-bs-toggle="modal" data-bs-target="#careModal_<?= $active_booking['id'] ?>" title="Care &amp; Feeding Notes">
+                                <i class="fa fa-notes-medical"></i>
+                            </button>
+                            <button class="btn btn-sm btn-outline-info rounded-circle" style="width:32px;height:32px;padding:0;"
+                                data-bs-toggle="modal" data-bs-target="#cctvModal_<?= $active_booking['id'] ?>" title="CCTV Live Feed">
+                                <i class="fa fa-video"></i>
+                            </button>
+                            <button class="btn btn-sm btn-outline-secondary rounded-circle" style="width:32px;height:32px;padding:0;"
+                                data-bs-toggle="modal" data-bs-target="#detailsModal_<?= $active_booking['id'] ?>" title="View Details">
+                                <i class="fa fa-eye"></i>
+                            </button>
+                        </div>
+                        <?php else: ?>
+                        <!-- Admin: view details only -->
+                        <button class="btn btn-sm btn-outline-primary rounded-pill px-3 mt-2 fw-bold" style="font-size:12px;"
+                            data-bs-toggle="modal" data-bs-target="#detailsModal_<?= $active_booking['id'] ?>">
+                            <i class="fa fa-eye me-1"></i> View Details
+                        </button>
+                        <?php endif; ?>
+                    </div>
+
+                <?php elseif ($upcoming_booking): ?>
+                    <div class="p-3 rounded-3 mb-3" style="background:#eff6ff; border:1px solid #bfdbfe;">
+                        <div class="d-flex justify-content-between mb-1">
+                            <span class="badge-approved"><i class="fa fa-calendar-check me-1"></i>UPCOMING</span>
+                            <span class="small text-muted font-monospace">#<?= $upcoming_booking['id'] ?></span>
+                        </div>
+                        <h6 class="fw-bold text-dark mb-1 mt-2"><i class="fa fa-paw text-primary me-1"></i><?= htmlspecialchars($upcoming_booking['pet_name']) ?></h6>
+                        <div class="small text-muted mb-2"><i class="fa fa-user me-1 opacity-50"></i><?= htmlspecialchars($upcoming_booking['client_name']) ?></div>
+                        <div class="small fw-semibold text-primary mb-3">
+                            <i class="fa fa-clock me-1"></i>Check-in: <?= date("M d, Y", strtotime($upcoming_booking['appointment_date'])) ?>
+                        </div>
+                        <?php if ($can_manage): ?>
+                        <form method="POST" class="m-0">
+                            <input type="hidden" name="apt_id" value="<?= $upcoming_booking['id'] ?>">
+                            <button type="submit" name="check_in_pet" class="btn btn-sm btn-primary w-100 fw-bold rounded-pill">
+                                <i class="fa fa-sign-in-alt me-1"></i> Check-In Pet Now
+                            </button>
+                        </form>
+                        <?php else: ?>
+                        <button class="btn btn-sm btn-outline-primary rounded-pill px-3 fw-bold w-100" style="font-size:12px;"
+                            data-bs-toggle="modal" data-bs-target="#detailsModal_<?= $upcoming_booking['id'] ?>">
+                            <i class="fa fa-eye me-1"></i> View Details
+                        </button>
+                        <?php endif; ?>
+                    </div>
+
+                <?php else: ?>
+                    <div class="p-3 rounded-3 text-center mb-3" style="background:#f0fdf4; border:1px solid #bbf7d0;">
+                        <i class="fa fa-door-open text-success me-2" style="font-size:16px;"></i>
+                        <span class="fw-bold text-success" style="font-size:13px;">AVAILABLE</span>
+                        <div class="small text-muted mt-1">Cage is empty &amp; ready for occupancy</div>
+                        <?php if ($can_manage): ?>
+                            <button class="btn btn-sm btn-outline-success rounded-pill fw-bold px-3 mt-2" onclick="openWalkinModal(<?= $i ?>)" style="font-size:12px;">
+                                <i class="fa fa-plus me-1"></i> Assign Walk-In Pet
+                            </button>
+                        <?php endif; ?>
+                    </div>
+                <?php endif; ?>
+
+                <!-- Upcoming Schedule Timeline -->
+                <div>
+                    <div class="text-muted fw-bold mb-2" style="font-size:11px; text-transform:uppercase; letter-spacing:.5px;">
+                        <i class="fa fa-list-ul me-1 opacity-50"></i>Upcoming Schedule
+                    </div>
+                    <?php if (empty($cages[$i])): ?>
+                        <div class="text-center py-2 text-muted small"><i class="fa fa-check me-1"></i>No upcoming bookings</div>
+                    <?php else: ?>
+                        <?php foreach ($cages[$i] as $booking): ?>
+                            <div class="booked-slot <?= $booking['status'] === 'Maintenance' ? 'border-warning' : '' ?>">
+                                <div style="font-size:12px;">
+                                    <i class="fa <?= $booking['status'] === 'Maintenance' ? 'fa-wrench text-warning' : 'fa-lock text-primary' ?> me-1"></i>
+                                    <?= date("M d", strtotime($booking['appointment_date'])) ?> → <?= $booking['status'] === 'Maintenance' ? 'Indefinite' : date("M d", strtotime($booking['end_date'])) ?>
+                                </div>
+                                <div class="fw-bold d-flex align-items-center gap-1" style="font-size:12px;">
+                                    <span><?= htmlspecialchars($booking['pet_name']) ?></span>
+                                    <?php if ($booking['status'] !== 'Maintenance'): ?>
+                                        <button class="btn btn-sm btn-light py-0 px-1 rounded border" style="font-size:10px;"
+                                            data-bs-toggle="modal" data-bs-target="#detailsModal_<?= $booking['id'] ?>">
+                                            <i class="fa fa-eye text-primary"></i>
+                                        </button>
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </div>
+            </div>
+        </div>
+        <?php endfor; ?>
+    </div>
+
+    <?php if ($can_manage):
+        $recent_bills = [];
+        $rbq = $conn->query("SELECT b.id, b.invoice_no, b.total_amount, b.downpayment_amount, b.downpayment_status, b.payment_status, b.payment_method, b.paid_at, b.created_at,
+                                    COALESCE(NULLIF(b.client_name, ''), u.fullname) AS client, COALESCE(NULLIF(b.pet_name, ''), r.pet_name) AS pet,
+                                    r.status AS stay_status, r.appointment_date AS stay_start, r.end_date AS stay_end, r.id AS res_id
+                             FROM billing b
+                             LEFT JOIN boarding_reservations r ON r.id = COALESCE(b.boarding_res_id, b.appointment_id)
+                             LEFT JOIN users u ON u.id = COALESCE(b.user_id, r.user_id)
+                             WHERE b.is_boarding = 1 AND COALESCE(b.payment_status, '') <> 'Void'
+                               AND (b.payment_status = 'Paid' OR r.status IN ('Checked In', 'Completed'))
+                             ORDER BY (b.payment_status = 'Paid') DESC, (b.downpayment_status IN ('Paid', 'Partial')) DESC, b.id ASC LIMIT 60");
+        // one row per stay (some stays have duplicate invoices — keep the paid / deposit-paid / original one), newest first
+        $seen = [];
+        if ($rbq) while ($x = $rbq->fetch_assoc()) { $k = $x['res_id'] ?: 'b' . $x['id']; if (isset($seen[$k])) continue; $seen[$k] = 1; $recent_bills[] = $x; }
+        usort($recent_bills, fn($p, $q) => strcmp((string)($q['paid_at'] ?: $q['created_at']), (string)($p['paid_at'] ?: $p['created_at'])));
+        $recent_bills = array_slice($recent_bills, 0, 8);
+    ?>
+    <div class="mt-4 p-4 bg-white" style="border-radius:18px;border:1px solid #edf2f6;box-shadow:0 4px 18px rgba(15,23,42,.04);" id="boardingReceipts">
+        <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+            <h6 class="fw-bold m-0" style="font-size:16px;"><i class="fa fa-receipt text-primary me-2"></i>Boarding payments &amp; receipts</h6>
+            <span class="text-muted" style="font-size:12.5px;"><i class="fa fa-circle-info me-1"></i>Paid online or in cash — print or re-print the receipt anytime.</span>
+        </div>
+        <?php if (!$recent_bills): ?>
+            <div class="text-muted small py-3 text-center">No boarding payments yet.</div>
+        <?php else: ?>
+        <div class="table-responsive">
+            <table class="table table-sm align-middle mb-0" style="font-size:13px;">
+                <thead><tr class="text-muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;"><th>Invoice</th><th>Client · Pet</th><th>Stay</th><th class="text-end">Total</th><th>Status</th><th class="text-end"></th></tr></thead>
+                <tbody>
+                <?php foreach ($recent_bills as $rb):
+                    $rb_credit = in_array($rb['downpayment_status'], ['Paid', 'Partial'], true) ? (float)$rb['downpayment_amount'] : 0;
+                    $rb_bal = $rb['payment_status'] === 'Paid' ? 0 : max(0, (float)$rb['total_amount'] - $rb_credit); ?>
+                    <tr>
+                        <td class="fw-semibold"><?= htmlspecialchars($rb['invoice_no'] ?: 'INV-' . str_pad($rb['id'], 5, '0', STR_PAD_LEFT)) ?></td>
+                        <td><?= htmlspecialchars($rb['client'] ?? '—') ?> <span class="text-muted">· <?= htmlspecialchars($rb['pet'] ?? '') ?></span></td>
+                        <td class="text-muted"><?= $rb['stay_start'] ? date('M d', strtotime($rb['stay_start'])) . ' → ' . date('M d', strtotime($rb['stay_end'])) : '—' ?></td>
+                        <td class="text-end fw-semibold">₱<?= number_format((float)$rb['total_amount'], 2) ?></td>
+                        <td>
+                            <?php if ($rb['payment_status'] === 'Paid'): ?>
+                                <span class="badge rounded-pill" style="background:#dcfce7;color:#166534;">Paid<?= $rb['payment_method'] ? ' · ' . htmlspecialchars($rb['payment_method']) : '' ?></span>
+                                <?php if ($rb['paid_at']): ?><div class="text-muted" style="font-size:11px;"><?= date('M d, g:i A', strtotime($rb['paid_at'])) ?></div><?php endif; ?>
+                            <?php else: ?>
+                                <span class="badge rounded-pill" style="background:#fef3c7;color:#92400e;">Balance ₱<?= number_format($rb_bal, 2) ?></span>
+                            <?php endif; ?>
+                        </td>
+                        <td class="text-end">
+                            <?php if ($rb['payment_status'] === 'Paid'): ?>
+                                <a href="staff_receipt.php?bill=<?= (int)$rb['id'] ?>" target="_blank" class="btn btn-sm fw-bold" style="background:#16a34a !important;background-image:none !important;color:#fff !important;border:none !important;border-radius:999px !important;padding:5px 12px;font-size:12px;box-shadow:none !important;"><i class="fa fa-print me-1"></i>Print receipt</a>
+                            <?php else: ?>
+                                <span class="text-muted" style="font-size:12px;">Awaiting payment</span>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+        <?php endif; ?>
+    </div>
+    <?php endif; ?>
+
+</main>
+
+<!-- ── MODALS (all outside any table/flex container) ─────────────────────── -->
+<?php
+for ($i = 1; $i <= $cage_count; $i++):
+    if (empty($cages[$i])) continue;
+    foreach ($cages[$i] as $b):
+        if ($b['status'] === 'Maintenance') continue;
+?>
+
+<!-- Details Modal: booking #<?= $b['id'] ?> -->
+<div class="modal fade" id="detailsModal_<?= $b['id'] ?>" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-lg">
+        <div class="modal-content shadow-lg" style="border-radius:20px; overflow:hidden;">
+            <div class="modal-header text-white border-0" style="background:linear-gradient(135deg,#1e3a8a,#2563eb);">
+                <div>
+                    <h5 class="fw-bold mb-0"><i class="fa fa-info-circle me-2"></i>Boarding Reservation Details</h5>
+                    <small class="opacity-75">Cage 0<?= $i ?> &mdash; <?= htmlspecialchars($b['status']) ?></small>
+                </div>
+                <button type="button" class="btn-close btn-close-white ms-auto" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body p-4">
+                <!-- Pet & Owner Info -->
+                <div class="row g-3 mb-3">
+                    <div class="col-md-6">
+                        <div class="p-3 rounded-3 bg-light border h-100">
+                            <div class="saas-label"><i class="fa fa-paw me-1"></i>Pet Info</div>
+                            <div class="fw-bold text-primary fs-6 mb-2"><?= htmlspecialchars($b['pet_name']) ?></div>
+                            <?php if(!empty($b['species'])): ?>
+                            <div class="d-flex flex-wrap gap-2 text-muted" style="font-size: 11.5px;">
+                                <?php if(!empty($b['species'])): ?><span class="badge bg-light text-dark border"><i class="fa fa-paw me-1 opacity-50"></i><?= htmlspecialchars($b['species']) ?></span><?php endif; ?>
+                                <?php if(!empty($b['breed'])): ?><span class="badge bg-light text-dark border"><i class="fa fa-tag me-1 opacity-50"></i><?= htmlspecialchars($b['breed']) ?></span><?php endif; ?>
+                                <?php if(!empty($b['gender'])): ?><span class="badge bg-light text-dark border"><i class="fa fa-venus-mars me-1 opacity-50"></i><?= htmlspecialchars($b['gender']) ?></span><?php endif; ?>
+                                <?php if(!empty($b['weight'])): ?><span class="badge bg-light text-dark border"><i class="fa fa-weight me-1 opacity-50"></i><?= htmlspecialchars($b['weight']) ?> kg</span><?php endif; ?>
+                                <?php if(!empty($b['age'])): ?><span class="badge bg-light text-dark border"><i class="fa fa-birthday-cake me-1 opacity-50"></i><?= htmlspecialchars($b['age']) ?> yrs</span><?php endif; ?>
+                            </div>
+                            <?php else: ?>
+                            <div class="small text-muted"><em>Full details unavailable (Walk-in or unlinked)</em></div>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="p-3 rounded-3 bg-light border h-100">
+                            <div class="saas-label"><i class="fa fa-user me-1"></i>Owner / Client</div>
+                            <div class="fw-bold mb-1"><?= htmlspecialchars($b['client_name'] ?? 'Walk-In Client') ?></div>
+                            <div class="small text-muted"><?= htmlspecialchars($b['contact_number'] ?? '') ?></div>
+                            <div class="small text-muted"><?= htmlspecialchars($b['email'] ?? '') ?></div>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="p-3 rounded-3 bg-light border">
+                            <div class="saas-label">Cage</div>
+                            <div class="fw-bold">Cage 0<?= $i ?></div>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="p-3 rounded-3 bg-light border">
+                            <div class="saas-label">Check-In</div>
+                            <div class="fw-bold"><?= date("M d, Y", strtotime($b['appointment_date'])) ?></div>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="p-3 rounded-3 bg-light border">
+                            <div class="saas-label">Check-Out</div>
+                            <div class="fw-bold"><?= date("M d, Y", strtotime($b['end_date'])) ?></div>
+                        </div>
+                    </div>
+                    <?php if (!empty($b['care_notes'])): ?>
+                    <div class="col-12">
+                        <div class="p-3 rounded-3 border" style="background:#fffbeb;">
+                            <div class="saas-label"><i class="fa fa-notes-medical me-1"></i>Care Instructions</div>
+                            <div class="small text-dark"><?= nl2br(htmlspecialchars($b['care_notes'])) ?></div>
+                        </div>
+                    </div>
+                    <?php endif; ?>
+                    <?php if (!empty($b['admin_message'])): ?>
+                    <div class="col-12">
+                        <div class="p-3 rounded-3 border" style="background:#f0f9ff;">
+                            <div class="saas-label"><i class="fa fa-history me-1"></i>Audit Trail</div>
+                            <div class="small text-secondary"><?= nl2br(htmlspecialchars($b['admin_message'])) ?></div>
+                        </div>
+                    </div>
+                    <?php endif; ?>
+                </div>
+
+                <?php if ($can_manage && !in_array($b['status'], ['Completed', 'Cancelled', 'Rejected'])): ?>
+                <!-- ── MANAGE SCHEDULE (staff only) ── -->
+                <hr class="my-3">
+                <div class="fw-bold text-dark mb-3" style="font-size:13px; text-transform:uppercase; letter-spacing:.5px;">
+                    <i class="fa fa-sliders-h me-1 text-primary"></i> Manage Schedule
+                </div>
+                <form method="POST" id="manageForm_<?= $b['id'] ?>">
+                    <input type="hidden" name="apt_id" value="<?= $b['id'] ?>">
+                    <div class="row g-2 mb-2">
+                        <div class="col-6">
+                            <label class="saas-label">New Check-In</label>
+                            <input type="date" name="new_start_date" class="form-control form-control-sm" value="<?= $b['appointment_date'] ?>" onclick="if(this.showPicker) this.showPicker();">
+                        </div>
+                        <div class="col-6">
+                            <label class="saas-label">New Check-Out</label>
+                            <input type="date" name="new_end_date" class="form-control form-control-sm" value="<?= $b['end_date'] ?>" onclick="if(this.showPicker) this.showPicker();">
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="saas-label">Reason / Staff Note <span class="text-danger">*</span></label>
+                        <input type="text" name="admin_message" id="admin_message_<?= $b['id'] ?>" class="form-control form-control-sm" placeholder="Reason for reschedule or cancellation…" required>
+                    </div>
+                    <div class="d-flex gap-2">
+                        <button type="button" class="btn btn-sm btn-primary w-50 fw-bold rounded-pill"
+                            onclick="
+                                let reasonInput = document.getElementById('admin_message_<?= $b['id'] ?>');
+                                if (!reasonInput.value.trim()) {
+                                    alert('Please enter a Reason / Staff Note before proposing a shift.');
+                                    reasonInput.focus();
+                                    return;
+                                }
+                                pragmaConfirm('Propose shift of dates?', 'This will update the dates and notify the client.', 'info', function(){ 
+                                    let f = document.getElementById('manageForm_<?= $b['id'] ?>');
+                                    let input = document.createElement('input');
+                                    input.type = 'hidden';
+                                    input.name = 'boarding_manage';
+                                    input.value = 'reschedule';
+                                    f.appendChild(input);
+                                    f.submit();
+                                })">
+                            <i class="fa fa-calendar-alt me-1"></i> Propose Shift
+                        </button>
+                        <button type="button" class="btn btn-sm btn-outline-danger w-50 fw-bold rounded-pill"
+                            onclick="pragmaConfirm('Cancel this boarding reservation?', 'This will cancel the booking and notify the client. This cannot be undone.', 'danger', function(){ document.getElementById('cancelForm_<?= $b['id'] ?>').submit(); })">
+                            <i class="fa fa-times me-1"></i> Cancel Booking
+                        </button>
+                    </div>
+                </form>
+                <!-- Hidden cancel form -->
+                <form method="POST" id="cancelForm_<?= $b['id'] ?>" class="d-none">
+                    <input type="hidden" name="apt_id" value="<?= $b['id'] ?>">
+                    <input type="hidden" name="boarding_manage" value="cancel">
+                </form>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
+</div>
+
+<?php if ($can_manage): ?>
+<!-- Care Notes Modal: booking #<?= $b['id'] ?> -->
+<div class="modal fade" id="careModal_<?= $b['id'] ?>" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content shadow-lg">
+            <div class="modal-header border-0 pb-0">
+                <h5 class="fw-bold"><i class="fa fa-notes-medical text-primary me-2"></i>Care &amp; Feeding Notes</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body p-4">
+                <div class="p-3 bg-light rounded-3 mb-3">
+                    <div class="fw-bold text-dark"><i class="fa fa-paw text-primary me-1"></i><?= htmlspecialchars($b['pet_name']) ?> <span class="text-muted fw-normal">(<?= htmlspecialchars($b['client_name'] ?? 'N/A') ?>)</span></div>
+                    <div class="small text-muted">Cage 0<?= $i ?> | Stay: <?= date("M d, Y", strtotime($b['appointment_date'])) ?> → <?= date("M d, Y", strtotime($b['end_date'])) ?></div>
+                </div>
+                <form method="POST">
+                    <input type="hidden" name="apt_id" value="<?= $b['id'] ?>">
+                    <label class="saas-label">Dietary &amp; Care Instructions</label>
+                    <textarea name="care_notes" class="form-control mb-3" rows="4" placeholder="E.g. Feed 2x daily with kibble, eye drops at 9 AM…"><?= htmlspecialchars($b['care_notes'] ?? '') ?></textarea>
+                    <button type="submit" name="save_care_notes" class="btn btn-primary w-100 fw-bold rounded-pill">
+                        <i class="fa fa-save me-1"></i> Save Instructions
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<?php if ($can_manage && in_array($b['status'], ['Checked In', 'Approved'], true)): $co = bb_preview($conn, $b); ?>
+<!-- Check-out & billing: booking #<?= $b['id'] ?> -->
+<div class="modal fade" id="checkoutModal_<?= $b['id'] ?>" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content shadow-lg" style="border-radius:18px;">
+            <form method="POST" onsubmit="return coValidate(<?= (int)$b['id'] ?>, <?= json_encode($co['balance']) ?>)">
+                <input type="hidden" name="apt_id" value="<?= (int)$b['id'] ?>">
+                <input type="hidden" name="release_cage" value="1">
+                <div class="modal-header border-0 pb-0">
+                    <div>
+                        <h5 class="fw-bold mb-0"><i class="fa fa-sign-out-alt text-danger me-2"></i>Check-out — <?= htmlspecialchars($b['pet_name']) ?></h5>
+                        <div class="small text-muted">Cage <?= str_pad((int)$i, 2, '0', STR_PAD_LEFT) ?> · <?= date('M d', strtotime($b['appointment_date'])) ?> → <?= date('M d, Y', strtotime($b['end_date'])) ?><?= $co['invoice_no'] ? ' · ' . htmlspecialchars($co['invoice_no']) : '' ?></div>
+                    </div>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="p-3 rounded-3" style="background:#f8fafc;border:1px solid #e2e8f0;font-size:13.5px;">
+                        <div class="d-flex justify-content-between"><span>Boarding · <?= $co['nights'] ?> night<?= $co['nights'] > 1 ? 's' : '' ?> × ₱<?= number_format($co['rate'], 2) ?></span><b>₱<?= number_format($co['total'], 2) ?></b></div>
+                        <?php if ($co['credit'] > 0): ?><div class="d-flex justify-content-between text-success mt-1"><span>Less: paid at booking</span><span>− ₱<?= number_format($co['credit'], 2) ?></span></div><?php endif; ?>
+                        <hr class="my-2">
+                        <div class="d-flex justify-content-between align-items-center"><span class="fw-bold">Balance due</span>
+                            <span class="fw-bold" style="font-size:18px;color:<?= $co['balance'] > 0 ? '#dc2626' : '#16a34a' ?>;"><?= $co['balance'] > 0 ? '₱' . number_format($co['balance'], 2) : 'Fully paid' ?></span></div>
+                    </div>
+                    <?php if ($co['balance'] > 0): ?>
+                    <div class="mt-3">
+                        <label class="d-flex gap-2 align-items-start p-2 rounded-3 border mb-2" style="cursor:pointer;">
+                            <input type="radio" name="pay_now" value="cash" class="form-check-input mt-1" checked onchange="coMode(<?= (int)$b['id'] ?>)">
+                            <span><b>Collect cash now</b><br><span class="small text-muted">Marks the invoice paid and opens the printable receipt.</span></span>
+                        </label>
+                        <div id="coCash_<?= (int)$b['id'] ?>" class="ps-4 mb-2">
+                            <div class="row g-2 align-items-end">
+                                <div class="col-6"><label class="small fw-semibold">Cash received (₱)</label>
+                                    <input type="number" step="0.01" min="0" name="cash_tendered" id="coTender_<?= (int)$b['id'] ?>" class="form-control" value="<?= number_format($co['balance'], 2, '.', '') ?>" oninput="coChange(<?= (int)$b['id'] ?>, <?= json_encode($co['balance']) ?>)"></div>
+                                <div class="col-6"><div class="small text-muted">Change</div><div class="fw-bold" id="coChangeTxt_<?= (int)$b['id'] ?>">₱0.00</div></div>
+                            </div>
+                        </div>
+                        <label class="d-flex gap-2 align-items-start p-2 rounded-3 border mb-2" style="cursor:pointer;<?= $co['balance'] < 100 ? 'opacity:.55;' : '' ?>">
+                            <input type="radio" name="pay_now" value="paymongo" class="form-check-input mt-1" onchange="coMode(<?= (int)$b['id'] ?>)" <?= $co['balance'] < 100 ? 'disabled' : '' ?>>
+                            <span><b><i class="fa fa-credit-card me-1 text-primary"></i>Pay with PayMongo</b> <span class="badge bg-primary bg-opacity-10 text-primary" style="font-size:10.5px;">GCash · Maya · Card</span><br>
+                                <span class="small text-muted"><?= $co['balance'] < 100 ? 'PayMongo needs at least ₱100 — collect this balance in cash.' : 'Opens PayMongo for ₱' . number_format($co['balance'], 2) . '. The pet is checked out only after the payment is confirmed.' ?></span></span>
+                        </label>
+                        <label class="d-flex gap-2 align-items-start p-2 rounded-3 border" style="cursor:pointer;">
+                            <input type="radio" name="pay_now" value="later" class="form-check-input mt-1" onchange="coMode(<?= (int)$b['id'] ?>)">
+                            <span><b>Client will pay later</b><br><span class="small text-muted">Online in their Billing page or at the counter. They'll be notified of the balance.</span></span>
+                        </label>
+                    </div>
+                    <?php elseif ($co['paid'] && $co['bill_id']): ?>
+                    <a href="staff_receipt.php?bill=<?= (int)$co['bill_id'] ?>" target="_blank" class="btn btn-sm btn-outline-success fw-bold rounded-pill mt-3"><i class="fa fa-print me-1"></i> Print receipt</a>
+                    <?php endif; ?>
+                </div>
+                <div class="modal-footer border-0">
+                    <button type="button" class="btn btn-light fw-semibold rounded-pill" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-danger fw-bold rounded-pill px-4" id="coSubmit_<?= (int)$b['id'] ?>"><i class="fa fa-sign-out-alt me-1"></i> <span><?= $co['balance'] > 0 ? 'Receive cash &amp; check out' : 'Check out &amp; release cage' ?></span></button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+<?php endif; ?>
+
+<!-- CCTV Feed Binding Modal: booking #<?= $b['id'] ?> -->
+<div class="modal fade" id="cctvModal_<?= $b['id'] ?>" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content shadow-lg border-0" style="border-radius: 20px;">
+            <div class="modal-header border-0 pb-0">
+                <h5 class="fw-bold"><i class="fa fa-video text-info me-2"></i>CCTV Feed Binding — Cage 0<?= $i ?></h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body p-4">
+                <form method="POST" class="mb-3">
+                    <input type="hidden" name="apt_id" value="<?= $b['id'] ?>">
+                    <div class="mb-3">
+                        <label class="saas-label">CCTV Camera Stream URL</label>
+                        <input type="text" name="cctv_link" class="form-control" required inputmode="url" autocomplete="off" value="<?= htmlspecialchars($b['cctv_link'] ?? '') ?>" placeholder="e.g. http://192.168.1.5:8080/video">
+                        <div class="form-text"><?= !empty($b['cctv_link']) ? 'Saved link: <span class="font-monospace">' . htmlspecialchars($b['cctv_link']) . '</span>' : '<span class="text-danger fw-semibold">No camera link saved yet.</span> The client sees "Camera not configured yet" until one is saved.' ?></div>
+                    </div>
+                    <button type="submit" name="save_cctv" class="btn btn-info text-white w-100 fw-bold rounded-pill shadow-sm mb-2">
+                        <i class="fa fa-save me-1"></i> Save Camera Stream Link
+                    </button>
+                </form>
+
+                <?php if (!empty($b['cctv_link'])): ?>
+                    <div class="p-3 bg-light rounded-3 text-center border">
+                        <div class="fw-bold text-dark mb-3" style="font-size: 13px;">Live CCTV Preview / Toggle</div>
+                        <div class="d-flex justify-content-center gap-2">
+                            <button class="btn btn-sm btn-success rounded-pill px-3 fw-bold shadow-sm" onclick="toggleCctv(<?= $b['id'] ?>, 1, <?= htmlspecialchars(json_encode($b['pet_name']), ENT_QUOTES) ?>, <?= (int)$b['cctv_enabled'] ?>)">
+                                <i class="fa fa-play me-1"></i> Turn Stream ON
+                            </button>
+                            <button class="btn btn-sm btn-danger rounded-pill px-3 fw-bold shadow-sm" onclick="toggleCctv(<?= $b['id'] ?>, 0, <?= htmlspecialchars(json_encode($b['pet_name']), ENT_QUOTES) ?>, <?= (int)$b['cctv_enabled'] ?>)">
+                                <i class="fa fa-stop me-1"></i> Turn Stream OFF
+                            </button>
+                        </div>
+                    </div>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
+</div>
+<?php endif; ?>
+
+<?php endforeach; endfor; ?>
+
+<!-- Walk-in Boarding Modal (staff only) -->
+<?php if ($can_manage): ?>
+<div class="modal fade" id="walkinBoardingModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content shadow-lg">
+            <div class="modal-header border-0 pb-0">
+                <h5 class="fw-bold"><i class="fa fa-plus-circle text-primary me-2"></i>Register Walk-in Boarding Pet</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body p-4">
+                <form method="POST">
+                    <div class="row g-2 mb-3">
+                        <div class="col-6">
+                            <label class="saas-label">Client Name</label>
+                            <input type="text" name="client_name" class="form-control" required placeholder="Owner's full name">
+                        </div>
+                        <div class="col-6">
+                            <label class="saas-label">Pet Name</label>
+                            <input type="text" name="pet_name" class="form-control" required placeholder="Pet's name">
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="saas-label">Assign Boarding Cage</label>
+                        <select name="cage_number" id="walkin_cage_select" class="form-select fw-bold" required>
+                            <?php for ($c = 1; $c <= $cage_count; $c++): ?>
+                                <option value="<?= $c ?>">Cage 0<?= $c ?></option>
+                            <?php endfor; ?>
+                        </select>
+                    </div>
+                    <div class="row g-2 mb-3">
+                        <div class="col-6">
+                            <label class="saas-label">Check-In Date</label>
+                            <input type="date" name="appointment_date" class="form-control" required value="<?= date('Y-m-d') ?>">
+                        </div>
+                        <div class="col-6">
+                            <label class="saas-label">Check-Out Date</label>
+                            <input type="date" name="end_date" class="form-control" required value="<?= date('Y-m-d', strtotime('+1 day')) ?>">
+                        </div>
+                    </div>
+                    <div class="mb-4">
+                        <label class="saas-label">Care Notes (Optional)</label>
+                        <textarea name="care_notes" class="form-control" rows="2" placeholder="Dietary or care instructions…"></textarea>
+                    </div>
+                    <button type="submit" name="add_walkin_boarding" class="btn btn-primary w-100 fw-bold rounded-pill py-2">
+                        <i class="fa fa-check-circle me-1"></i> Register &amp; Check-In Pet
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+<?php endif; ?>
+
+<!-- ── CUSTOM CONFIRM MODAL ─────────────────────────────────────────────── -->
+<div class="modal fade" id="pragmaConfirmModal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false" style="z-index: 99999;">
+    <div class="modal-dialog modal-dialog-centered" style="max-width:420px; z-index: 100000;">
+        <div class="modal-content" style="border-radius:20px; overflow:hidden;">
+            <div id="pragmaConfirmStripe" style="height:5px; background:linear-gradient(90deg,#dc2626,#ef4444);"></div>
+            <div class="modal-body p-4">
+                <div class="d-flex align-items-start gap-3 mb-4">
+                    <div id="pragmaConfirmIconWrap"
+                         style="width:52px;height:52px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0;background:rgba(220,38,38,.1);color:#dc2626;">
+                        <i id="pragmaConfirmIcon" class="fa fa-exclamation-triangle"></i>
+                    </div>
+                    <div>
+                        <h5 id="pragmaConfirmTitle" class="fw-bold mb-1" style="font-size:16px;color:#1e293b;"></h5>
+                        <p id="pragmaConfirmMessage" class="text-muted mb-0" style="font-size:13.5px;line-height:1.55;"></p>
+                    </div>
+                </div>
+                <div class="d-flex gap-2 justify-content-end">
+                    <button type="button" class="btn btn-light fw-semibold px-4 rounded-pill" data-bs-dismiss="modal" style="font-size:13.5px;border:1px solid #e2e8f0;">
+                        <i class="fa fa-times me-1 opacity-50"></i> Cancel
+                    </button>
+                    <button type="button" id="pragmaConfirmOkBtn" class="btn fw-bold px-4 rounded-pill btn-danger" style="font-size:13.5px;">
+                        <i class="fa fa-check me-1"></i> <span id="pragmaConfirmOkLabel">Confirm</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+function openWalkinModal(cageNo) {
+    document.getElementById('walkin_cage_select').value = cageNo;
+    new bootstrap.Modal(document.getElementById('walkinBoardingModal')).show();
+}
+
+// ── pragmaConfirm ──────────────────────────────────────────────────────────
+(function() {
+    var _cb = null, _modal = null;
+    var palettes = {
+        danger:  { stripe:'linear-gradient(90deg,#dc2626,#ef4444)', iconBg:'rgba(220,38,38,.1)', iconColor:'#dc2626', btn:'btn-danger',  icon:'fa-exclamation-triangle', label:'Yes, Confirm' },
+        warning: { stripe:'linear-gradient(90deg,#d97706,#f59e0b)', iconBg:'rgba(217,119,6,.1)',  iconColor:'#d97706', btn:'btn-warning', icon:'fa-exclamation-circle',  label:'Yes, Proceed'  },
+        info:    { stripe:'linear-gradient(90deg,#2563eb,#3b82f6)', iconBg:'rgba(37,99,235,.1)',  iconColor:'#2563eb', btn:'btn-primary', icon:'fa-info-circle',          label:'OK'            },
+    };
+    window.pragmaConfirm = function(title, message, type, callback) {
+        var p = palettes[type] || palettes.danger;
+        document.getElementById('pragmaConfirmStripe').style.background    = p.stripe;
+        document.getElementById('pragmaConfirmIconWrap').style.background  = p.iconBg;
+        document.getElementById('pragmaConfirmIconWrap').style.color       = p.iconColor;
+        document.getElementById('pragmaConfirmIcon').className             = 'fa ' + p.icon;
+        document.getElementById('pragmaConfirmTitle').textContent          = title;
+        document.getElementById('pragmaConfirmMessage').innerHTML          = message;
+        document.getElementById('pragmaConfirmOkLabel').textContent        = p.label;
+        var btn = document.getElementById('pragmaConfirmOkBtn');
+        btn.className = 'btn fw-bold px-4 rounded-pill ' + p.btn;
+        _cb = callback;
+        if (!_modal) _modal = new bootstrap.Modal(document.getElementById('pragmaConfirmModal'));
+        _modal.show();
+    };
+    document.addEventListener('DOMContentLoaded', function() {
+        document.getElementById('pragmaConfirmOkBtn').addEventListener('click', function() {
+            if (_modal) _modal.hide();
+            if (typeof _cb === 'function') setTimeout(_cb, 200);
+        });
+    });
+})();
+
+// Turn a cage's live feed on/off: confirm in a dialog, then show the result in the same dialog
+function toggleCctv(aptId, state, petName, current) {
+    var d = document.getElementById('sbCamDlg'), icon = document.getElementById('sbCamIcon'),
+        title = document.getElementById('sbCamTitle'), text = document.getElementById('sbCamText'),
+        go = document.getElementById('sbCamGo'), cancel = document.getElementById('sbCamCancel');
+    var pet = String(petName || 'this pet').replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    var done = false;
+    function show(kind, t, msg, goLabel, cancelLabel) {
+        d.className = 'sbcam-bd open sbcam-' + kind;
+        icon.innerHTML = { on: '<i class="fa fa-video"></i>', off: '<i class="fa fa-video-slash"></i>', ok: '<i class="fa fa-check"></i>', err: '<i class="fa fa-triangle-exclamation"></i>', busy: '<i class="fa fa-spinner fa-spin"></i>' }[kind];
+        title.textContent = t; text.innerHTML = msg;
+        go.style.display = goLabel ? '' : 'none'; go.innerHTML = goLabel || '';
+        cancel.style.display = cancelLabel ? '' : 'none'; cancel.textContent = cancelLabel || '';
+    }
+    cancel.onclick = function () { d.classList.remove('open'); };
+    if (state === current) {
+        show(state ? 'on' : 'off', state ? 'Live feed is already ON' : 'Live feed is already OFF',
+             state ? 'The owner of <b>' + pet + '</b> can already watch the cage camera.' : 'The owner of <b>' + pet + '</b> can\'t watch the cage camera right now.', '', 'Close');
+        return;
+    }
+    show(state ? 'on' : 'off',
+         state ? 'Turn the live feed ON?' : 'Turn the live feed OFF?',
+         state ? 'The owner of <b>' + pet + '</b> will be able to watch the cage camera and will get a notification.'
+               : 'The owner of <b>' + pet + '</b> will no longer be able to watch the cage camera. They will be notified that it is paused.',
+         state ? '<i class="fa fa-play me-1"></i> Turn ON' : '<i class="fa fa-stop me-1"></i> Turn OFF', 'Cancel');
+    go.onclick = function () {
+        if (done) { location.reload(); return; }
+        var formData = new FormData();
+        formData.append(state ? 'turn_on_cctv_ajax' : 'turn_off_cctv_ajax', 1);
+        formData.append('apt_id', aptId);
+        show('busy', state ? 'Turning the feed on…' : 'Turning the feed off…', 'Please wait a moment.', '', '');
+        fetch('staff_boarding.php', { method: 'POST', body: formData })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (data.status !== 'success') throw new Error();
+                done = true;
+                show('ok', state ? 'Live feed is now ON' : 'Live feed is now OFF',
+                     state ? 'The owner of <b>' + pet + '</b> can now watch the cage camera.' : 'The owner of <b>' + pet + '</b> can no longer watch the cage camera.',
+                     'Done', '');
+            })
+            .catch(function () {
+                show('err', 'Couldn\'t update the live feed', 'Something went wrong. Check your connection and try again.', '', 'Close');
+            });
+    };
+}
+</script>
+<script>
+function coMode(id) {
+    var cash = document.querySelector('#checkoutModal_' + id + ' input[name="pay_now"][value="cash"]');
+    var box = document.getElementById('coCash_' + id);
+    if (box && cash) box.style.display = cash.checked ? '' : 'none';
+    var picked = document.querySelector('#checkoutModal_' + id + ' input[name="pay_now"]:checked');
+    var lbl = document.querySelector('#coSubmit_' + id + ' span');
+    if (lbl && picked) lbl.innerHTML = picked.value === 'cash' ? 'Receive cash &amp; check out' : (picked.value === 'paymongo' ? 'Continue to PayMongo' : 'Check out &amp; release cage');
+}
+function coChange(id, bal) {
+    var t = parseFloat(document.getElementById('coTender_' + id).value) || 0;
+    var el = document.getElementById('coChangeTxt_' + id);
+    el.textContent = t >= bal ? '₱' + (t - bal).toFixed(2) : 'Short by ₱' + (bal - t).toFixed(2);
+    el.style.color = t >= bal ? '#0f172a' : '#dc2626';
+}
+function coValidate(id, bal) {
+    var cash = document.querySelector('#checkoutModal_' + id + ' input[name="pay_now"][value="cash"]');
+    if (bal > 0 && cash && cash.checked) {
+        var t = parseFloat(document.getElementById('coTender_' + id).value) || 0;
+        if (t < bal) { alert('Cash received is less than the balance of ₱' + bal.toFixed(2) + '.'); return false; }
+    }
+    return true;
+}
+</script>
+<div id="sbCamDlg" class="sbcam-bd" role="dialog" aria-modal="true" aria-labelledby="sbCamTitle">
+    <div class="sbcam-box">
+        <div class="sbcam-icon" id="sbCamIcon"></div>
+        <h3 id="sbCamTitle"></h3>
+        <p id="sbCamText"></p>
+        <div class="sbcam-actions">
+            <button type="button" class="sbcam-cancel" id="sbCamCancel">Cancel</button>
+            <button type="button" class="sbcam-go" id="sbCamGo"></button>
+        </div>
+    </div>
+</div>
+<style>
+    .sbcam-bd { position:fixed; inset:0; background:rgba(15,23,42,.55); backdrop-filter:blur(2px); z-index:100000; display:none; align-items:center; justify-content:center; padding:16px; }
+    .sbcam-bd.open { display:flex; }
+    .sbcam-box { background:#fff; border-radius:22px; width:100%; max-width:400px; padding:26px 24px 22px; text-align:center; box-shadow:0 30px 70px rgba(15,23,42,.3); animation:sbcamPop .18s ease; }
+    @keyframes sbcamPop { from { transform:translateY(10px) scale(.97); opacity:0; } to { transform:none; opacity:1; } }
+    .sbcam-icon { width:60px; height:60px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; font-size:24px; margin-bottom:10px; }
+    .sbcam-box h3 { font-size:19px; font-weight:800; color:#0f172a; margin:4px 0 6px; }
+    .sbcam-box p { font-size:14px; color:#64748b; margin:0; line-height:1.5; }
+    .sbcam-actions { display:flex; gap:10px; margin-top:20px; }
+    .sbcam-actions button { flex:1; border:none; border-radius:999px; padding:11px 14px; font-weight:800; font-size:14px; cursor:pointer; background-image:none !important; box-shadow:none !important; }
+    .sbcam-cancel { background:#f1f5f9 !important; color:#334155 !important; }
+    .sbcam-cancel:hover { background:#e2e8f0 !important; }
+    .sbcam-go { color:#fff !important; }
+    .sbcam-on .sbcam-icon   { background:#ecfdf5; color:#059669; }  .sbcam-on .sbcam-go  { background:#059669 !important; }
+    .sbcam-off .sbcam-icon  { background:#fef2f2; color:#dc2626; }  .sbcam-off .sbcam-go { background:#dc2626 !important; }
+    .sbcam-ok .sbcam-icon   { background:#ecfdf5; color:#059669; }  .sbcam-ok .sbcam-go  { background:#2563eb !important; }
+    .sbcam-err .sbcam-icon  { background:#fef2f2; color:#dc2626; }
+    .sbcam-busy .sbcam-icon { background:#eff6ff; color:#2563eb; }
+</style>
+</body>
+</html>

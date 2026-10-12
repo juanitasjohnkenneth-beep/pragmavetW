@@ -1,0 +1,110 @@
+<?php
+/**
+ * Service prices — single source of truth, editable by the admin in System Settings.
+ * Seeded with the amounts the system already charged, so nothing changes until an admin edits a price.
+ */
+
+function sp_ensure_table($conn) {
+    static $done = false;
+    if ($done) return;
+    $done = true;
+    $conn->query("
+        CREATE TABLE IF NOT EXISTS service_prices (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            service_name VARCHAR(100) NOT NULL,
+            price DECIMAL(10,2) NOT NULL DEFAULT 0,
+            unit VARCHAR(20) NOT NULL DEFAULT 'per visit',
+            sort_order INT NOT NULL DEFAULT 0,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uk_service (service_name)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+    $r = $conn->query("SELECT COUNT(*) c FROM service_prices");
+    if ($r && (int)$r->fetch_assoc()['c'] === 0) {
+        $seed = [
+            ['Consultation', 500, 'per visit'], ['General Checkup', 500, 'per visit'],
+            ['Vaccination', 800, 'per visit'], ['Deworming', 800, 'per visit'], ['Vaccination and Deworming', 800, 'per visit'],
+            ['Laboratory Test', 950, 'per visit'], ['Dental Cleaning', 1500, 'per visit'], ['Dental Prophylaxis', 1500, 'per visit'],
+            ['Grooming', 500, 'per visit'], ['Surgery', 500, 'per visit'], ['Confinement', 2000, 'per visit'],
+            ['Other Services', 500, 'per visit'], ['Pet Boarding', 800, 'per day'],
+        ];
+        $st = $conn->prepare("INSERT INTO service_prices (service_name, price, unit, sort_order) VALUES (?, ?, ?, ?)");
+        foreach ($seed as $i => $row) {
+            $st->bind_param("sdsi", $row[0], $row[1], $row[2], $i);
+            $st->execute();
+        }
+    }
+
+    // Sub-options (e.g. vaccine types) live under a parent service via `category`
+    $conn->query("ALTER TABLE service_prices ADD COLUMN IF NOT EXISTS category VARCHAR(100) NULL DEFAULT NULL");
+
+    // One-time: vaccine types 5-in-1 / 3-in-1 replace the single Vaccination price (start at the old price)
+    $hasVacc = $conn->query("SELECT COUNT(*) c FROM service_prices WHERE category = 'Vaccination'");
+    if ($hasVacc && (int)$hasVacc->fetch_assoc()['c'] === 0) {
+        $old = $conn->query("SELECT price, sort_order FROM service_prices WHERE service_name = 'Vaccination'")->fetch_assoc();
+        $p = $old ? (float)$old['price'] : 800.00;
+        $o = $old ? (int)$old['sort_order'] : 2;
+        $vs = $conn->prepare("INSERT IGNORE INTO service_prices (service_name, price, unit, sort_order, category) VALUES (?, ?, 'per dose', ?, 'Vaccination')");
+        foreach (['5-in-1 Vaccine', '3-in-1 Vaccine'] as $k => $vn) {
+            $so = $o * 10 + $k;
+            $vs->bind_param("sdi", $vn, $p, $so);
+            $vs->execute();
+        }
+        $conn->query("DELETE FROM service_prices WHERE service_name = 'Vaccination'");
+    }
+    // One-time: Laboratory Test gets sub-types. The base "Laboratory Test" row stays (booking uses it) and joins the group.
+    $hasLab = $conn->query("SELECT COUNT(*) c FROM service_prices WHERE category = 'Laboratory Test'");
+    if ($hasLab && (int)$hasLab->fetch_assoc()['c'] === 0) {
+        $base = $conn->query("SELECT price, sort_order FROM service_prices WHERE service_name = 'Laboratory Test'")->fetch_assoc();
+        $p = $base ? (float)$base['price'] : 950.00;
+        $o = $base ? (int)$base['sort_order'] : 5;
+        $conn->query("UPDATE service_prices SET category = 'Laboratory Test' WHERE service_name = 'Laboratory Test'");
+        $ls = $conn->prepare("INSERT IGNORE INTO service_prices (service_name, price, unit, sort_order, category) VALUES (?, ?, 'per test', ?, 'Laboratory Test')");
+        foreach (['Complete Blood Count (CBC)', 'Blood Chemistry', 'Urinalysis', 'Fecalysis', 'X-ray', 'Ultrasound', 'Skin Scraping'] as $k => $ln) {
+            $so = $o * 10 + $k + 1;
+            $ls->bind_param("sdi", $ln, $p, $so);
+            $ls->execute();
+        }
+    }
+    // "Other Services" is no longer offered
+    $conn->query("DELETE FROM service_prices WHERE service_name = 'Other Services'");
+}
+
+/** All services with prices, in display order. */
+function sp_all($conn) {
+    sp_ensure_table($conn);
+    $out = [];
+    $r = $conn->query("SELECT id, service_name, price, unit, category, updated_at FROM service_prices ORDER BY sort_order, service_name");
+    if ($r) while ($row = $r->fetch_assoc()) $out[] = $row;
+    return $out;
+}
+
+/** Price for a service type (exact name first, then the same keyword rules billing has always used). */
+function sp_price($conn, $service) {
+    static $map = null;
+    if ($map === null) {
+        $map = [];
+        foreach (sp_all($conn) as $row) $map[strtolower($row['service_name'])] = (float)$row['price'];
+    }
+    $s = strtolower(trim((string)$service));
+    if (isset($map[$s])) return $map[$s];
+    // Vaccine types: "3-in-1" picks that price; any other vaccination defaults to the 5-in-1 price
+    if (strpos($s, 'vaccin') !== false && strpos($s, 'deworm') === false) {
+        if (strpos($s, '3-in-1') !== false || strpos($s, '3 in 1') !== false) return $map['3-in-1 vaccine'] ?? ($map['5-in-1 vaccine'] ?? 800.00);
+        return $map['5-in-1 vaccine'] ?? ($map['3-in-1 vaccine'] ?? 800.00);
+    }
+    $kw = [
+        'deworm' => 'deworming', 'dental' => 'dental cleaning',
+        'lab' => 'laboratory test', 'test' => 'laboratory test', 'confinement' => 'confinement',
+        'groom' => 'grooming', 'surg' => 'surgery', 'board' => 'pet boarding',
+    ];
+    foreach ($kw as $needle => $name) {
+        if (strpos($s, $needle) !== false && isset($map[$name])) return $map[$name];
+    }
+    return $map['consultation'] ?? 500.00;
+}
+
+/** Boarding rate per day. */
+function sp_boarding_rate($conn) {
+    return sp_price($conn, 'Pet Boarding');
+}

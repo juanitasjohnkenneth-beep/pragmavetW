@@ -1,0 +1,370 @@
+<?php
+session_start();
+include("dbconnection.php");
+
+$user_role = $_SESSION['role'] ?? '';
+$is_admin = ($user_role === 'admin');
+$is_owner = ($user_role === 'clinic_owner' || $user_role === 'owner');
+$is_staff = ($user_role === 'staff');
+$is_doctor = ($user_role === 'doctor');
+
+if(!isset($_SESSION['user_id']) || (!$is_admin && !$is_owner && !$is_staff && !$is_doctor)){
+    header("Location: index.php");
+    exit();
+}
+
+// Log Vitals
+if(isset($_POST['log_vitals'])) {
+    $pet_id   = (int)$_POST['pet_id'];
+    $temp     = (float)$_POST['temperature'];
+    $hr       = (int)$_POST['heart_rate'];
+    $notes    = $_POST['notes'];
+
+    $stmt = $conn->prepare("INSERT INTO monitoring(pet_id, temperature, heart_rate, notes) VALUES(?,?,?,?)");
+    $stmt->bind_param("idis", $pet_id, $temp, $hr, $notes);
+
+    if($stmt->execute()){
+        $_SESSION['message'] = "Vital signs recorded successfully.";
+        $_SESSION['msg_type'] = "success";
+    } else {
+        $_SESSION['message'] = "Error recording vitals.";
+        $_SESSION['msg_type'] = "danger";
+    }
+    header("Location: admin_monitoring.php");
+    exit();
+}
+
+// â”€â”€ Fetch pets for dropdown (registered pets + currently boarded pets via cage) â”€â”€
+$pets_query = $conn->query("
+    SELECT DISTINCT p.id, p.name, p.species
+    FROM pets p
+    ORDER BY p.name ASC
+");
+
+// â”€â”€ Fetch currently boarded pets (live cage synced view) â”€â”€
+$boarded_query = $conn->query("
+    SELECT br.id as res_id, br.cage_number, br.pet_name, br.appointment_date, br.end_date,
+           br.status, br.cctv_link, br.cctv_enabled,
+           u.fullname as owner_name,
+           (SELECT m.temperature FROM monitoring m
+            JOIN pets p2 ON m.pet_id=p2.id
+            WHERE p2.name = br.pet_name
+            ORDER BY m.recorded_at DESC LIMIT 1) as last_temp,
+           (SELECT m.heart_rate FROM monitoring m
+            JOIN pets p2 ON m.pet_id=p2.id
+            WHERE p2.name = br.pet_name
+            ORDER BY m.recorded_at DESC LIMIT 1) as last_hr,
+           (SELECT m.recorded_at FROM monitoring m
+            JOIN pets p2 ON m.pet_id=p2.id
+            WHERE p2.name = br.pet_name
+            ORDER BY m.recorded_at DESC LIMIT 1) as last_logged
+    FROM boarding_reservations br
+    JOIN users u ON br.user_id = u.id
+    WHERE br.status IN ('Approved','Pending')
+      AND br.service_type = 'Pet Boarding Reservation'
+      AND br.appointment_date <= CURDATE()
+      AND br.end_date >= CURDATE()
+    ORDER BY br.cage_number ASC
+");
+
+// â”€â”€ Fetch recent monitoring logs â”€â”€
+$logs = $conn->query("
+    SELECT m.*, p.name as pet_name, p.species
+    FROM monitoring m
+    JOIN pets p ON m.pet_id = p.id
+    ORDER BY m.recorded_at DESC LIMIT 20
+");
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="theme.js?v=<?=time()?>"></script>
+<link rel="stylesheet" href="theme.css?v=<?=time()?>">
+
+<title>Patient Monitoring | VetAdmin</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+<style>
+:root {
+    --primary: #2563eb; --secondary: #3b82f6; --dark: #1e40af; --light-bg: #E6EEF8;
+    --sidebar-width:260px;
+}
+body { background: var(--light-bg); font-family: 'Inter', sans-serif; color: #2D3748; }
+
+.sidebar { background:#0f172a; width:var(--sidebar-width); height:100vh; position:fixed; top:0; left:0; padding:24px 16px; z-index:1000; display:flex; flex-direction:column; box-shadow:5px 0 20px rgba(0,0,0,.2); overflow-y:auto; }
+.sidebar h4 { color:#ffffff; font-weight:800; font-size:22px; margin-bottom:30px; letter-spacing:0.5px; display:flex; align-items:center; gap:10px; }
+.sidebar a { display:flex; align-items:center; gap:10px; padding:12px 16px; border-radius:8px; color:#94a3b8; text-decoration:none; margin-bottom:4px; font-weight:600; font-size:15px; transition:.2s; }
+.sidebar a i { width: 25px; }
+.sidebar a:hover, .sidebar a.active { background:#2563eb; color:#ffffff; }
+
+.main-content { margin-left: var(--sidebar-width); padding: 40px; }
+.card-premium { background: white; border: none; border-radius: 15px; padding: 25px; box-shadow: 0 4px 6px rgba(0,0,0,0.02); }
+.table-custom thead th { background: #F7FAFC; color: #4A5568; font-size: 13px; border-bottom: 2px solid #E2E8F0; }
+
+/* Boarded pet cards */
+.boarder-card {
+    background: white; border-radius: 14px; padding: 18px 20px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.05); border-left: 4px solid #3b82f6;
+    transition: transform 0.2s;
+}
+.boarder-card:hover { transform: translateY(-3px); }
+.boarder-card.no-vitals { border-left-color: #ed8936; }
+
+.vital-pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600;
+}
+.vital-pill.temp-ok   { background: #e6fcf5; color: #0ca678; }
+.vital-pill.temp-high { background: #fff5f5; color: #e53e3e; }
+.vital-pill.no-data   { background: #E6EEF8; color: #718096; }
+
+.live-dot {
+    width: 8px; height: 8px; border-radius: 50%; background: #22c55e;
+    display: inline-block; animation: pulse-dot 1.5s infinite;
+}
+@keyframes pulse-dot {
+    0%,100% { opacity:1; transform:scale(1); }
+    50%      { opacity:.5; transform:scale(1.3); }
+}
+
+.sidebar::-webkit-scrollbar { width: 5px; }
+.sidebar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 10px; }
+.sidebar::-webkit-scrollbar-track { background: transparent; }
+</style>
+    <link rel="stylesheet" href="assets/pragmavet.css">
+    <link href="assets/global-style.css" rel="stylesheet">
+</head>
+<body>
+
+<?php if(isset($_SESSION['message'])): ?>
+<div class="position-fixed top-0 end-0 p-3" style="z-index: 9999">
+    <div class="alert alert-<?php echo $_SESSION['msg_type']; ?> alert-dismissible fade show shadow-sm pe-5">
+        <?php echo $_SESSION['message']; unset($_SESSION['message'], $_SESSION['msg_type']); ?>
+        <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+    </div>
+</div>
+<?php endif; ?>
+
+<?php include("includes/admin_sidebar.php"); ?>
+
+<div class="main-content">
+
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h2 class="fw-bold m-0 text-danger"><i class="fa fa-heartbeat me-2"></i> In-Patient Monitoring</h2>
+            <p class="text-muted mb-0">Live vital logging and real-time boarding cage status</p>
+        </div>
+        <div class="d-flex align-items-center gap-2">
+            <!-- Dark Mode Toggle -->
+            <button class="btn btn-sm btn-outline-secondary rounded-circle shadow-sm" id="themeToggle" style="width: 40px; height: 40px;">
+                <i class="fa fa-moon" id="themeIcon"></i>
+            </button>
+            <button class="btn btn-danger shadow-sm px-4" data-bs-toggle="modal" data-bs-target="#vitalModal">
+                <i class="fa fa-plus me-2"></i> Log New Vitals
+            </button>
+        </div>
+    </div>
+
+    <!-- â”€â”€ Currently Boarded Pets (Live Sync from Pet Hotel Ops) â”€â”€ -->
+    <div class="card-premium mb-4">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <h5 class="fw-bold m-0">
+                <i class="fa fa-hotel text-primary me-2"></i>
+                Currently Boarded Pets
+                <span class="badge bg-primary bg-opacity-10 text-primary border border-primary border-opacity-25 ms-2" style="font-size:12px;">
+                    Live Sync
+                </span>
+            </h5>
+            <a href="admin_boarding.php" class="btn btn-sm btn-outline-primary rounded-pill fw-bold px-3">
+                <i class="fa fa-hotel me-1"></i> Manage Cages
+            </a>
+        </div>
+
+        <?php if($boarded_query && $boarded_query->num_rows > 0): ?>
+        <div class="row g-3">
+            <?php while($b = $boarded_query->fetch_assoc()):
+                $days_left  = ceil((strtotime($b['end_date']) - time()) / 86400);
+                $has_vitals = !empty($b['last_temp']);
+                $temp_high  = $has_vitals && $b['last_temp'] > 39.5;
+            ?>
+            <div class="col-md-6 col-xl-4">
+                <div class="boarder-card <?php echo !$has_vitals ? 'no-vitals' : ''; ?>">
+                    <div class="d-flex justify-content-between align-items-start mb-2">
+                        <div>
+                            <div class="fw-bold text-dark fs-6">
+                                <i class="fa fa-paw text-primary me-1"></i>
+                                <?php echo htmlspecialchars($b['pet_name']); ?>
+                            </div>
+                            <div class="text-muted small">
+                                <i class="fa fa-user me-1"></i><?php echo htmlspecialchars($b['owner_name']); ?>
+                            </div>
+                        </div>
+                        <span class="badge bg-primary bg-opacity-10 text-primary border border-primary border-opacity-25 fw-bold">
+                            Cage 0<?php echo $b['cage_number']; ?>
+                        </span>
+                    </div>
+
+                    <div class="d-flex gap-2 flex-wrap mb-2">
+                        <?php if($has_vitals): ?>
+                            <span class="vital-pill <?php echo $temp_high ? 'temp-high' : 'temp-ok'; ?>">
+                                <i class="fa fa-thermometer-half"></i>
+                                <?php echo $b['last_temp']; ?> Â°C
+                            </span>
+                            <span class="vital-pill temp-ok">
+                                <i class="fa fa-heartbeat"></i>
+                                <?php echo $b['last_hr']; ?> BPM
+                            </span>
+                        <?php else: ?>
+                            <span class="vital-pill no-data">
+                                <i class="fa fa-exclamation-circle"></i>
+                                No vitals yet
+                            </span>
+                        <?php endif; ?>
+                    </div>
+
+                    <div class="d-flex justify-content-between align-items-center mt-2 pt-2 border-top">
+                        <div class="small text-muted">
+                            <i class="fa fa-calendar me-1"></i>
+                            <?php echo date("M d", strtotime($b['appointment_date'])); ?>
+                            <i class="fa fa-arrow-right mx-1 opacity-50"></i>
+                            <?php echo date("M d", strtotime($b['end_date'])); ?>
+                            <span class="ms-1 badge bg-secondary bg-opacity-10 text-secondary" style="font-size:10px;">
+                                <?php echo $days_left; ?>d left
+                            </span>
+                        </div>
+                        <?php if(!empty($b['cctv_link']) && $b['cctv_enabled'] == 1): ?>
+                        <span class="small fw-bold text-success">
+                            <span class="live-dot"></span> Live Cam
+                        </span>
+                        <?php endif; ?>
+                    </div>
+
+                    <?php if($has_vitals): ?>
+                    <div class="mt-1" style="font-size:11px; color:#94a3b8;">
+                        Last logged: <?php echo date("M d, H:i", strtotime($b['last_logged'])); ?>
+                    </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+            <?php endwhile; ?>
+        </div>
+        <?php else: ?>
+        <div class="text-center py-4">
+            <i class="fa fa-hotel fa-3x text-muted opacity-25 mb-3"></i>
+            <h6 class="text-muted">No pets are currently boarded today.</h6>
+            <a href="admin_boarding.php" class="btn btn-sm btn-outline-primary mt-1">View Boarding Schedule</a>
+        </div>
+        <?php endif; ?>
+    </div>
+
+    <!-- â”€â”€ Vital Signs Log Table â”€â”€ -->
+    <div class="card-premium">
+        <h5 class="fw-bold mb-4"><i class="fa fa-list-alt text-danger me-2"></i> Vital Signs Log</h5>
+
+        <?php if($logs && $logs->num_rows > 0): ?>
+        <div class="table-responsive">
+            <table class="table table-custom table-hover">
+                <thead>
+                    <tr>
+                        <th>Time Recorded</th>
+                        <th>Patient Name</th>
+                        <th>Temperature (Â°C)</th>
+                        <th>Heart Rate (BPM)</th>
+                        <th>Observations/Notes</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php while($row = $logs->fetch_assoc()): ?>
+                    <tr>
+                        <td class="text-muted fw-bold"><?php echo date("M d - H:i", strtotime($row['recorded_at'])); ?></td>
+                        <td>
+                            <span class="fa fa-paw text-primary me-2"></span>
+                            <?php echo htmlspecialchars($row['pet_name']); ?>
+                        </td>
+                        <td>
+                            <?php
+                                $temp  = $row['temperature'];
+                                $color = ($temp > 39.5) ? 'text-danger fw-bold' : 'text-success fw-bold';
+                                echo "<span class='$color'>{$temp} Â°C</span>";
+                            ?>
+                        </td>
+                        <td class="fw-bold"><?php echo htmlspecialchars($row['heart_rate']); ?></td>
+                        <td class="small text-muted"><?php echo htmlspecialchars($row['notes']); ?></td>
+                    </tr>
+                    <?php endwhile; ?>
+                </tbody>
+            </table>
+        </div>
+        <?php else: ?>
+            <div class="text-center py-5">
+                <i class="fa fa-clipboard-check fa-4x text-muted opacity-25 mb-3"></i>
+                <h5 class="text-muted">No vital signs recorded recently.</h5>
+            </div>
+        <?php endif; ?>
+    </div>
+
+</div>
+
+<!-- Log Vitals Modal -->
+<div class="modal fade" id="vitalModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content border-0 shadow">
+            <div class="modal-header bg-danger text-white">
+                <h5 class="fw-bold mb-0"><i class="fa fa-heartbeat me-2"></i> Log Vital Signs</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body p-4">
+                <form method="POST">
+                    <div class="mb-3">
+                        <label class="form-label fw-bold small">SELECT PATIENT</label>
+                        <select name="pet_id" class="form-select" required>
+                            <option value="" disabled selected>Select a pet...</option>
+                            <?php
+                            if($pets_query && $pets_query->num_rows > 0){
+                                while($p = $pets_query->fetch_assoc()){
+                                    echo "<option value='".$p['id']."'>".htmlspecialchars($p['name']." (".$p['species'].")")."</option>";
+                                }
+                            }
+                            ?>
+                        </select>
+                    </div>
+                    <div class="row g-3 mb-3">
+                        <div class="col-6">
+                            <label class="form-label fw-bold small">TEMP (Â°C)</label>
+                            <input type="number" step="0.1" name="temperature" class="form-control" required placeholder="38.5">
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label fw-bold small">HEART RATE (BPM)</label>
+                            <input type="number" name="heart_rate" class="form-control" required placeholder="120">
+                        </div>
+                    </div>
+                    <div class="mb-4">
+                        <label class="form-label fw-bold small">OBSERVATIONS &amp; NOTES</label>
+                        <textarea name="notes" class="form-control" rows="2" placeholder="Resting comfortably..."></textarea>
+                    </div>
+                    <button type="submit" name="log_vitals" class="btn btn-danger w-100 fw-bold">Save Record</button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+
+<!-- Auto Dismiss Alerts -->
+<script>
+setTimeout(function() {
+    let alerts = document.querySelectorAll('.alert');
+    alerts.forEach(a => {
+        a.classList.remove('show');
+        setTimeout(() => a.parentElement.remove(), 500);
+    });
+}, 3000);
+</script>
+    <script src="mousetrail.js"></script>
+</body>
+</html>

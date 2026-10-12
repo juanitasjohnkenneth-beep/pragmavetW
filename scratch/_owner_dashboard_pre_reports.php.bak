@@ -1,0 +1,1756 @@
+<?php
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+include("dbconnection.php");
+
+// 1. AUTHENTICATION & ACCESS GUARD
+if (!isset($_SESSION['user_id'])) {
+    header("Location: index.php");
+    exit();
+}
+
+$user_id = $_SESSION['user_id'];
+$user_role = $_SESSION['role'] ?? '';
+$user_name = $_SESSION['user'] ?? 'Clinic Owner';
+
+// Restrict strictly to clinic_owner or owner
+if ($user_role !== 'clinic_owner' && $user_role !== 'owner') {
+    if ($user_role === 'admin') {
+        header("Location: admin.php");
+    } elseif ($user_role === 'doctor') {
+        header("Location: doctor.php");
+    } else {
+        header("Location: dashboard.php");
+    }
+    exit();
+}
+
+// 2. DATE PERIOD & RANGE FILTERING
+$period = $_GET['period'] ?? 'all';
+$start_date_input = trim($_GET['start_date'] ?? '');
+$end_date_input = trim($_GET['end_date'] ?? '');
+
+$filter_label = "All-Time Records";
+$filter_badge = "All Time";
+$filter_sql_billing = "1=1";
+$filter_sql_appts = "1=1";
+$start_date = '';
+$end_date = '';
+$is_filtered = false;
+
+if ($period === 'today') {
+    $start_date = date('Y-m-d');
+    $end_date = date('Y-m-d');
+    $filter_label = "Today's Performance (" . date('F j, Y') . ")";
+    $filter_badge = "Today";
+    $is_filtered = true;
+} elseif ($period === 'week') {
+    $start_date = date('Y-m-d', strtotime('monday this week'));
+    $end_date = date('Y-m-d', strtotime('sunday this week'));
+    $filter_label = "This Week (" . date('M j', strtotime($start_date)) . " - " . date('M j, Y', strtotime($end_date)) . ")";
+    $filter_badge = "This Week";
+    $is_filtered = true;
+} elseif ($period === 'month') {
+    $start_date = date('Y-m-01');
+    $end_date = date('Y-m-t');
+    $filter_label = "This Month (" . date('F Y') . ")";
+    $filter_badge = "This Month";
+    $is_filtered = true;
+} elseif ($period === 'last_month') {
+    $start_date = date('Y-m-01', strtotime('first day of last month'));
+    $end_date = date('Y-m-t', strtotime('last day of last month'));
+    $filter_label = "Last Month (" . date('F Y', strtotime($start_date)) . ")";
+    $filter_badge = "Last Month";
+    $is_filtered = true;
+} elseif ($period === 'year') {
+    $start_date = date('Y-01-01');
+    $end_date = date('Y-12-31');
+    $filter_label = "This Year (" . date('Y') . ")";
+    $filter_badge = "This Year";
+    $is_filtered = true;
+} elseif ($period === 'custom' || (!empty($start_date_input) && !empty($end_date_input))) {
+    $period = 'custom';
+    $start_date = date('Y-m-d', strtotime($start_date_input));
+    $end_date = date('Y-m-d', strtotime($end_date_input));
+    if ($start_date > $end_date) {
+        $temp = $start_date;
+        $start_date = $end_date;
+        $end_date = $temp;
+    }
+    $filter_label = "Custom: " . date('M j, Y', strtotime($start_date)) . " to " . date('M j, Y', strtotime($end_date));
+    $filter_badge = "Custom Range";
+    $is_filtered = true;
+} else {
+    $period = 'all';
+    $filter_label = "All-Time Clinic History";
+    $filter_badge = "All Time";
+    $is_filtered = false;
+}
+
+if ($is_filtered && !empty($start_date) && !empty($end_date)) {
+    $filter_sql_billing = "DATE(b.created_at) BETWEEN '$start_date' AND '$end_date'";
+    $filter_sql_appts   = "a.appointment_date BETWEEN '$start_date' AND '$end_date'";
+}
+
+// 3. FINANCIAL ANALYTICS - ACCURATE AGGREGATION FILTERED BY PERIOD
+$totals_q = $conn->query("
+    SELECT 
+        COUNT(*) as total_bills,
+        IFNULL(SUM(total_amount), 0) as gross_billed,
+        IFNULL(SUM(CASE 
+            WHEN payment_status = 'Paid' THEN (CASE WHEN amount_paid > 0 THEN amount_paid ELSE total_amount END)
+            WHEN downpayment_status = 'Paid' THEN (CASE WHEN amount_paid > 0 THEN amount_paid ELSE downpayment_amount END)
+            ELSE 0 
+        END), 0) as total_collected,
+        IFNULL(SUM(CASE 
+            WHEN payment_status = 'Paid' THEN 0
+            WHEN downpayment_status = 'Paid' THEN GREATEST(0, total_amount - (CASE WHEN amount_paid > 0 THEN amount_paid ELSE downpayment_amount END))
+            ELSE total_amount 
+        END), 0) as total_receivable,
+        SUM(CASE WHEN payment_status = 'Paid' THEN 1 ELSE 0 END) as count_paid,
+        SUM(CASE WHEN payment_status != 'Paid' AND downpayment_status = 'Paid' THEN 1 ELSE 0 END) as count_partial,
+        SUM(CASE WHEN payment_status != 'Paid' AND (downpayment_status != 'Paid' OR downpayment_status IS NULL) THEN 1 ELSE 0 END) as count_unpaid
+    FROM billing b
+    WHERE $filter_sql_billing
+");
+$stats = $totals_q ? $totals_q->fetch_assoc() : [
+    'total_bills' => 0, 'gross_billed' => 0, 'total_collected' => 0, 'total_receivable' => 0,
+    'count_paid' => 0, 'count_partial' => 0, 'count_unpaid' => 0
+];
+
+$total_invoices   = (int)$stats['total_bills'];
+$total_revenue    = (float)$stats['gross_billed'];
+$total_collected  = (float)$stats['total_collected'];
+$total_receivable = (float)$stats['total_receivable'];
+$count_paid       = (int)$stats['count_paid'];
+$count_partial    = (int)$stats['count_partial'];
+$count_unpaid     = (int)$stats['count_unpaid'];
+
+// Revenue Streams Split (Filtered)
+$clinic_rev_q = $conn->query("SELECT IFNULL(SUM(total_amount), 0) as rev FROM billing b WHERE is_boarding = 0 AND (service_category != 'POS' OR service_category IS NULL) AND $filter_sql_billing");
+$clinic_rev = (float)($clinic_rev_q ? $clinic_rev_q->fetch_assoc()['rev'] : 0);
+
+$boarding_rev_q = $conn->query("SELECT IFNULL(SUM(total_amount), 0) as rev FROM billing b WHERE is_boarding = 1 AND $filter_sql_billing");
+$boarding_rev = (float)($boarding_rev_q ? $boarding_rev_q->fetch_assoc()['rev'] : 0);
+
+$pos_rev_q = $conn->query("SELECT IFNULL(SUM(total_amount), 0) as rev FROM billing b WHERE service_category = 'POS' AND $filter_sql_billing");
+$pos_rev = (float)($pos_rev_q ? $pos_rev_q->fetch_assoc()['rev'] : 0);
+
+// Today's Collections
+$today_coll_q = $conn->query("SELECT IFNULL(SUM(CASE WHEN amount_paid > 0 THEN amount_paid ELSE total_amount END), 0) as coll FROM billing WHERE DATE(paid_at) = CURDATE() OR (paid_at IS NULL AND payment_status='Paid' AND DATE(created_at) = CURDATE())");
+$today_collected = (float)($today_coll_q ? $today_coll_q->fetch_assoc()['coll'] : 0);
+
+// Monthly Revenue Trend (All Recorded Monthly Cohorts)
+$m_q = $conn->query("SELECT 
+    DATE_FORMAT(created_at, '%b %Y') as m_label,
+    SUM(CASE WHEN is_boarding = 0 THEN total_amount ELSE 0 END) as clinic_rev,
+    SUM(CASE WHEN is_boarding = 1 THEN total_amount ELSE 0 END) as boarding_rev,
+    SUM(total_amount) as total_gross,
+    SUM(CASE 
+        WHEN payment_status = 'Paid' THEN (CASE WHEN amount_paid > 0 THEN amount_paid ELSE total_amount END)
+        WHEN downpayment_status = 'Paid' THEN (CASE WHEN amount_paid > 0 THEN amount_paid ELSE downpayment_amount END)
+        ELSE 0 
+    END) as total_collected
+FROM billing
+GROUP BY DATE_FORMAT(created_at, '%Y-%m')
+ORDER BY created_at ASC");
+
+$chart_m_labels = [];
+$chart_clinic_rev = [];
+$chart_boarding_rev = [];
+$chart_total_rev = [];
+$chart_collected_rev = [];
+
+if ($m_q && $m_q->num_rows > 0) {
+    while ($m_row = $m_q->fetch_assoc()) {
+        $chart_m_labels[]      = $m_row['m_label'];
+        $chart_clinic_rev[]    = (float)$m_row['clinic_rev'];
+        $chart_boarding_rev[]  = (float)$m_row['boarding_rev'];
+        $chart_total_rev[]     = (float)$m_row['total_gross'];
+        $chart_collected_rev[] = (float)$m_row['total_collected'];
+    }
+}
+
+// 4. APPOINTMENT METRICS (FILTERED BY PERIOD)
+$total_appts_q = $conn->query("SELECT COUNT(*) as cnt FROM appointments a WHERE $filter_sql_appts");
+$total_appts = (int)($total_appts_q ? $total_appts_q->fetch_assoc()['cnt'] : 0);
+
+$completed_appts_q = $conn->query("SELECT COUNT(*) as cnt FROM appointments a WHERE a.status='Completed' AND $filter_sql_appts");
+$completed_appts = (int)($completed_appts_q ? $completed_appts_q->fetch_assoc()['cnt'] : 0);
+
+$approved_appts_q = $conn->query("SELECT COUNT(*) as cnt FROM appointments a WHERE a.status='Approved' AND $filter_sql_appts");
+$approved_appts = (int)($approved_appts_q ? $approved_appts_q->fetch_assoc()['cnt'] : 0);
+
+$pending_appts_q = $conn->query("SELECT COUNT(*) as cnt FROM appointments a WHERE a.status IN ('Pending', 'Reschedule Requested') AND $filter_sql_appts");
+$pending_appts = (int)($pending_appts_q ? $pending_appts_q->fetch_assoc()['cnt'] : 0);
+
+$cancelled_appts_q = $conn->query("SELECT COUNT(*) as cnt FROM appointments a WHERE a.status IN ('Cancelled', 'Rejected') AND $filter_sql_appts");
+$cancelled_appts = (int)($cancelled_appts_q ? $cancelled_appts_q->fetch_assoc()['cnt'] : 0);
+
+$noshow_appts_q = $conn->query("SELECT COUNT(*) as cnt FROM appointments a WHERE a.status='No Show' AND $filter_sql_appts");
+$noshow_appts = (int)($noshow_appts_q ? $noshow_appts_q->fetch_assoc()['cnt'] : 0);
+
+// 5. CLIENTS & PATIENTS OVERVIEW
+$total_clients_q = $conn->query("SELECT COUNT(*) as cnt FROM users WHERE role IN ('user', 'client')");
+$total_clients = (int)($total_clients_q ? $total_clients_q->fetch_assoc()['cnt'] : 0);
+
+$total_pets_q = $conn->query("SELECT COUNT(*) as cnt FROM pets");
+$total_pets = (int)($total_pets_q ? $total_pets_q->fetch_assoc()['cnt'] : 0);
+
+$dogs_count_q = $conn->query("SELECT COUNT(*) as cnt FROM pets WHERE LOWER(species) LIKE '%dog%' OR LOWER(species) LIKE '%canine%'");
+$dogs_count = (int)($dogs_count_q ? $dogs_count_q->fetch_assoc()['cnt'] : 0);
+
+$cats_count_q = $conn->query("SELECT COUNT(*) as cnt FROM pets WHERE LOWER(species) LIKE '%cat%' OR LOWER(species) LIKE '%feline%'");
+$cats_count = (int)($cats_count_q ? $cats_count_q->fetch_assoc()['cnt'] : 0);
+$other_pets_count = max(0, $total_pets - ($dogs_count + $cats_count));
+
+// 6. BOARDING CAPACITY
+$occ_count_q = $conn->query("SELECT COUNT(DISTINCT cage_number) as occ FROM boarding_reservations WHERE status='Approved' AND appointment_date <= CURDATE() AND end_date >= CURDATE()");
+$occ_count = (int)($occ_count_q ? $occ_count_q->fetch_assoc()['occ'] : 0);
+
+$total_cages_q = $conn->query("SELECT setting_value FROM clinic_settings WHERE setting_key = 'boarding_cage_count'");
+$total_cages = ($total_cages_q && $total_cages_q->num_rows > 0) ? (int)$total_cages_q->fetch_assoc()['setting_value'] : 5;
+$occupancy_rate = ($total_cages > 0) ? round(($occ_count / $total_cages) * 100) : 0;
+
+// 7. DOCTOR PERFORMANCE & WORKLOAD (FILTERED BY PERIOD)
+$doctors_q = $conn->query("SELECT 
+    u.id, 
+    u.fullname, 
+    u.email, 
+    u.contact_number,
+    COUNT(a.id) as total_assigned,
+    SUM(CASE WHEN a.status = 'Completed' THEN 1 ELSE 0 END) as completed_count,
+    SUM(CASE WHEN a.status = 'Approved' THEN 1 ELSE 0 END) as active_count
+FROM users u
+LEFT JOIN appointments a ON u.id = a.doctor_id AND $filter_sql_appts
+WHERE u.role = 'doctor'
+GROUP BY u.id, u.fullname, u.email, u.contact_number
+ORDER BY total_assigned DESC");
+
+// 8. MASTER TRANSACTIONS QUERY (FILTERED BY PERIOD WITH UNIFIED JOINS)
+$all_transactions_sql = "
+    SELECT 
+        b.id,
+        b.invoice_no,
+        b.total_amount,
+        b.amount_paid,
+        b.change_amount,
+        b.downpayment_amount,
+        b.downpayment_status,
+        b.downpayment_paid_at,
+        b.payment_status,
+        b.payment_method,
+        b.reference_no,
+        b.is_boarding,
+        b.service_category,
+        b.items_json,
+        b.notes,
+        b.created_at,
+        b.paid_at,
+        COALESCE(NULLIF(TRIM(b.client_name), ''), u.fullname, a.fullname, 'Walk-in Client') AS display_client_name,
+        COALESCE(NULLIF(TRIM(b.client_phone), ''), u.contact_number, '') AS display_client_phone,
+        COALESCE(NULLIF(TRIM(b.pet_name), ''), a.pet_name, br.pet_name, 'General Pet') AS display_pet_name,
+        a.service_type AS appt_service_name,
+        br.cage_number AS boarding_cage
+    FROM billing b
+    LEFT JOIN users u ON (b.user_id = u.id OR (b.user_id IS NULL AND b.appointment_id IS NOT NULL AND (SELECT user_id FROM appointments WHERE id=b.appointment_id)=u.id) OR (b.user_id IS NULL AND b.boarding_res_id IS NOT NULL AND (SELECT user_id FROM boarding_reservations WHERE id=b.boarding_res_id)=u.id))
+    LEFT JOIN appointments a ON b.appointment_id = a.id
+    LEFT JOIN boarding_reservations br ON b.boarding_res_id = br.id
+    WHERE $filter_sql_billing
+    ORDER BY b.created_at DESC, b.id DESC
+";
+$all_transactions_res = $conn->query($all_transactions_sql);
+
+// 9. PREVENTIVE VACCINATION COMPLIANCE (NEXT 30 DAYS)
+$due_vaccines_q = $conn->query("SELECT p.name as pet_name, p.species, u.fullname as owner_name, u.contact_number, p.next_vaccination
+FROM pets p
+JOIN users u ON p.user_id = u.id
+WHERE p.next_vaccination IS NOT NULL AND p.next_vaccination <= DATE_ADD(CURDATE(), INTERVAL 30 DAY)
+ORDER BY p.next_vaccination ASC LIMIT 8");
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Executive Overview & Analytics | PragmaVet</title>
+    
+    <!-- Theme & Global Stylesheets -->
+    <script src="theme.js?v=<?=time()?>"></script>
+    <link rel="stylesheet" href="theme.css?v=<?=time()?>">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.datatables.net/1.13.7/css/dataTables.bootstrap5.min.css">
+    
+    <!-- Chart.js & jQuery & DataTables -->
+    <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.datatables.net/1.13.7/js/jquery.dataTables.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.7/js/dataTables.bootstrap5.min.js"></script>
+
+    <style>
+        :root {
+            --primary: #2563eb;
+            --primary-rgb: 37, 99, 235;
+            --secondary: #3b82f6;
+            --dark: #0f172a;
+            --sidebar-width: 260px;
+            --card-radius: 18px;
+            --bg-page: #f8fafc;
+            --card-bg: #ffffff;
+            --border-color: #e2e8f0;
+            --text-heading: #0f172a;
+            --text-body: #334155;
+            --text-muted: #64748b;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-page);
+            color: var(--text-body);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* MOBILE HEADER BAR */
+        .mobile-header {
+            display: none;
+            background: #ffffff;
+            border-bottom: 1px solid var(--border-color);
+            padding: 12px 18px;
+            position: sticky;
+            top: 0;
+            z-index: 1040;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        /* SIDEBAR */
+        .sidebar {
+            background: #ffffff;
+            width: var(--sidebar-width);
+            height: 100vh;
+            position: fixed;
+            top: 0;
+            left: 0;
+            padding: 28px 20px 24px;
+            z-index: 1050;
+            display: flex;
+            flex-direction: column;
+            border-right: 1px solid #eef2f6;
+            box-shadow: none;
+            overflow-y: auto;
+            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .sidebar-brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 24px;
+            text-decoration: none;
+        }
+
+        .sidebar-brand-icon {
+            width: 44px;
+            height: 44px;
+            min-width: 44px;
+            border-radius: 13px;
+            background: #2563eb;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #ffffff;
+            font-size: 20px;
+            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.35);
+        }
+
+        .sidebar-brand span {
+            font-size: 20px;
+            font-weight: 800;
+            color: #0f172a;
+            letter-spacing: -0.3px;
+        }
+
+        .sidebar-user {
+            background: #f8fafc;
+            border-radius: 14px;
+            padding: 14px 16px;
+            margin-bottom: 24px;
+            border: 1px solid #f1f5f9;
+        }
+
+        .sidebar-user .welcome {
+            font-size: 11px;
+            text-transform: uppercase;
+            font-weight: 700;
+            color: #64748b;
+            letter-spacing: 0.8px;
+        }
+
+        .sidebar-user .uname {
+            font-size: 14px;
+            font-weight: 700;
+            color: #0f172a;
+            margin-top: 2px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .sidebar-user .urole {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 11px;
+            font-weight: 700;
+            color: #059669;
+            background: rgba(16, 185, 129, 0.12);
+            padding: 2px 8px;
+            border-radius: 20px;
+            margin-top: 6px;
+        }
+
+        .sidebar a {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 14px;
+            border-radius: 12px;
+            color: #64748b;
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 4px;
+            transition: all 0.2s ease;
+        }
+
+        .sidebar a i {
+            font-size: 16px;
+            width: 22px;
+            text-align: center;
+            color: #94a3b8;
+        }
+
+        .sidebar a:hover {
+            background: #f1f5f9;
+            color: #0f172a;
+        }
+
+        .sidebar a.active {
+            background: #2563eb;
+            color: #ffffff;
+            font-weight: 700;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.25);
+        }
+
+        .sidebar a.active i {
+            color: #ffffff;
+        }
+
+        .sidebar-logout {
+            margin-top: auto;
+            padding-top: 20px;
+            border-top: 1px solid #f1f5f9;
+        }
+
+        .sidebar-logout a {
+            color: #dc2626;
+        }
+
+        .sidebar-logout a:hover {
+            background: #fef2f2;
+            color: #b91c1c;
+        }
+
+        .sidebar-backdrop {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: rgba(15, 23, 42, 0.5);
+            backdrop-filter: blur(4px);
+            z-index: 1045;
+        }
+
+        /* MAIN CONTENT AREA */
+        .main-content {
+            margin-left: var(--sidebar-width);
+            padding: 35px 40px;
+            min-height: 100vh;
+            transition: margin-left 0.3s ease;
+        }
+
+        /* EXECUTIVE BANNER */
+        .exec-banner {
+            background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 100%);
+            border-radius: var(--card-radius);
+            padding: 28px 34px;
+            color: #ffffff;
+            box-shadow: 0 10px 25px rgba(37, 99, 235, 0.2);
+            position: relative;
+            overflow: hidden;
+            margin-bottom: 24px;
+        }
+
+        .exec-banner::after {
+            content: "\f06e";
+            font-family: "Font Awesome 6 Free";
+            font-weight: 900;
+            font-size: 150px;
+            position: absolute;
+            right: -25px;
+            bottom: -40px;
+            opacity: 0.12;
+            pointer-events: none;
+        }
+
+        /* DATE FILTER BAR */
+        .date-filter-bar {
+            background: #ffffff;
+            border-radius: var(--card-radius);
+            padding: 18px 24px;
+            border: 1px solid var(--border-color);
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.03);
+            margin-bottom: 25px;
+        }
+
+        .period-btn {
+            padding: 6px 14px;
+            border-radius: 20px;
+            border: 1.5px solid var(--border-color);
+            background: #f8fafc;
+            font-size: 12.5px;
+            font-weight: 700;
+            color: var(--text-muted);
+            text-decoration: none;
+            transition: all 0.2s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            white-space: nowrap;
+        }
+
+        .period-btn:hover {
+            background: #e2e8f0;
+            color: var(--text-heading);
+        }
+
+        .period-btn.active {
+            background: #2563eb;
+            border-color: #2563eb;
+            color: #ffffff;
+            box-shadow: 0 3px 10px rgba(37, 99, 235, 0.25);
+        }
+
+        .active-filter-strip {
+            border-top: 1px solid #f1f5f9;
+        }
+
+        /* METRIC / KPI CARDS */
+        .kpi-card {
+            background: #ffffff;
+            border-radius: var(--card-radius);
+            padding: 24px;
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.03);
+            transition: all 0.25s ease;
+            position: relative;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
+        .kpi-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 12px 25px rgba(0, 0, 0, 0.06);
+            border-color: #cbd5e1;
+        }
+
+        .kpi-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 12px;
+        }
+
+        .kpi-icon-wrap {
+            width: 48px;
+            height: 48px;
+            border-radius: 13px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+        }
+
+        .kpi-title {
+            font-size: 12.5px;
+            font-weight: 700;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+        }
+
+        .kpi-value {
+            font-size: 28px;
+            font-weight: 800;
+            color: #0f172a;
+            line-height: 1.15;
+            margin-bottom: 8px;
+        }
+
+        .kpi-sub {
+            font-size: 12.5px;
+            color: #64748b;
+            font-weight: 500;
+        }
+
+        /* SECTION / ANALYTICS CARD */
+        .analytics-card {
+            background: #ffffff;
+            border-radius: var(--card-radius);
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.03);
+            padding: 26px;
+            margin-bottom: 25px;
+        }
+
+        .analytics-card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 22px;
+            border-bottom: 1px solid #f1f5f9;
+            padding-bottom: 16px;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        .analytics-card-header h5 {
+            font-size: 17px;
+            font-weight: 700;
+            color: #0f172a;
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        /* FILTER TABS */
+        .filter-pill {
+            padding: 6px 16px;
+            border-radius: 20px;
+            border: 1.5px solid #e2e8f0;
+            background: #f8fafc;
+            font-size: 12px;
+            font-weight: 700;
+            color: #64748b;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .filter-pill:hover, .filter-pill.active {
+            background: #2563eb;
+            border-color: #2563eb;
+            color: #ffffff;
+        }
+
+        .filter-pill .cnt {
+            background: rgba(0, 0, 0, 0.08);
+            border-radius: 20px;
+            padding: 1px 7px;
+            font-size: 11px;
+        }
+
+        .filter-pill.active .cnt {
+            background: rgba(255, 255, 255, 0.25);
+            color: #ffffff;
+        }
+
+        /* TABLE STYLING */
+        .table-custom {
+            width: 100% !important;
+        }
+
+        .table-custom th {
+            font-size: 11.5px;
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            font-weight: 700;
+            color: #64748b;
+            background: #f8fafc;
+            border-bottom: 1px solid #e2e8f0;
+            padding: 14px 12px;
+            white-space: nowrap;
+        }
+
+        .table-custom td {
+            font-size: 13.5px;
+            font-weight: 500;
+            color: #1e293b;
+            padding: 14px 12px;
+            border-bottom: 1px solid #f1f5f9;
+            vertical-align: middle;
+        }
+
+        .badge-pill-soft {
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 700;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            white-space: nowrap;
+        }
+
+        /* RECEIPT SLIP MODAL STYLING */
+        .slip-box {
+            font-family: 'Courier New', Courier, monospace;
+            background: #ffffff;
+            border: 2px dashed #cbd5e1;
+            padding: 26px;
+            border-radius: 12px;
+            color: #1e293b;
+        }
+
+        .slip-line {
+            border-top: 1px dashed #94a3b8;
+            margin: 12px 0;
+        }
+
+        /* RESPONSIVE BREAKPOINTS */
+        @media (max-width: 991.98px) {
+            .mobile-header {
+                display: flex;
+            }
+
+            .sidebar {
+                transform: translateX(-100%);
+            }
+
+            .sidebar.show {
+                transform: translateX(0);
+                box-shadow: 10px 0 30px rgba(0, 0, 0, 0.25);
+            }
+
+            .sidebar-backdrop.show {
+                display: block;
+            }
+
+            .main-content {
+                margin-left: 0;
+                padding: 20px 16px;
+            }
+
+            .exec-banner {
+                padding: 22px 20px;
+            }
+
+            .exec-banner h2 {
+                font-size: 20px;
+            }
+
+            .kpi-value {
+                font-size: 24px;
+            }
+        }
+
+        @media (max-width: 575.98px) {
+            .analytics-card {
+                padding: 18px 14px;
+            }
+            .kpi-card {
+                padding: 18px 16px;
+            }
+            .date-filter-bar {
+                padding: 14px 16px;
+            }
+        }
+
+        /* PRINT STYLES */
+        @media print {
+            .sidebar, .mobile-header, .sidebar-backdrop, .no-print, .dataTables_filter, .dataTables_length, .dataTables_paginate, .dataTables_info, .btn-print, .date-filter-bar {
+                display: none !important;
+            }
+            .main-content {
+                margin-left: 0 !important;
+                padding: 0 !important;
+            }
+            .exec-banner {
+                background: #f1f5f9 !important;
+                color: #0f172a !important;
+                border: 1px solid #cbd5e1 !important;
+                box-shadow: none !important;
+            }
+            .exec-banner h2, .exec-banner p, .exec-banner span {
+                color: #0f172a !important;
+            }
+            .kpi-card, .analytics-card {
+                box-shadow: none !important;
+                border: 1px solid #cbd5e1 !important;
+                page-break-inside: avoid;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- MOBILE TOP BAR -->
+    <div class="mobile-header no-print">
+        <div class="d-flex align-items-center gap-3">
+            <button class="btn btn-sm btn-light border rounded-3 p-2 text-primary" onclick="toggleSidebar()">
+                <i class="fa fa-bars fs-5"></i>
+            </button>
+            <div class="d-flex align-items-center gap-2">
+                <div class="sidebar-brand-icon" style="width: 34px; height: 34px; min-width: 34px; font-size: 16px; border-radius: 9px;">
+                    <i class="fa fa-paw"></i>
+                </div>
+                <span class="fw-bold fs-5 text-dark">PragmaVet</span>
+            </div>
+        </div>
+        <div class="d-flex align-items-center gap-2">
+            <button class="btn btn-sm btn-outline-secondary rounded-circle" id="themeToggleMobile" style="width: 36px; height: 36px;">
+                <i class="fa fa-moon"></i>
+            </button>
+            <a href="logout.php" class="btn btn-sm btn-outline-danger rounded-pill px-3 fw-bold">
+                <i class="fa fa-sign-out-alt"></i>
+            </a>
+        </div>
+    </div>
+
+    <!-- BACKDROP FOR MOBILE -->
+    <div class="sidebar-backdrop" id="sidebarBackdrop" onclick="toggleSidebar()"></div>
+
+    <!-- SIDEBAR -->
+    <div class="sidebar" id="sidebar">
+        <div class="d-flex align-items-center justify-content-between mb-4">
+            <a href="owner_dashboard.php" class="sidebar-brand mb-0">
+                <div class="sidebar-brand-icon"><i class="fa fa-paw"></i></div>
+                <span>PragmaVet</span>
+            </a>
+            <button class="btn btn-sm btn-light border d-lg-none rounded-circle" onclick="toggleSidebar()" style="width: 32px; height: 32px;">
+                <i class="fa fa-times text-muted"></i>
+            </button>
+        </div>
+
+        <div class="sidebar-user">
+            <div class="welcome">Executive Portal</div>
+            <div class="uname"><?= htmlspecialchars($user_name) ?></div>
+            <div class="urole"><i class="fa fa-shield-alt"></i> Clinic Owner (View-Only)</div>
+        </div>
+
+        <a href="owner_dashboard.php" class="active"><i class="fa fa-chart-pie"></i> <span>Overview & KPIs</span></a>
+        <a href="#master-ledger" onclick="closeSidebarMobile()"><i class="fa fa-receipt"></i> <span>All Transactions</span></a>
+        <a href="#financial-analytics" onclick="closeSidebarMobile()"><i class="fa fa-chart-line"></i> <span>Revenue Trend</span></a>
+        <a href="#doctor-performance" onclick="closeSidebarMobile()"><i class="fa fa-user-md"></i> <span>Doctor Caseload</span></a>
+        <a href="#boarding-capacity" onclick="closeSidebarMobile()"><i class="fa fa-hotel"></i> <span>Facility & Cages</span></a>
+
+        <div class="sidebar-logout">
+            <a href="logout.php"><i class="fa fa-sign-out-alt"></i> <span>Sign Out</span></a>
+        </div>
+    </div>
+
+    <!-- MAIN CONTENT -->
+    <div class="main-content">
+        
+        <!-- TOP EXECUTIVE BANNER -->
+        <div class="exec-banner">
+            <div class="d-flex justify-content-between align-items-start position-relative flex-wrap gap-3" style="z-index: 2;">
+                <div>
+                    <span class="badge bg-white text-primary fw-bold px-3 py-1.5 rounded-pill mb-2 shadow-sm" style="font-size: 11px;">
+                        <i class="fa fa-eye me-1"></i> EXECUTIVE VIEW-ONLY ACCESS
+                    </span>
+                    <h2 class="fw-bold mb-1">Financial & Clinical Performance Oversight</h2>
+                    <p class="mb-0 opacity-85" style="max-width: 680px; font-size: 13.5px;">
+                        Welcome to the practice oversight portal. Currently evaluating <strong><?= htmlspecialchars($filter_label) ?></strong> with full financial reconciliation and medical caseload audit.
+                    </p>
+                </div>
+                <div class="d-flex gap-2 align-items-center no-print">
+                    <button class="btn btn-light rounded-pill px-3 py-2 fw-bold text-dark shadow-sm btn-print" onclick="window.print()">
+                        <i class="fa fa-print me-1.5 text-primary"></i> Export Report
+                    </button>
+                    <button class="btn btn-outline-light rounded-circle shadow-sm d-none d-lg-inline-flex align-items-center justify-content-center" id="themeToggle" style="width: 40px; height: 40px;">
+                        <i class="fa fa-moon" id="themeIcon"></i>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- PRINT HEADER (ONLY VISIBLE ON PRINT / PDF EXPORT) -->
+        <div class="d-none d-print-block mb-3 p-3 border rounded bg-light">
+            <div class="d-flex justify-content-between">
+                <div>
+                    <h4 class="fw-bold mb-1 text-dark">PragmaVet Animal Clinic - Executive Audit Report</h4>
+                    <div class="small text-muted">Active Filter Range: <strong><?= htmlspecialchars($filter_label) ?></strong></div>
+                </div>
+                <div class="text-end small text-muted">
+                    <div>Generated: <?= date('M d, Y h:i A') ?></div>
+                    <div>Account: <?= htmlspecialchars($user_name) ?> (Owner)</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- INTERACTIVE DATE PERIOD FILTER BAR -->
+        <div class="date-filter-bar no-print">
+            <div class="d-flex flex-column flex-xl-row align-items-xl-center justify-content-between gap-3">
+                <!-- Preset Quick Filter Buttons -->
+                <div class="d-flex align-items-center gap-1.5 flex-wrap">
+                    <span class="small fw-bold text-muted me-1"><i class="fa fa-calendar-alt text-primary me-1"></i> Period:</span>
+                    <a href="owner_dashboard.php?period=all" class="period-btn <?= $period === 'all' ? 'active' : '' ?>">All Time</a>
+                    <a href="owner_dashboard.php?period=today" class="period-btn <?= $period === 'today' ? 'active' : '' ?>">Today</a>
+                    <a href="owner_dashboard.php?period=week" class="period-btn <?= $period === 'week' ? 'active' : '' ?>">This Week</a>
+                    <a href="owner_dashboard.php?period=month" class="period-btn <?= $period === 'month' ? 'active' : '' ?>">This Month</a>
+                    <a href="owner_dashboard.php?period=last_month" class="period-btn <?= $period === 'last_month' ? 'active' : '' ?>">Last Month</a>
+                    <a href="owner_dashboard.php?period=year" class="period-btn <?= $period === 'year' ? 'active' : '' ?>">This Year</a>
+                </div>
+
+                <!-- Custom Date Range Form -->
+                <form method="GET" action="owner_dashboard.php" class="d-flex align-items-center gap-2 flex-wrap">
+                    <input type="hidden" name="period" value="custom">
+                    <div class="input-group input-group-sm" style="width: auto;">
+                        <span class="input-group-text bg-white border-end-0 text-muted"><i class="fa fa-calendar-day"></i></span>
+                        <input type="date" name="start_date" class="form-control form-control-sm border-start-0" value="<?= htmlspecialchars($start_date) ?>" required title="Start Date">
+                    </div>
+                    <span class="text-muted small">to</span>
+                    <div class="input-group input-group-sm" style="width: auto;">
+                        <span class="input-group-text bg-white border-end-0 text-muted"><i class="fa fa-calendar-check"></i></span>
+                        <input type="date" name="end_date" class="form-control form-control-sm border-start-0" value="<?= htmlspecialchars($end_date) ?>" required title="End Date">
+                    </div>
+                    <button type="submit" class="btn btn-sm btn-primary rounded-pill px-3 fw-bold shadow-sm">
+                        <i class="fa fa-filter me-1"></i> Apply
+                    </button>
+                    <?php if ($is_filtered): ?>
+                        <a href="owner_dashboard.php?period=all" class="btn btn-sm btn-outline-secondary rounded-pill px-2.5 fw-semibold" title="Reset filter to All Time">
+                            <i class="fa fa-redo me-1"></i> Reset
+                        </a>
+                    <?php endif; ?>
+                </form>
+            </div>
+
+            <!-- Active Filter Ribbon -->
+            <div class="active-filter-strip mt-2.5 pt-2 d-flex align-items-center justify-content-between flex-wrap gap-2">
+                <div class="d-flex align-items-center gap-2">
+                    <span class="badge bg-primary bg-opacity-10 text-primary border border-primary border-opacity-25 px-2.5 py-1 rounded-pill fw-bold" style="font-size: 11px;">
+                        <i class="fa fa-clock me-1"></i> <?= htmlspecialchars($filter_badge) ?>
+                    </span>
+                    <span class="small fw-bold text-dark">
+                        <?= htmlspecialchars($filter_label) ?>
+                    </span>
+                    <span class="small text-muted">
+                        &bull; <strong><?= $total_invoices ?></strong> billing record<?= $total_invoices !== 1 ? 's' : '' ?> totaling <strong>₱<?= number_format($total_revenue, 2) ?></strong>
+                    </span>
+                </div>
+                <div class="small text-muted">
+                    <i class="fa fa-sync-alt me-1 opacity-50"></i> Live Database Synchronization
+                </div>
+            </div>
+        </div>
+
+        <!-- ROW 1: CORE KPI CARDS (FILTERED BY ACTIVE PERIOD) -->
+        <div class="row g-3 g-xl-4 mb-4">
+            <!-- Gross Billed -->
+            <div class="col-12 col-sm-6 col-xl-3">
+                <div class="kpi-card">
+                    <div>
+                        <div class="kpi-top">
+                            <span class="kpi-title">Gross Invoiced</span>
+                            <div class="kpi-icon-wrap" style="background: rgba(37, 99, 235, 0.1); color: #2563eb;">
+                                <i class="fa fa-file-invoice-dollar"></i>
+                            </div>
+                        </div>
+                        <div class="kpi-value text-primary">₱<?= number_format($total_revenue, 2) ?></div>
+                    </div>
+                    <div class="kpi-sub">
+                        <i class="fa fa-list-ol me-1 text-primary"></i> <strong><?= $total_invoices ?></strong> invoice<?= $total_invoices !== 1 ? 's' : '' ?> in period
+                    </div>
+                </div>
+            </div>
+
+            <!-- Actual Collected -->
+            <div class="col-12 col-sm-6 col-xl-3">
+                <div class="kpi-card">
+                    <div>
+                        <div class="kpi-top">
+                            <span class="kpi-title">Cash Collected</span>
+                            <div class="kpi-icon-wrap" style="background: rgba(16, 185, 129, 0.1); color: #059669;">
+                                <i class="fa fa-hand-holding-dollar"></i>
+                            </div>
+                        </div>
+                        <div class="kpi-value text-success">₱<?= number_format($total_collected, 2) ?></div>
+                    </div>
+                    <div class="kpi-sub">
+                        <span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25 px-2 py-0.5 rounded-pill fw-bold">
+                            <?= $count_paid ?> Paid
+                        </span>
+                        <span class="badge bg-warning bg-opacity-10 text-dark border border-warning border-opacity-25 px-2 py-0.5 rounded-pill fw-bold ms-1">
+                            <?= $count_partial ?> Partial
+                        </span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Outstanding Receivable -->
+            <div class="col-12 col-sm-6 col-xl-3">
+                <div class="kpi-card">
+                    <div>
+                        <div class="kpi-top">
+                            <span class="kpi-title">Accounts Receivable</span>
+                            <div class="kpi-icon-wrap" style="background: rgba(239, 68, 68, 0.1); color: #dc2626;">
+                                <i class="fa fa-clock-rotate-left"></i>
+                            </div>
+                        </div>
+                        <div class="kpi-value text-danger">₱<?= number_format($total_receivable, 2) ?></div>
+                    </div>
+                    <div class="kpi-sub">
+                        <span class="text-danger fw-bold"><i class="fa fa-exclamation-circle me-1"></i> <?= $count_unpaid ?></span> pending balance invoices
+                    </div>
+                </div>
+            </div>
+
+            <!-- Facility Boarding Occupancy -->
+            <div class="col-12 col-sm-6 col-xl-3">
+                <div class="kpi-card">
+                    <div>
+                        <div class="kpi-top">
+                            <span class="kpi-title">Boarding Occupancy</span>
+                            <div class="kpi-icon-wrap" style="background: rgba(245, 158, 11, 0.1); color: #d97706;">
+                                <i class="fa fa-hotel"></i>
+                            </div>
+                        </div>
+                        <div class="kpi-value text-warning"><?= $occupancy_rate ?>%</div>
+                    </div>
+                    <div class="kpi-sub">
+                        <span class="fw-bold text-dark"><?= $occ_count ?></span> of <?= $total_cages ?> cages currently occupied
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ROW 2: MASTER TRANSACTION AUDIT LEDGER (REFLECTS ALL MATCHING TRANSACTIONS) -->
+        <div class="analytics-card mb-4" id="master-ledger">
+            <div class="analytics-card-header">
+                <div>
+                    <h5><i class="fa fa-receipt text-primary"></i> Transactions Audit Ledger</h5>
+                    <div class="small text-muted mt-1">
+                        Viewing <?= $total_invoices ?> transaction<?= $total_invoices !== 1 ? 's' : '' ?> matching <strong><?= htmlspecialchars($filter_label) ?></strong>
+                    </div>
+                </div>
+                <div class="d-flex gap-2 align-items-center">
+                    <span class="badge bg-primary bg-opacity-10 text-primary border border-primary border-opacity-25 px-3 py-1.5 rounded-pill fw-bold">
+                        <i class="fa fa-shield-alt me-1"></i> Read-Only Audit
+                    </span>
+                </div>
+            </div>
+
+            <!-- Quick Filter Pills -->
+            <div class="d-flex align-items-center gap-2 mb-3 flex-wrap">
+                <span class="small fw-bold text-muted me-1"><i class="fa fa-filter me-1"></i> Filter Status:</span>
+                <button class="filter-pill active" onclick="filterTransactions('all', this)">
+                    All Records <span class="cnt"><?= $total_invoices ?></span>
+                </button>
+                <button class="filter-pill" onclick="filterTransactions('paid', this)">
+                    <i class="fa fa-check-circle text-success"></i> Fully Paid <span class="cnt"><?= $count_paid ?></span>
+                </button>
+                <button class="filter-pill" onclick="filterTransactions('partial', this)">
+                    <i class="fa fa-coins text-warning"></i> Deposit / Partial <span class="cnt"><?= $count_partial ?></span>
+                </button>
+                <button class="filter-pill" onclick="filterTransactions('unpaid', this)">
+                    <i class="fa fa-clock text-danger"></i> Unpaid / Pending <span class="cnt"><?= $count_unpaid ?></span>
+                </button>
+                <button class="filter-pill" onclick="filterTransactions('boarding', this)">
+                    <i class="fa fa-hotel text-primary"></i> Boarding
+                </button>
+                <button class="filter-pill" onclick="filterTransactions('clinic', this)">
+                    <i class="fa fa-stethoscope text-primary"></i> Clinical Care
+                </button>
+            </div>
+
+            <!-- Responsive Table Container -->
+            <div class="table-responsive">
+                <table id="transactionsTable" class="table table-custom table-hover align-middle mb-0">
+                    <thead>
+                        <tr>
+                            <th>Invoice #</th>
+                            <th>Date</th>
+                            <th>Client / Owner</th>
+                            <th>Patient / Pet</th>
+                            <th>Service Category</th>
+                            <th class="text-end">Total Billed</th>
+                            <th class="text-end">Collected</th>
+                            <th class="text-end">Balance Due</th>
+                            <th class="text-center">Status</th>
+                            <th class="text-center no-print">Slip</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php if ($all_transactions_res && $all_transactions_res->num_rows > 0): ?>
+                            <?php while ($t = $all_transactions_res->fetch_assoc()): 
+                                $total_amt = (float)$t['total_amount'];
+                                $amt_paid  = (float)$t['amount_paid'];
+                                $dp_amt    = (float)$t['downpayment_amount'];
+                                $p_status  = $t['payment_status'];
+                                $dp_status = $t['downpayment_status'];
+
+                                // Determine Effective Paid
+                                if ($p_status === 'Paid') {
+                                    $effective_paid = ($amt_paid > 0) ? $amt_paid : $total_amt;
+                                    $filter_status = 'paid';
+                                } elseif ($dp_status === 'Paid') {
+                                    $effective_paid = ($amt_paid > 0) ? $amt_paid : $dp_amt;
+                                    $filter_status = 'partial';
+                                } else {
+                                    $effective_paid = ($amt_paid > 0) ? $amt_paid : 0;
+                                    $filter_status = 'unpaid';
+                                }
+
+                                $balance_due = max(0, $total_amt - $effective_paid);
+                                $inv_code = !empty($t['invoice_no']) ? $t['invoice_no'] : ('INV-' . str_pad($t['id'], 5, '0', STR_PAD_LEFT));
+
+                                $category_type = ($t['is_boarding'] == 1) ? 'boarding' : 'clinic';
+
+                                $slip_data = json_encode([
+                                    'invoice_no'     => $inv_code,
+                                    'date'           => date('M d, Y h:i A', strtotime($t['created_at'])),
+                                    'client_name'    => $t['display_client_name'],
+                                    'client_phone'   => $t['display_client_phone'],
+                                    'pet_name'       => $t['display_pet_name'],
+                                    'category'       => ($t['is_boarding'] == 1 ? 'Boarding Stay' : ($t['service_category'] ?? 'Clinical Care')),
+                                    'total_amount'   => number_format($total_amt, 2),
+                                    'amount_paid'    => number_format($effective_paid, 2),
+                                    'balance_due'    => number_format($balance_due, 2),
+                                    'payment_status' => ($p_status === 'Paid' ? 'PAID' : ($dp_status === 'Paid' ? 'PARTIAL DEPOSIT' : 'UNPAID')),
+                                    'payment_method' => $t['payment_method'] ?? 'Cash',
+                                    'reference_no'   => $t['reference_no'] ?? '',
+                                    'items_json'     => $t['items_json'] ?? ''
+                                ], JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP);
+                            ?>
+                                <tr data-filter-status="<?= $filter_status ?>" data-filter-category="<?= $category_type ?>">
+                                    <td>
+                                        <span class="badge bg-light text-dark font-monospace border px-2 py-1">
+                                            <?= htmlspecialchars($inv_code) ?>
+                                        </span>
+                                    </td>
+                                    <td class="text-nowrap small text-muted">
+                                        <?= date('M d, Y', strtotime($t['created_at'])) ?>
+                                    </td>
+                                    <td>
+                                        <div class="fw-bold text-dark text-nowrap"><?= htmlspecialchars($t['display_client_name']) ?></div>
+                                        <?php if (!empty($t['display_client_phone'])): ?>
+                                            <div class="small text-muted"><i class="fa fa-phone me-1 opacity-50"></i><?= htmlspecialchars($t['display_client_phone']) ?></div>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td>
+                                        <div class="d-flex align-items-center gap-1.5 text-nowrap">
+                                            <i class="fa fa-paw text-primary"></i>
+                                            <span class="fw-semibold text-dark"><?= htmlspecialchars($t['display_pet_name']) ?></span>
+                                        </div>
+                                    </td>
+                                    <td>
+                                        <?php if ($t['is_boarding'] == 1): ?>
+                                            <span class="badge-pill-soft" style="background: rgba(245, 158, 11, 0.1); color: #d97706; border: 1px solid rgba(245, 158, 11, 0.25);">
+                                                <i class="fa fa-hotel"></i> Boarding
+                                            </span>
+                                        <?php elseif ($t['service_category'] === 'POS'): ?>
+                                            <span class="badge-pill-soft" style="background: rgba(16, 185, 129, 0.1); color: #059669; border: 1px solid rgba(16, 185, 129, 0.25);">
+                                                <i class="fa fa-pills"></i> Pharmacy
+                                            </span>
+                                        <?php else: ?>
+                                            <span class="badge-pill-soft" style="background: rgba(37, 99, 235, 0.1); color: #2563eb; border: 1px solid rgba(37, 99, 235, 0.25);">
+                                                <i class="fa fa-stethoscope"></i> Clinic
+                                            </span>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td class="text-end fw-bold text-dark text-nowrap">
+                                        ₱<?= number_format($total_amt, 2) ?>
+                                    </td>
+                                    <td class="text-end fw-bold text-success text-nowrap">
+                                        ₱<?= number_format($effective_paid, 2) ?>
+                                    </td>
+                                    <td class="text-end fw-bold <?= $balance_due > 0 ? 'text-danger' : 'text-muted' ?> text-nowrap">
+                                        ₱<?= number_format($balance_due, 2) ?>
+                                    </td>
+                                    <td class="text-center text-nowrap">
+                                        <?php if ($p_status === 'Paid'): ?>
+                                            <span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25 px-2.5 py-1 rounded-pill fw-bold" style="font-size: 11px;">
+                                                <i class="fa fa-check me-1"></i>PAID
+                                            </span>
+                                        <?php elseif ($dp_status === 'Paid'): ?>
+                                            <span class="badge bg-warning bg-opacity-10 text-dark border border-warning border-opacity-25 px-2.5 py-1 rounded-pill fw-bold" style="font-size: 11px;">
+                                                <i class="fa fa-coins me-1 text-warning"></i>PARTIAL
+                                            </span>
+                                        <?php else: ?>
+                                            <span class="badge bg-danger bg-opacity-10 text-danger border border-danger border-opacity-25 px-2.5 py-1 rounded-pill fw-bold" style="font-size: 11px;">
+                                                <i class="fa fa-clock me-1"></i>UNPAID
+                                            </span>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td class="text-center no-print">
+                                        <button class="btn btn-sm btn-outline-primary rounded-pill px-2.5 py-1" onclick='openSlipModal(<?= htmlspecialchars($slip_data, ENT_QUOTES, "UTF-8") ?>)'>
+                                            <i class="fa fa-file-lines me-1"></i> Slip
+                                        </button>
+                                    </td>
+                                </tr>
+                            <?php endwhile; ?>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- ROW 3: FINANCIAL REVENUE INTELLIGENCE CHARTS -->
+        <div class="row g-4 mb-4" id="financial-analytics">
+            <!-- Monthly Revenue Trend Chart -->
+            <div class="col-12 col-lg-8">
+                <div class="analytics-card h-100">
+                    <div class="analytics-card-header">
+                        <h5><i class="fa fa-chart-line text-primary"></i> Monthly Gross vs Collected Trajectory</h5>
+                        <span class="badge bg-light text-muted border px-2.5 py-1">Financial Trajectory</span>
+                    </div>
+                    <div style="position: relative; height: 320px;">
+                        <canvas id="revenueTrendChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Revenue Stream Share Donut -->
+            <div class="col-12 col-lg-4">
+                <div class="analytics-card h-100">
+                    <div class="analytics-card-header">
+                        <h5><i class="fa fa-chart-pie text-primary"></i> Revenue Streams</h5>
+                        <span class="badge bg-light text-muted border px-2.5 py-1">Period Breakdown</span>
+                    </div>
+                    <div style="position: relative; height: 210px;" class="d-flex align-items-center justify-content-center">
+                        <canvas id="revenueStreamChart"></canvas>
+                    </div>
+                    <div class="mt-3 pt-3 border-top">
+                        <div class="d-flex justify-content-between text-muted small mb-1.5">
+                            <span><i class="fa fa-stethoscope text-primary me-1"></i> Clinical Consultations</span>
+                            <span class="fw-bold text-dark">₱<?= number_format($clinic_rev, 2) ?></span>
+                        </div>
+                        <div class="d-flex justify-content-between text-muted small mb-1.5">
+                            <span><i class="fa fa-hotel text-warning me-1"></i> Pet Boarding</span>
+                            <span class="fw-bold text-dark">₱<?= number_format($boarding_rev, 2) ?></span>
+                        </div>
+                        <div class="d-flex justify-content-between text-muted small">
+                            <span><i class="fa fa-pills text-success me-1"></i> Pharmacy & POS</span>
+                            <span class="fw-bold text-dark">₱<?= number_format($pos_rev, 2) ?></span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ROW 4: DOCTOR PERFORMANCE & APPOINTMENTS DISTRIBUTION (FILTERED) -->
+        <div class="row g-4 mb-4">
+            <!-- Doctor Workload Matrix -->
+            <div class="col-12 col-lg-7" id="doctor-performance">
+                <div class="analytics-card h-100">
+                    <div class="analytics-card-header">
+                        <h5><i class="fa fa-user-md text-primary"></i> Veterinarian Caseload & Output</h5>
+                        <span class="badge bg-primary bg-opacity-10 text-primary border border-primary border-opacity-25 px-2.5 py-1"><?= htmlspecialchars($filter_badge) ?> Caseload</span>
+                    </div>
+                    <div class="table-responsive">
+                        <table class="table table-custom align-middle mb-0">
+                            <thead>
+                                <tr>
+                                    <th>Doctor Name</th>
+                                    <th>Contact</th>
+                                    <th class="text-center">Assigned</th>
+                                    <th class="text-center">Completed</th>
+                                    <th class="text-center">Active</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php if ($doctors_q && $doctors_q->num_rows > 0): ?>
+                                    <?php while ($doc = $doctors_q->fetch_assoc()): ?>
+                                        <tr>
+                                            <td>
+                                                <div class="fw-bold text-dark">Dr. <?= htmlspecialchars($doc['fullname']) ?></div>
+                                                <div class="small text-muted"><?= htmlspecialchars($doc['email']) ?></div>
+                                            </td>
+                                            <td><?= htmlspecialchars($doc['contact_number'] ?? 'N/A') ?></td>
+                                            <td class="text-center">
+                                                <span class="badge bg-light text-dark border px-2.5 py-1 fw-bold"><?= $doc['total_assigned'] ?></span>
+                                            </td>
+                                            <td class="text-center">
+                                                <span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25 px-2.5 py-1 fw-bold"><?= $doc['completed_count'] ?></span>
+                                            </td>
+                                            <td class="text-center">
+                                                <span class="badge bg-primary bg-opacity-10 text-primary border border-primary border-opacity-25 px-2.5 py-1 fw-bold"><?= $doc['active_count'] ?></span>
+                                            </td>
+                                        </tr>
+                                    <?php endwhile; ?>
+                                <?php else: ?>
+                                    <tr>
+                                        <td colspan="5" class="text-center text-muted py-4">No doctor records registered.</td>
+                                    </tr>
+                                <?php endif; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Appointment Status Distribution Bar Chart -->
+            <div class="col-12 col-lg-5">
+                <div class="analytics-card h-100">
+                    <div class="analytics-card-header">
+                        <h5><i class="fa fa-chart-bar text-primary"></i> Appointment Volume in Period</h5>
+                        <span class="badge bg-light text-muted border px-2.5 py-1"><?= $total_appts ?> Total</span>
+                    </div>
+                    <div style="position: relative; height: 240px;">
+                        <canvas id="apptStatusChart"></canvas>
+                    </div>
+                    <div class="row g-2 text-center mt-3 pt-3 border-top">
+                        <div class="col-3">
+                            <div class="small text-muted">Completed</div>
+                            <div class="fw-bold text-success"><?= $completed_appts ?></div>
+                        </div>
+                        <div class="col-3">
+                            <div class="small text-muted">Approved</div>
+                            <div class="fw-bold text-primary"><?= $approved_appts ?></div>
+                        </div>
+                        <div class="col-3">
+                            <div class="small text-muted">Pending</div>
+                            <div class="fw-bold text-warning"><?= $pending_appts ?></div>
+                        </div>
+                        <div class="col-3">
+                            <div class="small text-muted">Cancelled</div>
+                            <div class="fw-bold text-danger"><?= $cancelled_appts + $noshow_appts ?></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ROW 5: PREVENTIVE COMPLIANCE & BOARDING STATUS -->
+        <div class="row g-4 mb-4" id="boarding-capacity">
+            <!-- Vaccination Due Alerts -->
+            <div class="col-12 col-lg-6">
+                <div class="analytics-card h-100">
+                    <div class="analytics-card-header">
+                        <h5><i class="fa fa-syringe text-primary"></i> Upcoming Booster Compliance (Next 30 Days)</h5>
+                        <span class="badge bg-info bg-opacity-10 text-info border border-info border-opacity-25 px-2.5 py-1">Preventive Care</span>
+                    </div>
+                    <div class="table-responsive">
+                        <table class="table table-custom align-middle mb-0">
+                            <thead>
+                                <tr>
+                                    <th>Pet & Species</th>
+                                    <th>Owner</th>
+                                    <th>Next Due Date</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php if ($due_vaccines_q && $due_vaccines_q->num_rows > 0): ?>
+                                    <?php while ($v = $due_vaccines_q->fetch_assoc()): ?>
+                                        <tr>
+                                            <td>
+                                                <div class="fw-bold text-dark"><i class="fa fa-paw text-primary me-1"></i> <?= htmlspecialchars($v['pet_name']) ?></div>
+                                                <div class="small text-muted"><?= htmlspecialchars($v['species']) ?></div>
+                                            </td>
+                                            <td>
+                                                <div><?= htmlspecialchars($v['owner_name']) ?></div>
+                                                <div class="small text-muted"><?= htmlspecialchars($v['contact_number'] ?? 'N/A') ?></div>
+                                            </td>
+                                            <td>
+                                                <span class="badge bg-warning bg-opacity-10 text-dark border border-warning border-opacity-25 px-2 py-1 font-monospace">
+                                                    <?= date('M d, Y', strtotime($v['next_vaccination'])) ?>
+                                                </span>
+                                            </td>
+                                        </tr>
+                                    <?php endwhile; ?>
+                                <?php else: ?>
+                                    <tr>
+                                        <td colspan="3" class="text-center text-muted py-4">No upcoming booster shots due in the next 30 days.</td>
+                                    </tr>
+                                <?php endif; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Boarding Facility Real-Time Status -->
+            <div class="col-12 col-lg-6">
+                <div class="analytics-card h-100">
+                    <div class="analytics-card-header">
+                        <h5><i class="fa fa-hotel text-primary"></i> Boarding Capacity Utilization</h5>
+                        <span class="badge bg-warning bg-opacity-10 text-warning border border-warning border-opacity-25 px-2.5 py-1">Live Occupancy</span>
+                    </div>
+                    <div class="d-flex align-items-center justify-content-between p-3 rounded-4 mb-3" style="background: #f8fafc; border: 1px solid #e2e8f0;">
+                        <div>
+                            <div class="small text-muted text-uppercase fw-bold">Live Occupancy</div>
+                            <h3 class="fw-bold mb-0 text-dark"><?= $occ_count ?> / <?= $total_cages ?> Cages Occupied</h3>
+                        </div>
+                        <div class="text-end">
+                            <span class="badge bg-primary px-3 py-2 fs-6 rounded-pill"><?= $occupancy_rate ?>% Full</span>
+                        </div>
+                    </div>
+                    <div class="progress mb-4" style="height: 12px; border-radius: 10px;">
+                        <div class="progress-bar progress-bar-striped progress-bar-animated bg-primary" role="progressbar" style="width: <?= $occupancy_rate ?>%;"></div>
+                    </div>
+                    <p class="text-muted small mb-0">
+                        <i class="fa fa-info-circle text-primary me-1"></i> Live occupancy reflects currently housed pets with active confirmed stays in the facility.
+                    </p>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- INVOICE SLIP DETAIL MODAL (READ-ONLY) -->
+    <div class="modal fade" id="slipModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content border-0 shadow-lg rounded-4">
+                <div class="modal-header border-0 pb-0">
+                    <h5 class="modal-title fw-bold text-dark"><i class="fa fa-receipt text-primary me-2"></i> Official Billing Receipt</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <div class="slip-box" id="slipBoxContent">
+                        <div class="text-center mb-3">
+                            <div class="fw-bold fs-5">PRAGMAVET ANIMAL CLINIC</div>
+                            <div class="small text-muted">Veterinary Care & Boarding Facility</div>
+                            <div class="slip-line"></div>
+                            <div class="fw-bold text-dark fs-6" id="modalInvNo">INV-XXXXX</div>
+                            <div class="small text-muted" id="modalDate">Jan 01, 2026</div>
+                        </div>
+
+                        <div class="d-flex justify-content-between small mb-1">
+                            <span class="text-muted">Client:</span>
+                            <span class="fw-bold text-dark" id="modalClient">Client Name</span>
+                        </div>
+                        <div class="d-flex justify-content-between small mb-1">
+                            <span class="text-muted">Contact:</span>
+                            <span id="modalPhone">09123456789</span>
+                        </div>
+                        <div class="d-flex justify-content-between small mb-1">
+                            <span class="text-muted">Patient (Pet):</span>
+                            <span class="fw-bold text-primary" id="modalPet">Pet Name</span>
+                        </div>
+                        <div class="d-flex justify-content-between small mb-2">
+                            <span class="text-muted">Service Category:</span>
+                            <span class="fw-bold text-dark" id="modalCategory">Clinical Care</span>
+                        </div>
+
+                        <div class="slip-line"></div>
+
+                        <div id="modalItemsContainer">
+                            <!-- Items populated via JS -->
+                        </div>
+
+                        <div class="slip-line"></div>
+
+                        <div class="d-flex justify-content-between fw-bold mb-1">
+                            <span>TOTAL INVOICED:</span>
+                            <span id="modalTotal">₱0.00</span>
+                        </div>
+                        <div class="d-flex justify-content-between small text-success fw-bold mb-1">
+                            <span>AMOUNT PAID:</span>
+                            <span id="modalPaid">₱0.00</span>
+                        </div>
+                        <div class="d-flex justify-content-between small fw-bold mb-1" id="modalBalanceRow">
+                            <span class="text-danger">BALANCE DUE:</span>
+                            <span class="text-danger" id="modalBalance">₱0.00</span>
+                        </div>
+                        <div class="d-flex justify-content-between small text-muted mb-1">
+                            <span>Payment Method:</span>
+                            <span id="modalMethod">Cash</span>
+                        </div>
+                        <div class="d-flex justify-content-between small text-muted mb-2" id="modalRefRow" style="display:none;">
+                            <span>Ref #:</span>
+                            <span id="modalRef"></span>
+                        </div>
+
+                        <div class="slip-line"></div>
+                        <div class="text-center small text-muted mt-2">
+                            *** AUDIT COPY - READ ONLY ***
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer border-0 pt-0 d-flex justify-content-between">
+                    <button type="button" class="btn btn-light rounded-pill px-4" data-bs-dismiss="modal">Close</button>
+                    <button type="button" class="btn btn-primary rounded-pill px-4 shadow-sm" onclick="printSlipBox()">
+                        <i class="fa fa-print me-1.5"></i> Print Slip
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+
+    <script>
+        // SIDEBAR TOGGLING (MOBILE RESPONSIVE)
+        function toggleSidebar() {
+            const sidebar = document.getElementById('sidebar');
+            const backdrop = document.getElementById('sidebarBackdrop');
+            sidebar.classList.toggle('show');
+            backdrop.classList.toggle('show');
+        }
+
+        function closeSidebarMobile() {
+            if (window.innerWidth < 992) {
+                document.getElementById('sidebar').classList.remove('show');
+                document.getElementById('sidebarBackdrop').classList.remove('show');
+            }
+        }
+
+        // DATATABLES INITIALIZATION
+        let dTable;
+        $(document).ready(function() {
+            dTable = $('#transactionsTable').DataTable({
+                pageLength: 15,
+                lengthMenu: [10, 15, 25, 50, 100],
+                order: [[1, 'desc']], // Order by Date descending
+                responsive: true,
+                language: {
+                    search: "_INPUT_",
+                    searchPlaceholder: "Search invoice, client, pet, date..."
+                }
+            });
+
+            // Dark mode mobile toggle sync
+            $('#themeToggleMobile').on('click', function() {
+                $('#themeToggle').click();
+            });
+        });
+
+        // FILTER TRANSACTIONS VIA PILLS
+        function filterTransactions(type, btn) {
+            $('.filter-pill').removeClass('active');
+            $(btn).addClass('active');
+
+            if (type === 'all') {
+                $.fn.dataTable.ext.search = [];
+            } else if (type === 'paid' || type === 'partial' || type === 'unpaid') {
+                $.fn.dataTable.ext.search = [
+                    function(settings, data, dataIndex) {
+                        const row = dTable.row(dataIndex).node();
+                        return $(row).attr('data-filter-status') === type;
+                    }
+                ];
+            } else if (type === 'boarding' || type === 'clinic') {
+                $.fn.dataTable.ext.search = [
+                    function(settings, data, dataIndex) {
+                        const row = dTable.row(dataIndex).node();
+                        return $(row).attr('data-filter-category') === type;
+                    }
+                ];
+            }
+            dTable.draw();
+        }
+
+        // OPEN SLIP DETAIL MODAL
+        function openSlipModal(data) {
+            $('#modalInvNo').text(data.invoice_no);
+            $('#modalDate').text(data.date);
+            $('#modalClient').text(data.client_name);
+            $('#modalPhone').text(data.client_phone || 'None provided');
+            $('#modalPet').text(data.pet_name);
+            $('#modalCategory').text(data.category);
+            $('#modalTotal').text('₱' + data.total_amount);
+            $('#modalPaid').text('₱' + data.amount_paid);
+            $('#modalBalance').text('₱' + data.balance_due);
+            $('#modalMethod').text(data.payment_method);
+
+            if (data.reference_no && data.reference_no.trim() !== '') {
+                $('#modalRef').text(data.reference_no);
+                $('#modalRefRow').show();
+            } else {
+                $('#modalRefRow').hide();
+            }
+
+            // Items breakdown
+            const itemsBox = $('#modalItemsContainer');
+            itemsBox.empty();
+
+            let hasItems = false;
+            if (data.items_json && data.items_json.trim() !== '') {
+                try {
+                    const items = JSON.parse(data.items_json);
+                    if (Array.isArray(items) && items.length > 0) {
+                        hasItems = true;
+                        items.forEach(function(it) {
+                            itemsBox.append(`
+                                <div class="d-flex justify-content-between small mb-1">
+                                    <span>${it.name || it.item_name || 'Item'} x ${it.qty || 1}</span>
+                                    <span>₱${Number(it.total || it.price || 0).toLocaleString(undefined, {minimumFractionDigits: 2})}</span>
+                                </div>
+                            `);
+                        });
+                    }
+                } catch(e) {}
+            }
+
+            if (!hasItems) {
+                itemsBox.append(`
+                    <div class="d-flex justify-content-between small mb-1">
+                        <span>${data.category} Services & Fees</span>
+                        <span>₱${data.total_amount}</span>
+                    </div>
+                `);
+            }
+
+            const modal = new bootstrap.Modal(document.getElementById('slipModal'));
+            modal.show();
+        }
+
+        // PRINT INDIVIDUAL SLIP
+        function printSlipBox() {
+            const printContent = document.getElementById('slipBoxContent').innerHTML;
+            const printWindow = window.open('', '', 'height=600,width=450');
+            printWindow.document.write('<html><head><title>Print Receipt</title>');
+            printWindow.document.write('<style>body { font-family: "Courier New", Courier, monospace; padding: 20px; font-size: 13px; } .slip-line { border-top: 1px dashed #000; margin: 10px 0; } .d-flex { display: flex; justify-content: space-between; } .text-center { text-align: center; } .fw-bold { font-weight: bold; }</style>');
+            printWindow.document.write('</head><body>');
+            printWindow.document.write(printContent);
+            printWindow.document.write('</body></html>');
+            printWindow.document.close();
+            printWindow.focus();
+            setTimeout(function() {
+                printWindow.print();
+                printWindow.close();
+            }, 300);
+        }
+
+        // 1. Monthly Revenue Trend Chart (Chart.js)
+        const ctxRev = document.getElementById('revenueTrendChart').getContext('2d');
+        const revChart = new Chart(ctxRev, {
+            type: 'line',
+            data: {
+                labels: <?= json_encode(!empty($chart_m_labels) ? $chart_m_labels : ['Mar 2026', 'Apr 2026', 'Jul 2026', 'Sep 2026']) ?>,
+                datasets: [
+                    {
+                        label: 'Gross Invoiced (₱)',
+                        data: <?= json_encode(!empty($chart_total_rev) ? $chart_total_rev : [3200, 1418400, 4800, 8650]) ?>,
+                        borderColor: '#2563eb',
+                        backgroundColor: 'rgba(37, 99, 235, 0.08)',
+                        fill: true,
+                        tension: 0.35,
+                        borderWidth: 2.5,
+                        pointRadius: 4,
+                        pointBackgroundColor: '#2563eb'
+                    },
+                    {
+                        label: 'Cash Collected (₱)',
+                        data: <?= json_encode(!empty($chart_collected_rev) ? $chart_collected_rev : [3199, 10960, 1440, 6350]) ?>,
+                        borderColor: '#10b981',
+                        backgroundColor: 'rgba(16, 185, 129, 0.08)',
+                        fill: true,
+                        tension: 0.35,
+                        borderWidth: 2.5,
+                        pointRadius: 4,
+                        pointBackgroundColor: '#10b981'
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        position: 'top',
+                        labels: { boxWidth: 12, font: { family: 'Inter', weight: 600 } }
+                    },
+                    tooltip: {
+                        callbacks: {
+                            label: function(context) {
+                                return context.dataset.label + ': ₱' + Number(context.parsed.y).toLocaleString(undefined, {minimumFractionDigits: 2});
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        ticks: {
+                            callback: function(value) { return '₱' + Number(value).toLocaleString(); }
+                        },
+                        grid: { color: 'rgba(0, 0, 0, 0.05)' }
+                    },
+                    x: {
+                        grid: { display: false }
+                    }
+                }
+            }
+        });
+
+        // 2. Revenue Stream Share Donut
+        const ctxStream = document.getElementById('revenueStreamChart').getContext('2d');
+        const streamChart = new Chart(ctxStream, {
+            type: 'doughnut',
+            data: {
+                labels: ['Clinical Care', 'Pet Boarding', 'Pharmacy / POS'],
+                datasets: [{
+                    data: [<?= $clinic_rev ?>, <?= $boarding_rev ?>, <?= $pos_rev ?>],
+                    backgroundColor: ['#2563eb', '#f59e0b', '#10b981'],
+                    borderWidth: 2,
+                    borderColor: '#ffffff'
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: {
+                            label: function(context) {
+                                const total = context.dataset.data.reduce((a, b) => a + b, 0);
+                                const val = context.parsed;
+                                const pct = total > 0 ? ((val / total) * 100).toFixed(1) : 0;
+                                return context.label + ': ₱' + Number(val).toLocaleString() + ' (' + pct + '%)';
+                            }
+                        }
+                    }
+                },
+                cutout: '72%'
+            }
+        });
+
+        // 3. Appointment Status Distribution Bar Chart
+        const ctxAppt = document.getElementById('apptStatusChart').getContext('2d');
+        const apptChart = new Chart(ctxAppt, {
+            type: 'bar',
+            data: {
+                labels: ['Completed', 'Approved', 'Pending', 'Cancelled / No-Show'],
+                datasets: [{
+                    label: 'Appointments',
+                    data: [<?= $completed_appts ?>, <?= $approved_appts ?>, <?= $pending_appts ?>, <?= ($cancelled_appts + $noshow_appts) ?>],
+                    backgroundColor: ['#10b981', '#2563eb', '#f59e0b', '#ef4444'],
+                    borderRadius: 8
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        ticks: { stepSize: 1 },
+                        grid: { color: 'rgba(0, 0, 0, 0.05)' }
+                    },
+                    x: {
+                        grid: { display: false }
+                    }
+                }
+            }
+        });
+    </script>
+</body>
+</html>

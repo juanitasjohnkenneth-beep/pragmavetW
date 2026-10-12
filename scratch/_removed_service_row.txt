@@ -1,0 +1,2 @@
+id	service_name	price	unit	sort_order	updated_at	category
+5	Vaccination and Deworming	800.00	per visit	4	2026-10-08 13:54:04	NULL

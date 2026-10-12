@@ -1,0 +1,777 @@
+<?php
+require_once __DIR__ . '/includes/mail_config.php';
+session_start();
+include("dbconnection.php");
+include_once("includes/rbac_guard.php");
+include_once("includes/client_notify.php");
+
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\Exception;
+require 'PHPMailer/src/Exception.php';
+require 'PHPMailer/src/PHPMailer.php';
+require 'PHPMailer/src/SMTP.php';
+
+require_once 'vendor/autoload.php';
+use Dompdf\Dompdf;
+use Dompdf\Options;
+
+// RBAC Access Guard
+$user_role = rbac_get_role();
+if (!isset($_SESSION['user_id']) || !in_array($user_role, ['admin', 'staff', 'clinic_owner', 'owner', 'doctor'])) {
+    header("Location: " . rbac_home_url($user_role));
+    exit();
+}
+
+// A health certificate is a medical statement: only a licensed veterinarian approves (signs) or declines it.
+// Admin, vet staff and the clinic owner can view requests and issued certificates.
+$conn->query("ALTER TABLE certificate_requests ADD COLUMN IF NOT EXISTS approved_by INT NULL");
+if ((isset($_POST['approve_request']) || isset($_POST['reject_request'])) && $user_role !== 'doctor') {
+    $_SESSION['message'] = "Certificates are reviewed and signed by a veterinarian. The vets have been notified of pending requests.";
+    $_SESSION['msg_type'] = "warning";
+    header("Location: admin_certificates.php"); exit();
+}
+$pv_vet_name = $user_role === 'doctor' ? ($conn->query("SELECT fullname FROM users WHERE id = " . (int)$_SESSION['user_id'])->fetch_assoc()['fullname'] ?? '') : '';
+$pv_req_ok = function ($conn, $req_id) {   // only requests still waiting can be decided
+    return (bool)$conn->query("SELECT 1 FROM certificate_requests WHERE id = " . (int)$req_id . " AND status = 'Pending'")->num_rows;
+};
+if ((isset($_POST['approve_request']) || isset($_POST['reject_request'])) && !$pv_req_ok($conn, (int)($_POST['req_id'] ?? 0))) {
+    $_SESSION['message'] = "This request was already reviewed.";
+    $_SESSION['msg_type'] = "info";
+    header("Location: admin_certificates.php"); exit();
+}
+
+// ─── APPROVE──────────────────────────────────────────────────────────────────
+if(isset($_POST['approve_request'])){
+    $req_id = (int)$_POST['req_id'];
+
+    // Fetch full data
+    $q = $conn->prepare("
+        SELECT cr.*, p.name as pet_name, p.species, p.breed, p.age, p.weight,
+               p.last_vaccination, p.next_vaccination,
+               u.fullname, u.email, u.contact_number, u.address
+        FROM certificate_requests cr
+        JOIN pets p ON cr.pet_id = p.id
+        JOIN users u ON cr.user_id = u.id
+        WHERE cr.id = ?
+    ");
+    $q->bind_param("i", $req_id);
+    $q->execute();
+    $data = $q->get_result()->fetch_assoc();
+
+    if($data){
+        // Fetch latest consultation
+        $hq = $conn->prepare("SELECT c.*, a.appointment_date FROM consultations c JOIN appointments a ON c.appointment_id = a.id WHERE a.pet_name=? AND a.user_id=? ORDER BY a.appointment_date DESC LIMIT 1");
+        $hq->bind_param("si", $data['pet_name'], $data['user_id']);
+        $hq->execute();
+        $history = $hq->get_result()->fetch_assoc();
+
+        $issued = date("F j, Y");
+        $vax_last = $data['last_vaccination'] ? date("F j, Y", strtotime($data['last_vaccination'])) : 'Not on record';
+        $vax_next = $data['next_vaccination'] ? date("F j, Y", strtotime($data['next_vaccination'])) : 'Consult Veterinarian';
+
+        // Build PDF HTML
+        $html = '<!DOCTYPE html><html><head><style>
+            body{font-family:Arial,sans-serif;color:#1a1a1a;margin:0;padding:0;}
+            .page{padding:50px;}
+            .header{text-align:center;border-bottom:2px solid #2563eb;padding-bottom:18px;margin-bottom:28px;}
+            .header h1{font-size:28px;color:#2563eb;margin:0;text-transform:uppercase;letter-spacing:2px;}
+            .header p{margin:4px 0 0;font-size:13px;color:#666;}
+            .title{text-align:center;margin:30px 0;font-size:24px;font-weight:bold;letter-spacing:1px;}
+            .grid{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-bottom:28px;}
+            .box{border:1px solid #e1e8ed;border-radius:8px;padding:18px;}
+            .box h4{margin:0 0 12px;font-size:12px;text-transform:uppercase;color:#3b82f6;border-bottom:1px solid #eee;padding-bottom:6px;}
+            .row{display:flex;justify-content:space-between;margin-bottom:8px;font-size:14px;}
+            .label{font-weight:bold;color:#555;}
+            .notes{background:#fffcf5;border:1px solid #f2e3c6;padding:20px;border-radius:8px;margin-bottom:28px;}
+            .notes h4{color:#d09a2b;margin:0 0 12px;font-size:12px;text-transform:uppercase;}
+            .notes p{line-height:1.6;margin:0;font-size:15px;}
+            .sigs{display:flex;justify-content:space-between;margin-top:60px;}
+            .sig{text-align:center;width:40%;}
+            .sig-line{border-top:1px solid #333;margin-top:50px;padding-top:8px;font-weight:bold;font-size:13px;}
+            .disclaimer{text-align:center;font-size:12px;color:#777;margin-top:20px;line-height:1.5;}
+        
+        /* ====== WHITE SIDEBAR THEME ====== */
+        .sidebar {
+            background: #ffffff !important;
+            width: var(--sidebar-width, 260px) !important;
+            height: 100vh !important;
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            padding: 28px 20px 24px !important;
+            z-index: 1000 !important;
+            display: flex !important;
+            flex-direction: column !important;
+            border-right: 1px solid #eef2f6 !important;
+            box-shadow: none !important;
+            overflow-y: auto !important;
+        }
+
+        .sidebar-brand {
+            display: flex !important;
+            align-items: center !important;
+            gap: 12px !important;
+            margin-bottom: 24px !important;
+            padding: 0 4px !important;
+            text-decoration: none !important;
+        }
+
+        .sidebar-brand-icon {
+            width: 44px !important;
+            height: 44px !important;
+            min-width: 44px !important;
+            border-radius: 13px !important;
+            background: #2563eb !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            color: #ffffff !important;
+            font-size: 20px !important;
+            flex-shrink: 0 !important;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+        }
+
+        .sidebar-brand span {
+            font-weight: 800 !important;
+            color: #182032 !important;
+            font-size: 22px !important;
+            letter-spacing: -0.4px !important;
+        }
+
+        .sidebar-user {
+            margin-bottom: 24px !important;
+            padding: 15px 18px !important;
+            border-radius: 14px !important;
+            background: #f8fafc !important;
+            border: 1px solid #eef2f6 !important;
+        }
+
+        .sidebar-user .welcome {
+            font-size: 13px !important;
+            color: #64748b !important;
+            font-weight: 500 !important;
+            line-height: 1.3 !important;
+        }
+
+        .sidebar-user .uname {
+            font-weight: 700 !important;
+            color: #0f172a !important;
+            font-size: 15.5px !important;
+            margin-top: 3px !important;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+        }
+
+        .sidebar a {
+            display: flex !important;
+            align-items: center !important;
+            gap: 14px !important;
+            padding: 12px 16px !important;
+            border-radius: 12px !important;
+            color: #334155 !important;
+            text-decoration: none !important;
+            margin-bottom: 4px !important;
+            font-weight: 600 !important;
+            font-size: 14.5px !important;
+            transition: all 0.2s ease !important;
+            letter-spacing: -0.1px !important;
+        }
+
+        .sidebar a i {
+            width: 22px !important;
+            text-align: center !important;
+            font-size: 16px !important;
+            color: #64748b !important;
+            transition: color 0.2s !important;
+            flex-shrink: 0 !important;
+        }
+
+        .sidebar a:hover {
+            background: #f8fafc !important;
+            color: #0f172a !important;
+        }
+
+        .sidebar a:hover i {
+            color: #2563eb !important;
+        }
+
+        .sidebar a.active {
+            background: #2563eb !important;
+            color: #ffffff !important;
+            font-weight: 700 !important;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+        }
+
+        .sidebar a.active i {
+            color: #ffffff !important;
+        }
+
+        .sidebar .sidebar-logout {
+            margin-top: auto !important;
+            padding-top: 20px !important;
+            border-top: 1px solid #f1f5f9 !important;
+        }
+
+        .sidebar .sidebar-logout a {
+            color: #dc2626 !important;
+            font-weight: 600 !important;
+            margin-bottom: 0 !important;
+        }
+
+        .sidebar .sidebar-logout a i {
+            color: #dc2626 !important;
+        }
+
+        .sidebar .sidebar-logout a:hover {
+            background: #fef2f2 !important;
+            color: #b91c1c !important;
+        }
+
+        .sidebar::-webkit-scrollbar { width: 5px; }
+        .sidebar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.06); border-radius: 10px; }
+        .sidebar::-webkit-scrollbar-track { background: transparent; }
+</style>    <link rel="stylesheet" href="assets/pragmavet.css">
+    <link href="assets/global-style.css" rel="stylesheet">
+</head><body><div class="page">
+        <div class="header"><h1>PragmaVet Animal Clinic</h1><p>Imus Branch &bull; pragmavet@clinic.com</p></div>
+        <div class="title">CERTIFICATE OF HEALTH AND VACCINATION</div>
+        <p style="text-align:center;color:#666;font-size:13px;margin-bottom:28px;">Date of Issuance: '.$issued.'</p>
+        <div class="grid">
+            <div class="box"><h4>Animal Information</h4>
+                <div class="row"><span class="label">Name:</span><span>'.htmlspecialchars($data['pet_name']).'</span></div>
+                <div class="row"><span class="label">Species / Breed:</span><span>'.htmlspecialchars($data['species']).' / '.htmlspecialchars($data['breed']).'</span></div>
+                <div class="row"><span class="label">Age:</span><span>'.($data['age'] ? $data['age'].' yrs' : 'N/A').'</span></div>
+                <div class="row"><span class="label">Weight:</span><span>'.($data['weight'] ? $data['weight'].' kg' : 'N/A').'</span></div>
+            </div>
+            <div class="box"><h4>Owner Details</h4>
+                <div class="row"><span class="label">Full Name:</span><span>'.htmlspecialchars($data['fullname']).'</span></div>
+                <div class="row"><span class="label">Contact:</span><span>'.htmlspecialchars($data['contact_number'] ?: 'N/A').'</span></div>
+                <div class="row"><span class="label">Email:</span><span>'.htmlspecialchars($data['email']).'</span></div>
+                <div class="row"><span class="label">Address:</span><span>'.htmlspecialchars($data['address'] ?: 'N/A').'</span></div>
+            </div>
+        </div>
+        <div class="box" style="margin-bottom:28px;"><h4>Immunization Record</h4>
+            <div class="row"><span class="label">Last Vaccination:</span><span>'.$vax_last.'</span></div>
+            <div class="row"><span class="label">Next Vaccination Due:</span><span style="color:#D32F2F;font-weight:bold;">'.$vax_next.'</span></div>
+        </div>';
+
+        if($history){
+            $html .= '<div class="notes"><h4>Recent Clinical Observations</h4><p>On <b>'.date("F j, Y", strtotime($history['appointment_date'])).'</b>, '.htmlspecialchars($data['pet_name']).' underwent a formal consultation.<br><br><b>Diagnosis:</b> '.htmlspecialchars($history['diagnosis']).'<br><b>Treatment:</b> '.htmlspecialchars($history['treatment']).'</p></div>';
+        } else {
+            $html .= '<div class="notes"><h4>Recent Clinical Observations</h4><p>No recent clinical observations on file.</p></div>';
+        }
+
+        $html .= '<p class="disclaimer">This document is digitally generated and secured by PragmaVet Systems.</p>
+        <div class="sigs">
+            <div class="sig"><div class="sig-line">Clinic Administrator</div></div>
+            <div class="sig"><div class="sig-line">' . htmlspecialchars($pv_vet_name ?: 'Licensed Veterinarian') . '<br><span style="font-weight:normal;font-size:11px;">Licensed Veterinarian · Approved ' . date('M j, Y') . '</span></div></div>
+        </div>
+        </div>    <script src="mousetrail.js"></script>
+</body></html>';
+
+        // Generate PDF
+        $options = new Options();
+        $options->set('defaultFont', 'Arial');
+        $options->set('isHtml5ParserEnabled', true);
+        $dompdf = new Dompdf($options);
+        $dompdf->loadHtml($html);
+        $dompdf->setPaper('A4', 'portrait');
+        $dompdf->render();
+
+        $filename = 'cert_'.$req_id.'_'.time().'.pdf';
+        $filepath = 'uploads/certificates/' . $filename;
+        file_put_contents($filepath, $dompdf->output());
+
+        // Update DB
+        $upd = $conn->prepare("UPDATE certificate_requests SET status='Approved', pdf_url=?, approved_by=? WHERE id=?");
+        $pdf_url = $filepath;
+        $pv_me = (int)$_SESSION['user_id'];
+        $upd->bind_param("sii", $pdf_url, $pv_me, $req_id);
+        $upd->execute();
+        notify_user($conn, $data['user_id'], "The health certificate for {$data['pet_name']} is ready. Tap to download it.", $pdf_url);
+        notify_staff($conn, "$pv_vet_name approved the health certificate for {$data['pet_name']} (" . $data['fullname'] . "). It was emailed to the owner; print a copy if they ask at the desk.", 'admin_certificates.php');
+
+        // Send Email
+        try {
+            $mail = new PHPMailer(true);
+            $mail->isSMTP();
+            $mail->Host = 'smtp.gmail.com';
+            $mail->SMTPAuth = true;
+            $mail->Username = PV_SMTP_USER;
+            $mail->Password = PV_SMTP_PASS;
+            $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
+            $mail->Port = 587;
+            $mail->setFrom(PV_SMTP_USER, 'PragmaVet Animal Clinic');
+            $mail->addAddress($data['email'], $data['fullname']);
+            $mail->isHTML(true);
+            $mail->Subject = 'Your Certificate of Health and Vaccination is Ready';
+            $mail->Body = "
+                <div style='font-family:Arial,sans-serif;max-width:600px;margin:0 auto;'>
+                <div style='background:#2563eb;padding:28px 32px;border-radius:12px 12px 0 0;'>
+                    <h1 style='color:#fff;margin:0;font-size:22px;'>PragmaVet Animal Clinic</h1>
+                    <p style='color:rgba(255,255,255,0.7);margin:4px 0 0;font-size:13px;'>Imus Branch</p>
+                </div>
+                <div style='background:#fff;padding:32px;border:1px solid #e2e8f0;border-top:0;border-radius:0 0 12px 12px;'>
+                    <p style='font-size:16px;font-weight:600;color:#1e293b;'>Hello, {$data['fullname']}!</p>
+                    <p style='color:#475569;line-height:1.6;'>Your request for a <strong>Certificate of Health and Vaccination</strong> for your pet <strong>{$data['pet_name']}</strong> has been approved.</p>
+                    <p style='color:#475569;line-height:1.6;'>Please find the certificate attached to this email.</p>
+                    <hr style='border:0;border-top:1px solid #e2e8f0;margin:24px 0;'>
+                    <p style='color:#94a3b8;font-size:13px;'>Thank you for trusting PragmaVet with your pet's healthcare needs.</p>
+                </div>
+                </div>
+            ";
+            $mail->addAttachment($filepath, 'Certificate_'.str_replace(' ','_',$data['pet_name']).'.pdf');
+            $mail->send();
+            $_SESSION['message'] = "Request approved, PDF generated, and email sent to {$data['email']}.";
+        } catch(Exception $e){
+            $_SESSION['message'] = "Request approved and PDF saved, but email failed: " . $mail->ErrorInfo;
+        }
+        $_SESSION['msg_type'] = "success";
+    }
+    header("Location: admin_certificates.php"); exit();
+}
+
+// ─── REJECT ───────────────────────────────────────────────────────────────────
+if(isset($_POST['reject_request'])){
+    $req_id = (int)$_POST['req_id'];
+    $reason = trim($_POST['rejection_reason']);
+    $upd = $conn->prepare("UPDATE certificate_requests SET status='Rejected', admin_notes=?, approved_by=? WHERE id=?");
+    $pv_me = (int)$_SESSION['user_id'];
+    $upd->bind_param("sii", $reason, $pv_me, $req_id);
+    $upd->execute();
+    $rq = $conn->query("SELECT cr.user_id, p.name AS pet_name FROM certificate_requests cr JOIN pets p ON p.id = cr.pet_id WHERE cr.id = $req_id")->fetch_assoc();
+    if ($rq) notify_user($conn, $rq['user_id'], "Your certificate request for {$rq['pet_name']} was not approved." . ($reason !== '' ? " Reason: $reason" : ''), 'pets.php');
+    $_SESSION['message'] = "Request rejected.";
+    $_SESSION['msg_type'] = "warning";
+    header("Location: admin_certificates.php"); exit();
+}
+
+// ─── FETCH ALL REQUESTS ───────────────────────────────────────────────────────
+$filter = 'all'; // Always fetch all for JS filtering
+$requests = $conn->query("
+    SELECT cr.*, p.name as pet_name, p.species, p.breed, p.age, p.weight,
+           p.last_vaccination, p.next_vaccination,
+           u.fullname, u.email, u.contact_number
+    FROM certificate_requests cr
+    JOIN pets p ON cr.pet_id = p.id
+    JOIN users u ON cr.user_id = u.id
+    ORDER BY cr.created_at DESC
+");
+$counts = [];
+foreach(['all','pending','approved','rejected'] as $s){
+    $sw = $s !== 'all' ? "WHERE cr.status='".ucfirst($s)."'" : "";
+    $r = $conn->query("SELECT COUNT(*) as c FROM certificate_requests cr $sw");
+    $counts[$s] = $r->fetch_assoc()['c'];
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Certificate Requests – PragmaVet Admin</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+    <link href="theme.css" rel="stylesheet">
+    <style>
+        :root { --primary: #2563eb; --secondary: #3b82f6; --sidebar-width: 260px; }
+        body { background: #f1f5f9; font-family: 'Inter', sans-serif; }
+        .sidebar { background:#0f172a; width:var(--sidebar-width); height:100vh; position:fixed; top:0; left:0; padding:24px 16px; z-index:1000; display:flex; flex-direction:column; box-shadow:5px 0 20px rgba(0,0,0,.2); overflow-y:auto; }
+        .sidebar h4 { color:#ffffff; font-weight:800; font-size:22px; margin-bottom:30px; letter-spacing:0.5px; display:flex; align-items:center; gap:10px; }
+        .sidebar a { display:flex; align-items:center; gap:10px; padding:12px 16px; border-radius:8px; color:#94a3b8; text-decoration:none; margin-bottom:4px; font-weight:600; font-size:15px; transition:.2s; }
+        .sidebar a i { width: 25px; }
+        .sidebar a:hover, .sidebar a.active { background:#2563eb; color:#ffffff; }
+        .sidebar-logout { margin-top: auto; }
+        .status-badge-pending  { background:#fef3c7; color:#92400e; }
+        .status-badge-approved { background:#dcfce7; color:#166534; }
+        .status-badge-rejected { background:#fee2e2; color:#991b1b; }
+    
+        /* ====== WHITE SIDEBAR THEME ====== */
+        .sidebar {
+            background: #ffffff !important;
+            width: var(--sidebar-width, 260px) !important;
+            height: 100vh !important;
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            padding: 28px 20px 24px !important;
+            z-index: 1000 !important;
+            display: flex !important;
+            flex-direction: column !important;
+            border-right: 1px solid #eef2f6 !important;
+            box-shadow: none !important;
+            overflow-y: auto !important;
+        }
+
+        .sidebar-brand {
+            display: flex !important;
+            align-items: center !important;
+            gap: 12px !important;
+            margin-bottom: 24px !important;
+            padding: 0 4px !important;
+            text-decoration: none !important;
+        }
+
+        .sidebar-brand-icon {
+            width: 44px !important;
+            height: 44px !important;
+            min-width: 44px !important;
+            border-radius: 13px !important;
+            background: #2563eb !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            color: #ffffff !important;
+            font-size: 20px !important;
+            flex-shrink: 0 !important;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+        }
+
+        .sidebar-brand span {
+            font-weight: 800 !important;
+            color: #182032 !important;
+            font-size: 22px !important;
+            letter-spacing: -0.4px !important;
+        }
+
+        .sidebar-user {
+            margin-bottom: 24px !important;
+            padding: 15px 18px !important;
+            border-radius: 14px !important;
+            background: #f8fafc !important;
+            border: 1px solid #eef2f6 !important;
+        }
+
+        .sidebar-user .welcome {
+            font-size: 13px !important;
+            color: #64748b !important;
+            font-weight: 500 !important;
+            line-height: 1.3 !important;
+        }
+
+        .sidebar-user .uname {
+            font-weight: 700 !important;
+            color: #0f172a !important;
+            font-size: 15.5px !important;
+            margin-top: 3px !important;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+        }
+
+        .sidebar a {
+            display: flex !important;
+            align-items: center !important;
+            gap: 14px !important;
+            padding: 12px 16px !important;
+            border-radius: 12px !important;
+            color: #334155 !important;
+            text-decoration: none !important;
+            margin-bottom: 4px !important;
+            font-weight: 600 !important;
+            font-size: 14.5px !important;
+            transition: all 0.2s ease !important;
+            letter-spacing: -0.1px !important;
+        }
+
+        .sidebar a i {
+            width: 22px !important;
+            text-align: center !important;
+            font-size: 16px !important;
+            color: #64748b !important;
+            transition: color 0.2s !important;
+            flex-shrink: 0 !important;
+        }
+
+        .sidebar a:hover {
+            background: #f8fafc !important;
+            color: #0f172a !important;
+        }
+
+        .sidebar a:hover i {
+            color: #2563eb !important;
+        }
+
+        .sidebar a.active {
+            background: #2563eb !important;
+            color: #ffffff !important;
+            font-weight: 700 !important;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+        }
+
+        .sidebar a.active i {
+            color: #ffffff !important;
+        }
+
+        .sidebar .sidebar-logout {
+            margin-top: auto !important;
+            padding-top: 20px !important;
+            border-top: 1px solid #f1f5f9 !important;
+        }
+
+        .sidebar .sidebar-logout a {
+            color: #dc2626 !important;
+            font-weight: 600 !important;
+            margin-bottom: 0 !important;
+        }
+
+        .sidebar .sidebar-logout a i {
+            color: #dc2626 !important;
+        }
+
+        .sidebar .sidebar-logout a:hover {
+            background: #fef2f2 !important;
+            color: #b91c1c !important;
+        }
+
+        .sidebar::-webkit-scrollbar { width: 5px; }
+        .sidebar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.06); border-radius: 10px; }
+        .sidebar::-webkit-scrollbar-track { background: transparent; }
+</style>
+    <link rel="stylesheet" href="assets/pragmavet.css">
+    <link href="assets/global-style.css" rel="stylesheet">
+</head>
+<body>
+<?php
+// Include the same sidebar as other admin pages
+$adminPage = 'certificates';
+?>
+<?php include("includes/admin_sidebar.php"); ?>
+<?php
+?>
+
+<div class="main-content" style="margin-left: 260px !important; width: calc(100% - 260px) !important; max-width: calc(100% - 260px) !important; padding: 24px 28px !important; box-sizing: border-box !important;">
+    <div class="d-flex align-items-center gap-3 mb-4">
+        <div style="width:4px;height:32px;background:linear-gradient(to bottom,#2563eb,#3b82f6);border-radius:2px;"></div>
+        <div>
+            <h4 class="fw-bold mb-0 text-dark">Certificate Requests</h4>
+            <p class="text-muted mb-0 small">Review and manage pet health certificate requests</p>
+        </div>
+    </div>
+
+    <?php if(isset($_SESSION['message'])): ?>
+    <div class="alert alert-<?php echo $_SESSION['msg_type']; ?> alert-dismissible fade show rounded-3 shadow-sm mb-4" role="alert">
+        <?php echo $_SESSION['message']; unset($_SESSION['message']); ?>
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    <?php endif; ?>
+
+    <!-- Filter Tabs -->
+    <div class="d-flex gap-2 mb-4 flex-wrap" id="certFilters">
+        <?php foreach(['all'=>'All','pending'=>'Pending','approved'=>'Approved','rejected'=>'Rejected'] as $k=>$v): ?>
+        <button onclick="filterCerts('<?php echo $k; ?>', this)" class="btn btn-sm rounded-pill fw-semibold px-4 <?php echo $k==='all' ? 'btn-primary shadow-sm active-filter' : 'btn-light border'; ?>" style="font-size:13px;">
+            <?php echo $v; ?> <span class="badge ms-1 <?php echo $k==='all' ? 'bg-white text-primary' : 'bg-secondary'; ?>" style="font-size:11px;"><?php echo $counts[$k]; ?></span>
+        </button>
+        <?php endforeach; ?>
+    </div>
+
+    <!-- Table -->
+    <div class="bg-white rounded-4 shadow-sm border overflow-hidden">
+        <table class="table table-hover mb-0 align-middle" style="font-size:14px;">
+            <thead style="background:#E6EEF8;border-bottom:1px solid #e2e8f0;">
+                <tr>
+                    <th class="px-4 py-3 text-muted fw-semibold text-uppercase" style="font-size:11px;">#</th>
+                    <th class="px-4 py-3 text-muted fw-semibold text-uppercase" style="font-size:11px;">Pet</th>
+                    <th class="px-4 py-3 text-muted fw-semibold text-uppercase" style="font-size:11px;">Owner</th>
+                    <th class="px-4 py-3 text-muted fw-semibold text-uppercase" style="font-size:11px;">Purpose</th>
+                    <th class="px-4 py-3 text-muted fw-semibold text-uppercase" style="font-size:11px;">Date</th>
+                    <th class="px-4 py-3 text-muted fw-semibold text-uppercase" style="font-size:11px;">Status</th>
+                    <th class="px-4 py-3 text-muted fw-semibold text-uppercase" style="font-size:11px;">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+            <?php if($requests && $requests->num_rows > 0): ?>
+            <?php while($req = $requests->fetch_assoc()): ?>
+                <tr class="req-row" data-status="<?php echo strtolower($req['status']); ?>">
+                    <td class="px-4 py-3 text-muted fw-medium">#<?php echo $req['id']; ?></td>
+                    <td class="px-4 py-3">
+                        <div class="fw-semibold text-dark"><?php echo htmlspecialchars($req['pet_name']); ?></div>
+                        <div class="text-muted small"><?php echo htmlspecialchars($req['species']); ?> &bull; <?php echo htmlspecialchars($req['breed']); ?></div>
+                    </td>
+                    <td class="px-4 py-3">
+                        <div class="fw-medium text-dark"><?php echo htmlspecialchars($req['fullname']); ?></div>
+                        <div class="text-muted small"><?php echo htmlspecialchars($req['email']); ?></div>
+                    </td>
+                    <td class="px-4 py-3 text-muted"><?php echo $req['purpose'] ? htmlspecialchars($req['purpose']) : '<span class="fst-italic">—</span>'; ?></td>
+                    <td class="px-4 py-3 text-muted"><?php echo date("M j, Y", strtotime($req['created_at'])); ?></td>
+                    <td class="px-4 py-3">
+                        <span class="badge px-3 py-2 rounded-pill fw-semibold status-badge-<?php echo strtolower($req['status']); ?>" style="font-size:11px;">
+                            <?php echo $req['status']; ?>
+                        </span>
+                    </td>
+                    <td class="px-4 py-3">
+                        <div class="d-flex gap-2 align-items-center">
+                            <button class="btn btn-sm btn-light border rounded-3 fw-medium" style="font-size:12px;" onclick="showDetails(<?php echo htmlspecialchars(json_encode($req)); ?>)" title="View Details">
+                                <i class="fa fa-eye me-1"></i> View
+                            </button>
+                            <?php if($req['status'] === 'Pending'): ?>
+                            <button class="btn btn-sm rounded-3 fw-medium" style="font-size:12px;background:#dcfce7;color:#166534;border:1px solid #bbf7d0;" onclick="approveRequest(<?php echo $req['id']; ?>)" title="Approve">
+                                <i class="fa fa-check me-1"></i> Approve
+                            </button>
+                            <button class="btn btn-sm rounded-3 fw-medium" style="font-size:12px;background:#fee2e2;color:#991b1b;border:1px solid #fecaca;" onclick="showRejectModal(<?php echo $req['id']; ?>)" title="Reject">
+                                <i class="fa fa-times me-1"></i> Reject
+                            </button>
+                            <?php elseif($req['status'] === 'Approved' && $req['pdf_url']): ?>
+                            <a href="<?php echo htmlspecialchars($req['pdf_url']); ?>" class="btn btn-sm btn-primary rounded-3 fw-medium" style="font-size:12px;" target="_blank">
+                                <i class="fa fa-download me-1"></i> PDF
+                            </a>
+                            <?php endif; ?>
+                        </div>
+                    </td>
+                </tr>
+            <?php endwhile; ?>
+            <?php else: ?>
+            <tr><td colspan="7" class="text-center py-5 text-muted">
+                <i class="fa fa-file-contract fa-2x opacity-25 d-block mb-2"></i>
+                No requests found.
+            </td></tr>
+            <?php endif; ?>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- VIEW DETAILS MODAL -->
+<div class="modal fade" id="detailsModal" tabindex="-1">
+    <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+        <div class="modal-content border-0 shadow-lg" style="border-radius:20px;">
+            <div class="modal-header border-0 pb-0" style="background:linear-gradient(135deg,#0f172a,#1e3a5f);border-radius:20px 20px 0 0;">
+                <h5 class="fw-bold text-white mb-0"><i class="fa fa-file-contract me-2"></i> Request Details</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body p-4" id="detailsBody"></div>
+        </div>
+    </div>
+</div>
+
+<!-- APPROVE FORM (hidden) -->
+<form method="POST" id="approveForm">
+    <input type="hidden" name="approve_request" value="1">
+    <input type="hidden" name="req_id" id="approveReqId">
+</form>
+
+<!-- APPROVE MODAL -->
+<div class="modal fade" id="approveModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content border-0 shadow-lg" style="border-radius:20px;">
+            <div class="modal-header border-0 pb-0">
+                <h5 class="fw-bold text-dark"><i class="fa fa-check-circle text-success me-2"></i> Approve Request</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body p-4">
+                <p class="text-muted mb-4">Are you sure you want to approve this request? The system will generate a PDF and email it to the owner.</p>
+                <div class="d-flex gap-2">
+                    <button type="button" class="btn btn-light w-50 rounded-pill fw-semibold border" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-success w-50 rounded-pill fw-semibold" onclick="submitApproveForm()">Approve</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- REJECT MODAL -->
+<div class="modal fade" id="rejectModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content border-0 shadow-lg" style="border-radius:20px;">
+            <div class="modal-header border-0 pb-0">
+                <h5 class="fw-bold text-dark"><i class="fa fa-times-circle text-danger me-2"></i> Reject Request</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body p-4">
+                <form method="POST" id="rejectForm">
+                    <input type="hidden" name="reject_request" value="1">
+                    <input type="hidden" name="req_id" id="rejectReqId">
+                    <div class="mb-4">
+                        <label class="form-label text-muted small fw-bold">REJECTION REASON <span class="fw-normal opacity-50">- Optional</span></label>
+                        <textarea name="rejection_reason" class="form-control" rows="3" placeholder="e.g. Incomplete vaccination records..."></textarea>
+                    </div>
+                    <button type="submit" class="btn btn-danger w-100 rounded-pill fw-semibold">Confirm Rejection</button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+function showDetails(req) {
+    const vaxLast = req.last_vaccination ? new Date(req.last_vaccination).toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'}) : 'Not on record';
+    const vaxNext = req.next_vaccination ? new Date(req.next_vaccination).toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'}) : 'Consult Veterinarian';
+    document.getElementById('detailsBody').innerHTML = `
+        <div class="row g-3 mb-3">
+            <div class="col-md-6">
+                <div class="bg-light rounded-3 p-3">
+                    <div class="text-muted small fw-bold text-uppercase mb-2" style="font-size:11px;">Animal Info</div>
+                    <div class="fw-bold text-dark fs-5">${req.pet_name}</div>
+                    <div class="text-muted">${req.species} &bull; ${req.breed}</div>
+                    <div class="text-muted small mt-1">Age: ${req.age||'N/A'} yrs &bull; Weight: ${req.weight||'N/A'} kg</div>
+                </div>
+            </div>
+            <div class="col-md-6">
+                <div class="bg-light rounded-3 p-3">
+                    <div class="text-muted small fw-bold text-uppercase mb-2" style="font-size:11px;">Owner Info</div>
+                    <div class="fw-bold text-dark">${req.fullname}</div>
+                    <div class="text-muted small">${req.email}</div>
+                    <div class="text-muted small">${req.contact_number||'No contact'}</div>
+                </div>
+            </div>
+        </div>
+        <div class="bg-light rounded-3 p-3 mb-3">
+            <div class="text-muted small fw-bold text-uppercase mb-2" style="font-size:11px;">Vaccination</div>
+            <div class="d-flex gap-4">
+                <div><span class="text-muted small">Last:</span> <span class="fw-medium">${vaxLast}</span></div>
+                <div><span class="text-muted small">Next:</span> <span class="fw-medium text-danger">${vaxNext}</span></div>
+            </div>
+        </div>
+        ${req.purpose ? `<div class="bg-light rounded-3 p-3 mb-3"><div class="text-muted small fw-bold text-uppercase mb-2" style="font-size:11px;">Purpose</div><div>${req.purpose}</div></div>` : ''}
+        ${req.admin_notes ? `<div class="alert alert-warning rounded-3 mb-0"><i class="fa fa-comment-alt me-2"></i><strong>Admin Note:</strong> ${req.admin_notes}</div>` : ''}
+    `;
+    new bootstrap.Modal(document.getElementById('detailsModal')).show();
+}
+
+function approveRequest(id) {
+    document.getElementById('approveReqId').value = id;
+    new bootstrap.Modal(document.getElementById('approveModal')).show();
+}
+
+function submitApproveForm() {
+    document.getElementById('approveForm').submit();
+}
+
+function showRejectModal(id) {
+    document.getElementById('rejectReqId').value = id;
+    new bootstrap.Modal(document.getElementById('rejectModal')).show();
+}
+
+function filterCerts(status, btn) {
+    // Update button styles
+    const buttons = document.querySelectorAll('#certFilters button');
+    buttons.forEach(b => {
+        b.className = 'btn btn-sm rounded-pill fw-semibold px-4 btn-light border';
+        b.querySelector('.badge').className = 'badge ms-1 bg-secondary';
+    });
+    btn.className = 'btn btn-sm rounded-pill fw-semibold px-4 btn-primary shadow-sm active-filter';
+    btn.querySelector('.badge').className = 'badge ms-1 bg-white text-primary';
+
+    // Filter rows
+    let visibleCount = 0;
+    const rows = document.querySelectorAll('.req-row');
+    rows.forEach(row => {
+        if (status === 'all' || row.getAttribute('data-status') === status) {
+            row.style.display = '';
+            visibleCount++;
+        } else {
+            row.style.display = 'none';
+        }
+    });
+    
+    let emptyRow = document.getElementById('emptyRow');
+    if(emptyRow) {
+        emptyRow.style.display = visibleCount === 0 ? '' : 'none';
+    }
+}
+</script>
+    <script src="mousetrail.js"></script>
+</body>
+</html>

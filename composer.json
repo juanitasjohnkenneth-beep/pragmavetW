@@ -1,0 +1,6 @@
+{
+    "require": {
+        "stripe/stripe-php": "^20.0",
+        "dompdf/dompdf": "^3.1"
+    }
+}

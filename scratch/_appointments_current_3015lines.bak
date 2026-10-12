@@ -1,0 +1,3016 @@
+    <?php
+session_start();
+include("dbconnection.php");
+
+if (!isset($_SESSION['user_id'])) {
+    header("Location: index.php");
+    exit();
+}
+
+$user_id = $_SESSION['user_id'];
+$user_name = $_SESSION['user'];
+
+// Include pet data helper for multi-pet and profile sync
+include_once("includes/pet_data_helper.php");
+
+
+// â”€â”€ Check for unrated completed appointment for auto-popup â”€â”€
+$pending_feedback = $conn->query("
+    SELECT id, pet_name, service_type FROM appointments 
+    WHERE user_id=$user_id AND status='Completed' AND id NOT IN (SELECT appointment_id FROM feedbacks)
+    ORDER BY appointment_date DESC LIMIT 1
+")->fetch_assoc();
+if (!$pending_feedback) {
+    // Check boarding too
+    $pending_feedback = $conn->query("
+        SELECT id, pet_name, service_type FROM boarding_reservations 
+        WHERE user_id=$user_id AND status='Completed' AND id NOT IN (SELECT appointment_id FROM feedbacks)
+        ORDER BY appointment_date DESC LIMIT 1
+    ")->fetch_assoc();
+}
+
+// â”€â”€ Fetch pets for booking form â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Also fetch pets with IDs and pictures for multi-pet selection
+$stmt_pets = $conn->prepare("SELECT id, name, species, pet_picture FROM pets WHERE user_id=? ORDER BY name ASC");
+$stmt_pets->bind_param("i", $user_id);
+$stmt_pets->execute();
+$pets_result = $stmt_pets->get_result();
+
+// â”€â”€ Fetch doctors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+$doctors = [];
+$r = $conn->query("SELECT id, fullname FROM users WHERE role='doctor' ORDER BY fullname ASC");
+if ($r)
+    while ($d = $r->fetch_assoc())
+        $doctors[] = $d;
+
+// â”€â”€ Doctor leave dates (for client-side validation) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+$unavailability = [];
+$now = date('Y-m-d');
+$ru = $conn->query("SELECT doctor_id, unavailable_date FROM doctor_unavailability WHERE unavailable_date >= '$now'");
+if ($ru)
+    while ($u = $ru->fetch_assoc()) {
+        $unavailability[$u['doctor_id']][] = $u['unavailable_date'];
+    }
+$doctorLeavesJSON = json_encode($unavailability);
+
+// â”€â”€ POST: Book appointment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+if (isset($_POST['book'])) {
+    $pet = $_POST['pet_name'];
+    $service = $_POST['service_type'];
+    $date = $_POST['appointment_date'];
+    $time = $_POST['appointment_time'];
+    $location = $_POST['service_location'];
+    $address = empty($_POST['home_address']) ? NULL : trim($_POST['home_address']);
+    $end_date = empty($_POST['end_date']) ? NULL : $_POST['end_date'];
+    $doctor_id = empty($_POST['doctor_id']) ? NULL : (int) $_POST['doctor_id'];
+    $signature_data = empty($_POST['signature_data']) ? NULL : $_POST['signature_data'];
+
+    // â”€â”€â”€ SMART SCHEDULING VALIDATION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    
+    // 1. Validate date is not in the past or same day
+    $today = date('Y-m-d');
+    $tomorrow = date('Y-m-d', strtotime('+1 day'));
+    if ($date < $tomorrow) {
+        $_SESSION['message'] = "âŒ Appointments must be booked at least 24 hours in advance. Earliest available: $tomorrow";
+        $_SESSION['msg_type'] = "danger";
+        header("Location: appointments.php");
+        exit();
+    }
+
+    // 2. Get service duration from service_durations table
+    $duration_minutes = 30;
+    $stmt_duration = $conn->prepare("SELECT duration_minutes FROM service_durations WHERE service_type = ?");
+    if ($stmt_duration) {
+        $stmt_duration->bind_param("s", $service);
+        $stmt_duration->execute();
+        $service_result = $stmt_duration->get_result();
+        $service_duration = $service_result ? $service_result->fetch_assoc() : null;
+        $duration_minutes = $service_duration ? $service_duration['duration_minutes'] : 30;
+    } else {
+        error_log('appointments.php: failed to prepare service duration query - ' . $conn->error);
+    }
+
+    // Calculate appointment end time
+    $appointment_end_time = date('H:i:s', strtotime($time . ' +' . $duration_minutes . ' minutes'));
+
+    // 3. If doctor specified, validate against smart scheduling rules
+    if (!empty($doctor_id)) {
+        // 3a. Check if doctor is on leave
+        $chk = $conn->prepare("SELECT id FROM doctor_unavailability WHERE doctor_id=? AND unavailable_date=?");
+        if (!$chk) {
+            error_log('appointments.php: prepare failed on doctor_unavailability - ' . $conn->error);
+            $_SESSION['message'] = "âŒ Database error. Please try again.";
+            $_SESSION['msg_type'] = "danger";
+            header("Location: appointments.php");
+            exit();
+        }
+        $chk->bind_param("is", $doctor_id, $date);
+        $chk->execute();
+        if ($chk->get_result()->num_rows > 0) {
+            $_SESSION['message'] = "âŒ The selected doctor is not available on this date (on leave). Please choose another date or doctor.";
+            $_SESSION['msg_type'] = "danger";
+            header("Location: appointments.php");
+            exit();
+        }
+        
+        // 3b. Get doctor's working hours and settings
+        $doc_stmt = $conn->prepare("SELECT fullname FROM users WHERE id = ? AND role = 'doctor'");
+        if (!$doc_stmt) {
+            error_log('appointments.php: prepare failed on users lookup - ' . $conn->error);
+            $_SESSION['message'] = "âŒ Database error. Please try again.";
+            $_SESSION['msg_type'] = "danger";
+            header("Location: appointments.php");
+            exit();
+        }
+        $doc_stmt->bind_param("i", $doctor_id);
+        $doc_stmt->execute();
+        $doc_result = $doc_stmt->get_result();
+        if ($doc_result->num_rows === 0) {
+            $_SESSION['message'] = "âŒ Doctor not found. Please try again.";
+            $_SESSION['msg_type'] = "danger";
+            header("Location: appointments.php");
+            exit();
+        }
+        
+        $doctor_info = $doc_result->fetch_assoc();
+        $doc_start_time = '08:00:00';
+        $doc_end_time = '17:00:00';
+        $buffer_mins = 15;
+        $max_appts = 10;
+        
+        // 3c. Validate time is within working hours
+        $slot_time = strtotime($time);
+        $slot_end = strtotime($appointment_end_time);
+        $working_start = strtotime($doc_start_time);
+        $working_end = strtotime($doc_end_time);
+        
+        if ($slot_time < $working_start || $slot_end > $working_end) {
+            $_SESSION['message'] = "âŒ Requested time is outside doctor's working hours (" . substr($doc_start_time, 0, 5) . " - " . substr($doc_end_time, 0, 5) . ").";
+            $_SESSION['msg_type'] = "danger";
+            header("Location: appointments.php");
+            exit();
+        }
+        
+        // 3d. Check for slot conflicts with existing appointments (prevent double-booking)
+        $conflict_stmt = $conn->prepare("
+            SELECT id, appointment_time, service_type 
+            FROM appointments 
+            WHERE doctor_id = ? AND appointment_date = ? AND status IN ('Pending', 'Approved')
+        ");
+        if (!$conflict_stmt) {
+            error_log('appointments.php: prepare failed on conflict check - ' . $conn->error);
+            $_SESSION['message'] = "âŒ Database error. Please try again.";
+            $_SESSION['msg_type'] = "danger";
+            header("Location: appointments.php");
+            exit();
+        }
+        $conflict_stmt->bind_param("is", $doctor_id, $date);
+        $conflict_stmt->execute();
+        $conflict_result = $conflict_stmt->get_result();
+        
+        while ($existing = $conflict_result->fetch_assoc()) {
+            $existing_start = strtotime($existing['appointment_time']);
+            $existing_duration = 30;
+            $stmt_duration_existing = $conn->prepare("SELECT duration_minutes FROM service_durations WHERE service_type = ?");
+            if ($stmt_duration_existing) {
+                $stmt_duration_existing->bind_param("s", $existing['service_type']);
+                $stmt_duration_existing->execute();
+                $existing_result = $stmt_duration_existing->get_result();
+                $existing_service = $existing_result ? $existing_result->fetch_assoc() : null;
+                $existing_duration = $existing_service ? $existing_service['duration_minutes'] : 30;
+            }
+            $existing_end = $existing_start + ($existing_duration * 60);
+            
+            // Add buffer on both sides
+            $buffer_seconds = $buffer_mins * 60;
+            $check_start = $existing_start - $buffer_seconds;
+            $check_end = $existing_end + $buffer_seconds;
+            
+            // Check if proposed slot overlaps with existing appointment + buffer
+            if (!($slot_end <= $check_start || $slot_time >= $check_end)) {
+                $next_available = date('H:i', $existing_end + $buffer_seconds);
+                $_SESSION['message'] = "âŒ This time slot is taken or too close to another appointment. Try " . $next_available . " or later.";
+                $_SESSION['msg_type'] = "danger";
+                header("Location: appointments.php");
+                exit();
+            }
+        }
+        
+        // 3e. Check doctor capacity for the day
+        $capacity_stmt = $conn->prepare("
+            SELECT COUNT(*) as count FROM appointments 
+            WHERE doctor_id = ? AND appointment_date = ? AND status IN ('Pending', 'Approved')
+        ");
+        if (!$capacity_stmt) {
+            error_log('appointments.php: prepare failed on capacity check - ' . $conn->error);
+            $_SESSION['message'] = "âŒ Database error. Please try again.";
+            $_SESSION['msg_type'] = "danger";
+            header("Location: appointments.php");
+            exit();
+        }
+        $capacity_stmt->bind_param("is", $doctor_id, $date);
+        $capacity_stmt->execute();
+        $capacity_result = $capacity_stmt->get_result()->fetch_assoc();
+        $current_count = $capacity_result['count'];
+        
+        if ($current_count >= $max_appts) {
+            $_SESSION['message'] = "âŒ Dr. " . htmlspecialchars($doctors[array_search($doctor_id, array_column($doctors, 'id'))]['fullname'] ?? 'Unknown') . " is fully booked on this date. Please try another date or doctor.";
+            $_SESSION['msg_type'] = "danger";
+            header("Location: appointments.php");
+            exit();
+        }
+    }
+    
+    // Handle multi-pet support: parse pet_name as JSON or comma-separated
+    $pet_names_arr = [];
+    $pet_ids_arr = [];
+    
+    // Check if pet_name contains JSON array (from multi-pet selection)
+    $first_char = substr($pet, 0, 1);
+    if ($first_char === '[' || $first_char === '{') {
+        $pet_data = json_decode($pet, true);
+        if (is_array($pet_data)) {
+            foreach ($pet_data as $p) {
+                $pet_names_arr[] = $p['name'] ?? $p;
+                $pet_ids_arr[] = $p['id'] ?? null;
+            }
+        }
+    } else {
+        // Single pet (backward compat)
+        $pet_names_arr[] = $pet;
+        $pet_ids_arr[] = null;
+    }
+    
+    // Generate display name (comma-separated for multi-pet)
+    $display_name = implode(', ', $pet_names_arr);
+    $is_multi = count($pet_names_arr) > 1 ? 1 : 0;
+    
+    // All smart scheduling validations passed - proceed with booking
+    $stmt = $conn->prepare("INSERT INTO appointments(user_id, pet_name, service_type, appointment_date, appointment_time, service_location, home_address, end_date, doctor_id, signature_data, is_multi_pet) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    if (!$stmt) {
+        $_SESSION['message'] = "âŒ Error preparing booking: " . htmlspecialchars($conn->error);
+        $_SESSION['msg_type'] = "danger";
+        error_log('appointments.php: prepare failed - ' . $conn->error);
+        header("Location: appointments.php");
+        exit();
+    }
+    $stmt->bind_param("isssssssssi", $user_id, $display_name, $service, $date, $time, $location, $address, $end_date, $doctor_id, $signature_data, $is_multi);
+    if ($stmt->execute()) {
+        $appointment_id = $stmt->insert_id;
+        
+        // Insert into appointment_pets junction table
+        if (function_exists('insertAppointmentPets') && !empty($pet_names_arr)) {
+            insertAppointmentPets($conn, $appointment_id, $user_id, $pet_ids_arr, $pet_names_arr);
+        }
+        
+        $msg_pet = htmlspecialchars($display_name);
+        $_SESSION['message'] = "âœ… Appointment for <b>$msg_pet</b> booked successfully! We look forward to seeing you.";
+        $_SESSION['msg_type'] = "success";
+    } else {
+        if (strpos($conn->error, 'Duplicate entry') !== false || strpos($conn->error, 'unique') !== false) {
+            $_SESSION['message'] = "âŒ This time slot was just taken. Please refresh and choose another time.";
+        } else {
+            $_SESSION['message'] = "âŒ Error booking appointment: " . htmlspecialchars($conn->error);
+        }
+        $_SESSION['msg_type'] = "danger";
+    }
+    header("Location: appointments.php");
+    exit();
+}
+
+// â”€â”€ POST: Cancel pending â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+if (isset($_POST['cancel_appt'])) {
+    $cid = (int) $_POST['cancel_appt_id'];
+    $type = $_POST['appt_type'] ?? 'Appointment';
+
+    if ($type === 'Boarding') {
+        $stmt = $conn->prepare("UPDATE boarding_reservations SET status='Cancelled' WHERE id=? AND user_id=? AND status='Pending'");
+    } else {
+        $stmt = $conn->prepare("UPDATE appointments SET status='Cancelled' WHERE id=? AND user_id=? AND status='Pending'");
+    }
+
+    $stmt->bind_param("ii", $cid, $user_id);
+    if ($stmt->execute() && $stmt->affected_rows > 0) {
+        $_SESSION['message'] = "Request cancelled successfully.";
+        $_SESSION['msg_type'] = "success";
+    } else {
+        $_SESSION['message'] = "Could not cancel â€” request may have already been processed.";
+        $_SESSION['msg_type'] = "danger";
+    }
+    header("Location: appointments.php");
+    exit();
+}
+
+// â”€â”€ POST: Accept reschedule â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+if (isset($_POST['accept_reschedule'])) {
+    $aid = (int) $_POST['reschedule_apt_id'];
+    $type = $_POST['appt_type'] ?? 'Appointment';
+
+    if ($type === 'Boarding') {
+        $stmt = $conn->prepare("UPDATE boarding_reservations SET appointment_date=proposed_reschedule_date, end_date=proposed_reschedule_end_date, status='Approved', client_action_needed=0 WHERE id=? AND user_id=?");
+        $msg_suffix = 'boarding reservation';
+    } else {
+        $stmt = $conn->prepare("UPDATE appointments SET appointment_date=proposed_reschedule_date, appointment_time=proposed_reschedule_time, status='Approved', client_action_needed=0 WHERE id=? AND user_id=?");
+        $msg_suffix = 'appointment';
+    }
+
+    $stmt->bind_param("ii", $aid, $user_id);
+    if ($stmt->execute()) {
+        $_SESSION['message'] = "Reschedule accepted. Your $msg_suffix is now Approved for the new date.";
+        $_SESSION['msg_type'] = "success";
+        $conn->query("INSERT INTO notifications(user_id,message) VALUES(1,'Client accepted reschedule for $msg_suffix ID {$aid}')");
+    }
+    header("Location: appointments.php");
+    exit();
+}
+
+// â”€â”€ POST: Decline reschedule â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+if (isset($_POST['decline_reschedule'])) {
+    $aid = (int) $_POST['reschedule_apt_id'];
+    $type = $_POST['appt_type'] ?? 'Appointment';
+
+    if ($type === 'Boarding') {
+        $stmt = $conn->prepare("UPDATE boarding_reservations SET status='Cancelled', client_action_needed=0 WHERE id=? AND user_id=?");
+        $msg_suffix = 'boarding reservation';
+    } else {
+        $stmt = $conn->prepare("UPDATE appointments SET status='Cancelled', client_action_needed=0 WHERE id=? AND user_id=?");
+        $msg_suffix = 'appointment';
+    }
+
+    $stmt->bind_param("ii", $aid, $user_id);
+    if ($stmt->execute()) {
+        $_SESSION['message'] = "Reschedule declined. Request has been cancelled.";
+        $_SESSION['msg_type'] = "danger";
+        $conn->query("INSERT INTO notifications(user_id,message) VALUES(1,'Client DECLINED reschedule for $msg_suffix ID {$aid}.')");
+    }
+    header("Location: appointments.php");
+    exit();
+    // â”€â”€ POST: Request reschedule (Client side) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if (isset($_POST['request_reschedule'])) {
+        $aid = (int) $_POST['reschedule_apt_id'];
+        $type = $_POST['appt_type'] ?? 'Appointment';
+        $new_date = $_POST['new_proposed_date'];
+        $new_time = $_POST['new_proposed_time'] ?? '08:00';
+        $reason = trim($_POST['reschedule_reason'] ?? '');
+
+        $table = $type === 'Boarding' ? 'boarding_reservations' : 'appointments';
+
+        $stmt = $conn->prepare("UPDATE $table SET status='Reschedule Requested', proposed_reschedule_date=?, proposed_reschedule_time=?, admin_message=? WHERE id=? AND user_id=? AND (status='Approved' OR status='Pending')");
+        $stmt->bind_param("sssii", $new_date, $new_time, $reason, $aid, $user_id);
+
+        if ($stmt->execute() && $stmt->affected_rows > 0) {
+            $_SESSION['message'] = "Reschedule request sent to clinic for review.";
+            $_SESSION['msg_type'] = "success";
+            $notif = "Client $user_name requested reschedule for $type ID $aid to $new_date.";
+            $conn->query("INSERT INTO notifications(user_id,message) VALUES(1,'" . addslashes($notif) . "')");
+        } else {
+            $_SESSION['message'] = "Could not submit request. Please try again.";
+            $_SESSION['msg_type'] = "danger";
+        }
+        header("Location: appointments.php");
+        exit();
+    }
+}
+
+// â”€â”€ Helper: get pet display data with profile sync â”€â”€
+function enrichAppointmentPetData($conn, $row) {
+    // Sync pet profile data from appointment_pets
+    if (function_exists('syncAppointmentPetData')) {
+        syncAppointmentPetData($conn, $row['id']);
+    }
+    // Get pets from junction table
+    if (function_exists('getAppointmentPets')) {
+        $pets = getAppointmentPets($conn, $row['id']);
+        if (!empty($pets)) {
+            $names = array_column($pets, 'display_name');
+            $row['pet_name'] = implode(', ', $names);
+            // Use first pet's picture
+            if (!empty($pets[0]['display_picture'])) {
+                $row['pet_picture'] = $pets[0]['display_picture'];
+            }
+        }
+    }
+    return $row;
+}
+
+// â”€â”€ Fetch ALL appointments (past + future) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+$stmt = $conn->prepare("SELECT a.*, IFNULL(d.fullname,'Clinic') as doctor_name FROM appointments a LEFT JOIN users d ON a.doctor_id=d.id WHERE a.user_id=? ORDER BY a.appointment_date DESC, a.appointment_time DESC");
+$stmt->bind_param("i", $user_id);
+$stmt->execute();
+$appointments = $stmt->get_result();
+$apptRows = [];
+while ($row = $appointments->fetch_assoc()) {
+    $row['_type'] = 'Appointment';
+    $row = enrichAppointmentPetData($conn, $row);
+    $apptRows[] = $row;
+}
+
+// â”€â”€ Fetch ALL boarding reservations (past + future) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+$stmt_b = $conn->prepare("SELECT * FROM boarding_reservations WHERE user_id=? ORDER BY appointment_date DESC");
+$stmt_b->bind_param("i", $user_id);
+$stmt_b->execute();
+$boardings = $stmt_b->get_result();
+while ($row = $boardings->fetch_assoc()) {
+    $row['_type'] = 'Boarding';
+    $row['doctor_name'] = 'Clinic (Boarding)';
+    $row['service_type'] = 'Pet Boarding (Cage ' . str_pad($row['cage_number'] ?? '?', 2, '0', STR_PAD_LEFT) . ')';
+    $row['service_location'] = 'On-Site';
+    $row['appointment_time'] = $row['appointment_time'] ?? '12:00:00';
+    $apptRows[] = $row;
+}
+
+// Sort the combined array by date and time
+usort($apptRows, function ($a, $b) {
+    $dateA = strtotime($a['appointment_date'] . ' ' . $a['appointment_time']);
+    $dateB = strtotime($b['appointment_date'] . ' ' . $b['appointment_time']);
+    return $dateB - $dateA; // DESC
+});
+
+// â”€â”€ Filter for active reschedule proposals â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+$rescheduleProposals = array_filter($apptRows, function ($r) {
+    return isset($r['client_action_needed']) && $r['client_action_needed'] == 1 &&
+        !str_contains($r['status'], 'Cancel') && !str_contains($r['status'], 'Reject');
+});
+
+// â”€â”€ Fetch user address â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+$uStmt = $conn->prepare("SELECT address FROM users WHERE id=?");
+$uStmt->bind_param("i", $user_id);
+$uStmt->execute();
+$myAddr = $uStmt->get_result()->fetch_assoc()['address'] ?? '';
+?>
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>Appointments | PragmaVet</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+    <link rel="stylesheet" href="https://unpkg.com/mobile-select@1.1.2/dist/mobile-select.css">
+    <style>
+        .flatpickr-calendar {
+            border-radius: 14px !important;
+            box-shadow: 0 12px 40px rgba(0, 0, 0, .14) !important;
+            font-family: 'Inter', sans-serif !important;
+            border: 1px solid #e2e8f0 !important;
+        }
+
+        .flatpickr-day.selected,
+        .flatpickr-day.selected:hover {
+            background: #1E5AA8 !important;
+            border-color: #1E5AA8 !important;
+        }
+
+        .flatpickr-time input {
+            font-family: 'Inter', sans-serif !important;
+        }
+
+        .numInputWrapper:hover {
+            background: none !important;
+        }
+
+        .sidebar::-webkit-scrollbar {
+            width: 5px;
+        }
+
+        .sidebar::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+        }
+
+        .sidebar::-webkit-scrollbar-track {
+            background: transparent;
+        }
+    </style>
+    <style>
+        :root {
+            --primary: #1E5AA8;
+            --secondary: #4A7FC4;
+            --dark: #15407A;
+            --light-bg: #F0F4F8;
+            --sidebar-width: 260px;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            background: var(--light-bg);
+            font-family: 'Inter', sans-serif;
+            color: #333;
+            overflow-x: hidden;
+            margin: 0;
+        }
+
+        /* â”€â”€ SIDEBAR â”€â”€ */
+        .sidebar {
+            background: #0f172a;
+            width: var(--sidebar-width);
+            height: 100vh;
+            position: fixed;
+            top: 0;
+            left: 0;
+            padding: 24px 16px;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 5px 0 20px rgba(0, 0, 0, .2);
+            overflow-y: auto;
+        }
+
+        .sidebar-brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 6px;
+        }
+
+        .sidebar-brand-icon {
+            width: 38px;
+            height: 38px;
+            background: linear-gradient(135deg, #4A7FC4, #1E5AA8);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .sidebar-brand span {
+            font-weight: 800;
+            font-size: 20px;
+            color: #fff;
+        }
+
+        .sidebar-user {
+            background: rgba(255, 255, 255, .06);
+            border-radius: 12px;
+            padding: 12px 14px;
+            margin: 16px 0 24px;
+        }
+
+        .sidebar-user .welcome {
+            font-size: 11px;
+            color: rgba(255, 255, 255, .45);
+            margin-bottom: 2px;
+        }
+
+        .sidebar-user .uname {
+            font-weight: 700;
+            font-size: 15px;
+            color: #fff;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .sidebar a {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 16px;
+            border-radius: 8px;
+            color: #94a3b8;
+            text-decoration: none;
+            margin-bottom: 4px;
+            font-weight: 600;
+            font-size: 15px;
+            transition: .2s;
+        }
+
+        .sidebar a i {
+            width: 20px;
+            text-align: center;
+            font-size: 15px;
+        }
+
+        .sidebar a:hover,
+        .sidebar a.active {
+            background: #2563eb;
+            color: #ffffff;
+        }
+
+        .sidebar-logout {
+            margin-top: auto;
+        }
+
+        .sidebar-logout a {
+            color: #ff7070 !important;
+        }
+
+        .sidebar-logout a:hover {
+            background: rgba(255, 112, 112, .12) !important;
+            box-shadow: none !important;
+        }
+
+        /* â”€â”€ MAIN â”€â”€ */
+        .main-content {
+            margin-left: var(--sidebar-width);
+            padding: 36px 44px;
+            min-height: 100vh;
+        }
+
+        .page-title {
+            font-weight: 800;
+            font-size: 26px;
+            color: var(--dark);
+            margin: 0;
+            letter-spacing: -.5px;
+        }
+
+        .page-sub {
+            color: #94a3b8;
+            font-size: 14px;
+            margin: 2px 0 0;
+        }
+
+        /* â”€â”€ CARDS â”€â”€ */
+        .card-prem {
+            background: #fff;
+            border: none;
+            border-radius: 20px;
+            box-shadow: 0 4px 24px rgba(0, 0, 0, .05);
+        }
+
+        .card-head {
+            padding: 22px 28px 16px;
+            border-bottom: 1px solid #f1f5f9;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .card-head h5 {
+            font-weight: 800;
+            font-size: 16px;
+            color: var(--dark);
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .card-body-p {
+            padding: 24px 28px;
+        }
+
+        /* â”€â”€ SEARCH â”€â”€ */
+        .search-wrap {
+            position: relative;
+            flex: 1;
+            min-width: 180px;
+        }
+
+        .search-wrap input {
+            width: 100%;
+            padding: 9px 14px 9px 38px;
+            border-radius: 10px;
+            border: 1.5px solid #e2e8f0;
+            background: #E6EEF8;
+            font-size: 13px;
+            font-family: inherit;
+            transition: .2s;
+            outline: none;
+        }
+
+        .search-wrap input:focus {
+            border-color: var(--secondary);
+            background: #fff;
+            box-shadow: 0 0 0 3px rgba(74, 127, 196, .15);
+        }
+
+        .search-wrap .si {
+            position: absolute;
+            left: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #94a3b8;
+            font-size: 13px;
+            pointer-events: none;
+        }
+
+        /* â”€â”€ TABLE â”€â”€ */
+        .appt-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .appt-table thead th {
+            padding: 10px 14px;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .06em;
+            color: #94a3b8;
+            border-bottom: 1.5px solid #f1f5f9;
+            white-space: nowrap;
+        }
+
+        .appt-table tbody tr {
+            cursor: pointer;
+            transition: background .12s;
+        }
+
+        .appt-table tbody tr:hover {
+            background: #E6EEF8;
+        }
+
+        .appt-table tbody td {
+            padding: 15px 14px;
+            vertical-align: middle;
+            border-bottom: 1px solid #f1f5f9;
+            font-size: 14px;
+        }
+
+        .appt-table tbody tr:last-child td {
+            border-bottom: none;
+        }
+
+        /* â”€â”€ PET AVATAR â”€â”€ */
+        .pet-avatar {
+            width: 42px;
+            height: 42px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #e0f2fe, #bae6fd);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            color: var(--secondary);
+            flex-shrink: 0;
+        }
+
+        /* â”€â”€ STATUS BADGES â”€â”€ */
+        .badge-s {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 700;
+            border: 1.5px solid transparent;
+        }
+
+        .badge-pending {
+            background: #fff7ed;
+            color: #ea580c;
+            border-color: #fed7aa;
+        }
+
+        .badge-approved {
+            background: #f0fdf4;
+            color: #16a34a;
+            border-color: #bbf7d0;
+        }
+
+        .badge-completed {
+            background: #eff6ff;
+            color: #2563eb;
+            border-color: #bfdbfe;
+        }
+
+        .badge-cancelled {
+            background: #fff1f2;
+            color: #e11d48;
+            border-color: #fecdd3;
+        }
+
+        .badge-default {
+            background: #E6EEF8;
+            color: #64748b;
+            border-color: #e2e8f0;
+        }
+
+        .badge-proposed {
+            background: #f5f3ff;
+            color: #7e22ce;
+            border-color: #ddd6fe;
+        }
+
+
+        /* â”€â”€ WIZARD FORM STYLES â”€â”€ */
+        .wz-container {
+            position: relative;
+        }
+
+        /* Progress Bar */
+        .wz-progress {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 28px;
+            position: relative;
+            padding: 0 4px;
+        }
+
+        .wz-progress-track {
+            position: absolute;
+            top: 50%;
+            left: 40px;
+            right: 40px;
+            height: 3px;
+            background: #e2e8f0;
+            border-radius: 4px;
+            transform: translateY(-50%);
+            z-index: 0;
+            overflow: hidden;
+        }
+
+        .wz-progress-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+            border-radius: 4px;
+            transition: width .45s cubic-bezier(.34, 1.56, .64, 1);
+        }
+
+        .wz-dot {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            background: #f1f5f9;
+            border: 2.5px solid #e2e8f0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 13px;
+            font-weight: 800;
+            color: #94a3b8;
+            position: relative;
+            z-index: 1;
+            transition: all .3s;
+            cursor: default;
+            flex-shrink: 0;
+        }
+
+        .wz-dot.wz-dot-active {
+            background: var(--primary);
+            border-color: var(--primary);
+            color: #fff;
+            box-shadow: 0 0 0 4px rgba(30, 90, 168, .15);
+            transform: scale(1.08);
+        }
+
+        .wz-dot.wz-dot-done {
+            background: #16a34a;
+            border-color: #16a34a;
+            color: #fff;
+        }
+
+        .wz-dot-label {
+            position: absolute;
+            top: calc(100% + 8px);
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .04em;
+            color: #94a3b8;
+            white-space: nowrap;
+            transition: color .3s;
+        }
+
+        .wz-dot.wz-dot-active .wz-dot-label,
+        .wz-dot.wz-dot-done .wz-dot-label {
+            color: var(--dark);
+        }
+
+        /* Steps */
+        .wz-step {
+            display: none;
+            animation: wzFadeIn .35s ease;
+        }
+
+        .wz-step.wz-active {
+            display: block;
+        }
+
+        @keyframes wzFadeIn {
+            from { opacity: 0; transform: translateX(18px); }
+            to { opacity: 1; transform: none; }
+        }
+
+        .wz-step.wz-done .wz-step-inner {
+            opacity: .5;
+        }
+
+        .wz-step-title {
+            font-size: 17px;
+            font-weight: 800;
+            color: var(--dark);
+            margin-bottom: 4px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .wz-step-sub {
+            font-size: 12px;
+            color: #94a3b8;
+            margin-bottom: 20px;
+        }
+
+        .wz-step-icon {
+            width: 32px;
+            height: 32px;
+            border-radius: 9px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            flex-shrink: 0;
+        }
+
+        /* Form fields inside wizard */
+        .wz-step label.lbl {
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .06em;
+            color: #64748b;
+            margin-bottom: 6px;
+            display: block;
+        }
+
+        .wz-step .form-control,
+        .wz-step .form-select {
+            border-radius: 10px;
+            padding: 10px 14px;
+            border: 1.5px solid #e2e8f0;
+            font-size: 14px;
+            background: #fafcff;
+            font-family: inherit;
+            transition: .2s;
+            outline: none;
+            width: 100%;
+        }
+
+        .wz-step .form-control:focus,
+        .wz-step .form-select:focus {
+            border-color: var(--secondary);
+            background: #fff;
+            box-shadow: 0 0 0 3px rgba(74, 127, 196, .12);
+        }
+
+        .wz-step .form-control.wz-error,
+        .wz-step .form-select.wz-error {
+            border-color: #e11d48;
+            box-shadow: 0 0 0 3px rgba(225, 29, 72, .12);
+        }
+
+        @keyframes wzShake {
+            0%, 100% { transform: translateX(0); }
+            20% { transform: translateX(-6px); }
+            40% { transform: translateX(6px); }
+            60% { transform: translateX(-4px); }
+            80% { transform: translateX(4px); }
+        }
+
+        .wz-shake {
+            animation: wzShake .45s ease;
+        }
+
+        /* Navigation buttons */
+        .wz-nav {
+            display: flex;
+            gap: 10px;
+            margin-top: 24px;
+            padding-top: 20px;
+            border-top: 1px solid #f1f5f9;
+        }
+
+        .wz-btn {
+            flex: 1;
+            padding: 12px 20px;
+            border-radius: 50px;
+            font-weight: 700;
+            font-size: 14px;
+            font-family: inherit;
+            cursor: pointer;
+            transition: .25s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            border: none;
+        }
+
+        .wz-btn-primary {
+            background: var(--primary);
+            color: #fff;
+            box-shadow: 0 6px 18px rgba(30, 90, 168, .25);
+        }
+
+        .wz-btn-primary:hover {
+            background: var(--dark);
+            transform: translateY(-2px);
+            box-shadow: 0 10px 28px rgba(18, 26, 47, .3);
+        }
+
+        .wz-btn-secondary {
+            background: #E6EEF8;
+            color: #64748b;
+            border: 1.5px solid #e2e8f0;
+        }
+
+        .wz-btn-secondary:hover {
+            background: #d1dce8;
+            color: #334155;
+        }
+
+        .wz-btn-success {
+            background: #16a34a;
+            color: #fff;
+            box-shadow: 0 6px 18px rgba(22, 163, 74, .25);
+        }
+
+        .wz-btn-success:hover {
+            background: #15803d;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 28px rgba(22, 163, 74, .3);
+        }
+
+        /* Review card */
+        .wz-review-card {
+            background: #f8fafc;
+            border: 1.5px solid #e2e8f0;
+            border-radius: 14px;
+            padding: 20px;
+            margin-bottom: 16px;
+        }
+
+        .wz-review-row {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            padding: 8px 0;
+            border-bottom: 1px solid #f1f5f9;
+        }
+
+        .wz-review-row:last-child {
+            border-bottom: none;
+        }
+
+        .wz-review-label {
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .05em;
+            color: #94a3b8;
+            min-width: 90px;
+            flex-shrink: 0;
+            padding-top: 2px;
+        }
+
+        .wz-review-value {
+            font-size: 14px;
+            font-weight: 600;
+            color: #0f172a;
+        }
+
+        .loc-toggle {
+            display: flex;
+            gap: 8px;
+        }
+
+        .loc-btn {
+            flex: 1;
+            padding: 10px;
+            border: 1.5px solid #e2e8f0;
+            border-radius: 10px;
+            background: #fafcff;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+            color: #64748b;
+            text-align: center;
+            transition: .2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+        }
+
+        .loc-btn.active {
+            border-color: var(--primary);
+            background: var(--primary);
+            color: #fff;
+        }
+
+        .btn-submit {
+            width: 100%;
+            padding: 13px;
+            background: var(--primary);
+            color: #fff;
+            border: none;
+            border-radius: 50px;
+            font-weight: 700;
+            font-size: 15px;
+            font-family: inherit;
+            cursor: pointer;
+            transition: .25s;
+            box-shadow: 0 6px 18px rgba(30, 90, 168, .25);
+        }
+
+        .btn-submit:hover {
+            background: var(--dark);
+            transform: translateY(-2px);
+            box-shadow: 0 10px 28px rgba(18, 26, 47, .3);
+        }
+
+        /* â”€â”€ ALERT TOAST â”€â”€ */
+        .alert-toast {
+            position: fixed;
+            top: 24px;
+            right: 32px;
+            z-index: 9999;
+            min-width: 320px;
+            max-width: 440px;
+            border-radius: 14px;
+            padding: 16px 20px;
+            font-weight: 500;
+            font-size: 14px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, .14);
+            animation: toastIn .4s ease;
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+        }
+
+        .alert-toast.success {
+            background: #f0fdf4;
+            border: 1.5px solid #bbf7d0;
+            color: #15803d;
+        }
+
+        /* â”€â”€ FEEDBACK MODAL PREMIUM STYLES â”€â”€ */
+        .feedback-stars i {
+            font-size: 32px;
+            color: #e2e8f0;
+            cursor: pointer;
+            transition: .2s;
+        }
+
+        .feedback-stars i.active {
+            color: #fbbf24;
+            transform: scale(1.1);
+        }
+
+        .feedback-modal-content {
+            border-radius: 30px;
+            border: none;
+            overflow: hidden;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.15);
+        }
+
+        .feedback-header {
+            background: #eff6ff;
+            border: none;
+            padding: 30px 30px 10px;
+            position: relative;
+        }
+
+        .feedback-body {
+            padding: 30px;
+            text-align: center;
+        }
+
+        .feedback-icon-bg {
+            width: 80px;
+            height: 80px;
+            background: #fff;
+            border-radius: 20px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 20px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05);
+        }
+
+        .feedback-btn {
+            background: #1E5AA8;
+            color: #fff;
+            border: none;
+            border-radius: 15px;
+            padding: 14px;
+            font-weight: 700;
+            width: 100%;
+            transition: .2s;
+            margin-top: 10px;
+        }
+
+        .feedback-btn:hover {
+            background: #15407A;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 15px -3px rgba(30, 90, 168, 0.3);
+        }
+
+        .feedback-textarea {
+            border-radius: 15px;
+            border: 1.5px solid #e2e8f0;
+            background: #f8fafc;
+            padding: 15px;
+            font-size: 14px;
+        }
+
+        .feedback-textarea:focus {
+            border-color: #3b82f6;
+            box-shadow: none;
+            background: #fff;
+        }
+
+        .alert-toast.danger {
+            background: #fff1f2;
+            border: 1.5px solid #fecdd3;
+            color: #be123c;
+        }
+
+        @keyframes toastIn {
+            from {
+                opacity: 0;
+                transform: translateY(-16px) scale(.96);
+            }
+
+            to {
+                opacity: 1;
+                transform: none;
+            }
+        }
+
+        /* â”€â”€ DETAIL MODAL â”€â”€ */
+        .dmodal-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, .5);
+            z-index: 99998;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 16px;
+            opacity: 0;
+            transition: opacity .18s;
+        }
+
+        .dmodal-backdrop.open {
+            display: flex;
+        }
+
+        .dmodal {
+            background: #fff;
+            border-radius: 20px;
+            width: 100%;
+            max-width: 520px;
+            max-height: 88vh;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 24px 64px rgba(0, 0, 0, .2);
+            overflow: hidden;
+            transform: scale(.95) translateY(12px);
+            transition: transform .2s, opacity .2s;
+            opacity: 0;
+        }
+
+        .dmodal-backdrop.open .dmodal {
+            transform: none;
+            opacity: 1;
+        }
+
+        .dmodal-header {
+            padding: 20px 24px;
+            border-bottom: 1px solid #f1f5f9;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .dmodal-header h5 {
+            font-weight: 800;
+            font-size: 17px;
+            color: var(--dark);
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .dmodal-close {
+            width: 34px;
+            height: 34px;
+            border-radius: 50%;
+            border: 1.5px solid #e2e8f0;
+            background: #E6EEF8;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 15px;
+            color: #64748b;
+            transition: .15s;
+        }
+
+        .dmodal-close:hover {
+            background: #fee2e2;
+            border-color: #fca5a5;
+            color: #e11d48;
+        }
+
+        .dmodal-body {
+            overflow-y: auto;
+            padding: 24px;
+            flex: 1;
+        }
+
+        .dmodal-footer {
+            padding: 16px 24px;
+            border-top: 1px solid #f1f5f9;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .info-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+
+        .info-item label {
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .08em;
+            color: #94a3b8;
+            display: block;
+            margin-bottom: 3px;
+        }
+
+        .info-item .val {
+            font-size: 14px;
+            font-weight: 600;
+            color: #0f172a;
+        }
+
+        .info-item.full {
+            grid-column: 1/-1;
+        }
+
+        .service-hero {
+            text-align: center;
+            background: linear-gradient(135deg, #eff6ff, #e0f2fe);
+            border-radius: 14px;
+            padding: 18px;
+            margin-bottom: 16px;
+        }
+
+        .service-hero .sname {
+            font-size: 20px;
+            font-weight: 800;
+            color: var(--primary);
+        }
+
+        .service-hero .slim {
+            font-size: 13px;
+            color: #64748b;
+            margin-top: 2px;
+        }
+
+        .notice-box {
+            border-radius: 12px;
+            padding: 14px 16px;
+            font-size: 13px;
+            margin-bottom: 14px;
+        }
+
+        .notice-box.warn {
+            background: #fff7ed;
+            border: 1.5px solid #fed7aa;
+            color: #9a3412;
+        }
+
+        .btn-action {
+            flex: 1;
+            padding: 11px 16px;
+            border-radius: 50px;
+            border: none;
+            font-weight: 700;
+            font-size: 13px;
+            font-family: inherit;
+            cursor: pointer;
+            transition: .2s;
+        }
+
+        .btn-action.green {
+            background: #16a34a;
+            color: #fff;
+        }
+
+        .btn-action.red {
+            background: #fff;
+            border: 1.5px solid #fca5a5;
+            color: #e11d48;
+        }
+
+        .btn-action.gray {
+            background: #E6EEF8;
+            border: 1.5px solid #e2e8f0;
+            color: #64748b;
+        }
+
+        .btn-action.danger-solid {
+            background: #e11d48;
+            color: #fff;
+        }
+
+        .btn-action:hover {
+            opacity: .88;
+            transform: translateY(-1px);
+        }
+
+        #homeAddressContainer,
+        #endDateContainer {
+            display: none;
+        }
+
+        .no-appt {
+            text-align: center;
+            padding: 52px 20px;
+            color: #94a3b8;
+        }
+
+        .no-appt i {
+            font-size: 48px;
+            display: block;
+            margin-bottom: 14px;
+            opacity: .35;
+        }
+
+        /* â”€â”€ NO PET MODAL â”€â”€ */
+        #noPetBackdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, .6);
+            z-index: 99999;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 16px;
+            opacity: 0;
+            transition: opacity .25s;
+        }
+
+        #noPetBackdrop.visible {
+            opacity: 1;
+        }
+
+        #noPetModal {
+            background: #fff;
+            border-radius: 24px;
+            width: 100%;
+            max-width: 440px;
+            box-shadow: 0 32px 80px rgba(0, 0, 0, .22);
+            overflow: hidden;
+            transform: scale(.92) translateY(24px);
+            transition: transform .28s cubic-bezier(.34, 1.56, .64, 1), opacity .25s;
+            opacity: 0;
+        }
+
+        #noPetBackdrop.visible #noPetModal {
+            transform: none;
+            opacity: 1;
+        }
+
+        .npm-header {
+            background: linear-gradient(135deg, #1E5AA8 0%, #4A7FC4 100%);
+            padding: 32px 28px 24px;
+            text-align: center;
+            position: relative;
+        }
+
+        .npm-icon {
+            width: 72px;
+            height: 72px;
+            background: rgba(255, 255, 255, .18);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 14px;
+            font-size: 32px;
+            color: #fff;
+            border: 2.5px solid rgba(255, 255, 255, .35);
+        }
+
+        .npm-title {
+            font-size: 20px;
+            font-weight: 800;
+            color: #fff;
+            margin: 0 0 6px;
+            letter-spacing: -.3px;
+        }
+
+        .npm-sub {
+            font-size: 13px;
+            color: rgba(255, 255, 255, .78);
+            margin: 0;
+            line-height: 1.5;
+        }
+
+        .npm-body {
+            padding: 28px;
+        }
+
+        .npm-steps {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            margin-bottom: 24px;
+        }
+
+        .npm-step {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+        }
+
+        .npm-step-num {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: #eff6ff;
+            color: #2563eb;
+            font-size: 13px;
+            font-weight: 800;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            margin-top: 1px;
+        }
+
+        .npm-step-text {
+            font-size: 13px;
+            color: #475569;
+            line-height: 1.5;
+        }
+
+        .npm-step-text strong {
+            color: #0f172a;
+            font-weight: 700;
+        }
+
+        .npm-btn-primary {
+            display: block;
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, #1E5AA8, #4A7FC4);
+            color: #fff;
+            border: none;
+            border-radius: 50px;
+            font-weight: 700;
+            font-size: 15px;
+            font-family: 'Inter', sans-serif;
+            cursor: pointer;
+            transition: .22s;
+            text-align: center;
+            text-decoration: none;
+            box-shadow: 0 6px 20px rgba(30, 90, 168, .3);
+            margin-bottom: 10px;
+        }
+
+        .npm-btn-primary:hover {
+            opacity: .9;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 28px rgba(30, 90, 168, .4);
+        }
+
+        .npm-btn-secondary {
+            display: block;
+            width: 100%;
+            padding: 12px;
+            background: transparent;
+            color: #64748b;
+            border: 1.5px solid #e2e8f0;
+            border-radius: 50px;
+            font-weight: 600;
+            font-size: 14px;
+            font-family: 'Inter', sans-serif;
+            cursor: pointer;
+            transition: .18s;
+            text-align: center;
+        }
+
+        .npm-btn-secondary:hover {
+            background: #E6EEF8;
+            border-color: #cbd5e1;
+            color: #334155;
+        }
+
+        .pet-select-card.selected {
+            border-color: #1E5AA8 !important;
+            background: #eff6ff !important;
+            box-shadow: 0 0 0 3px rgba(30,90,168,.12) !important;
+        }
+        .pet-select-card.selected .pet-check-badge {
+            display: inline-flex !important;
+        }
+        .pet-select-card:hover {
+            border-color: #4A7FC4;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(30,90,168,.1);
+        }
+
+        .sidebar::-webkit-scrollbar {
+            width: 5px;
+        }
+
+        .sidebar::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+        }
+
+        .sidebar::-webkit-scrollbar-track {
+            background: transparent;
+        }
+    </style>
+    <link rel="stylesheet" href="assets/pragmavet.css">
+    <link href="assets/global-style.css" rel="stylesheet">
+</head>
+
+<body>
+
+    <?php if (isset($_SESSION['message'])): ?>
+        <div class="alert-toast <?php echo $_SESSION['msg_type'] === 'success' ? 'success' : 'danger'; ?>" id="toastMsg">
+            <i class="fa <?php echo $_SESSION['msg_type'] === 'success' ? 'fa-check-circle' : 'fa-exclamation-circle'; ?>"
+                style="margin-top:1px;font-size:18px;flex-shrink:0;"></i>
+            <div><?php echo $_SESSION['message'];
+            unset($_SESSION['message'], $_SESSION['msg_type']); ?></div>
+            <button onclick="this.parentElement.remove()"
+                style="background:none;border:none;cursor:pointer;margin-left:auto;font-size:16px;color:inherit;opacity:.6;">&#x2715;</button>
+        </div>
+    <?php endif; ?>
+
+    <!-- SIDEBAR -->
+    <div class="sidebar">
+        <div class="sidebar-brand" style="display:flex; align-items:center; gap:10px; margin-bottom: 20px;">
+            <div class="sidebar-brand-icon"><i class="fa fa-paw" style="color:#fff;font-size:18px;"></i></div>
+            <span style="font-weight:bold; color:white; font-size: 18px;">PragmaVet</span>
+        </div>
+        <div class="sidebar-user"
+            style="margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid rgba(255,255,255,0.1);">
+            <div class="welcome" style="font-size:12px; color:#A0AEC0;">Welcome back,</div>
+            <div class="uname" style="font-weight:bold; color:white; font-size:15px;">
+                <?php echo htmlspecialchars($user_name ?? ''); ?></div>
+        </div>
+        <a href="dashboard.php"><i class="fa fa-home"></i> Dashboard</a>
+        <a href="appointments.php" class="active"><i class="fa fa-calendar-check"></i> Appointments</a>
+        <a href="boarding.php"><i class="fa fa-hotel"></i> Pet Boarding</a>
+        <a href="pets.php"><i class="fa fa-notes-medical"></i> Profile & Pets</a>
+        <a href="billing.php"><i class="fa fa-file-invoice-dollar"></i> Billing</a>
+        <a href="feedback.php"><i class="fa fa-star"></i> Feedback</a>
+        <a href="settings.php"><i class="fa fa-cog"></i> Account Settings</a>
+        <div class="sidebar-logout" style="margin-top:auto;"><a href="logout.php" class="text-danger"><i
+                    class="fa fa-sign-out-alt"></i> Logout</a></div>
+    </div>
+
+    <div class="main-content">
+
+        <!-- Page header -->
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <div>
+                <div class="page-title">Manage Appointments</div>
+                <div class="page-sub">Book a new session and view your full history</div>
+            </div>
+        </div>
+
+        <div class="row g-4 align-items-start">
+
+            <!-- â”€â”€ LEFT: BOOKING FORM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+            <div class="col-xl-4 col-lg-5">
+                <div class="card-prem">
+                    <div class="card-head">
+                        <h5><span
+                                style="width:32px;height:32px;border-radius:9px;background:#eff6ff;display:inline-flex;align-items:center;justify-content:center;color:#2563eb;font-size:14px;"><i
+                                    class="fa fa-plus"></i></span> Book Request</h5>
+                    </div>
+                    <div class="card-body-p form-section">
+
+                        <?php if ($pets_result->num_rows == 0): ?>
+                            <div style="text-align:center;padding:32px 16px;">
+                                <div
+                                    style="width:64px;height:64px;border-radius:50%;background:#fff7ed;display:flex;align-items:center;justify-content:center;margin:0 auto 14px;font-size:28px;color:#ea580c;">
+                                    <i class="fa fa-exclamation-triangle"></i>
+                                </div>
+                                <div style="font-weight:700;font-size:15px;color:#0f172a;margin-bottom:6px;">No Pet
+                                    Registered</div>
+                                <p style="color:#64748b;font-size:13px;margin-bottom:16px;">Register a pet profile before
+                                    booking an appointment.</p>
+                                <a href="pets.php"
+                                    style="display:inline-block;background:var(--primary);color:#fff;padding:11px 28px;border-radius:50px;font-weight:700;text-decoration:none;font-size:14px;"><i
+                                        class="fa fa-plus-circle me-1"></i> Register a Pet</a>
+                            </div>
+                        <?php else: ?>
+                            <form method="POST" id="appointmentForm">
+                                <input type="hidden" name="book" value="1">
+
+                                <!-- WIZARD CONTAINER -->
+                                <div id="bookingWizard" class="wz-container">
+
+                                    <!-- Progress Indicator -->
+                                    <div class="wz-progress">
+                                        <div class="wz-progress-track">
+                                            <div class="wz-progress-fill" style="width:0%;"></div>
+                                        </div>
+                                        <div class="wz-dot" data-step="1">
+                                            1
+                                            <span class="wz-dot-label">Details</span>
+                                        </div>
+                                        <div class="wz-dot" data-step="2">
+                                            2
+                                            <span class="wz-dot-label">Schedule</span>
+                                        </div>
+                                        <div class="wz-dot" data-step="3">
+                                            3
+                                            <span class="wz-dot-label">Review</span>
+                                        </div>
+                                    </div>
+
+                                    <!-- STEP 1: Pet & Service Details -->
+                                    <div class="wz-step" data-step="1">
+                                        <div class="wz-step-title">
+                                            <span class="wz-step-icon" style="background:#eff6ff;color:#2563eb;">
+                                                <i class="fa fa-paw"></i>
+                                            </span>
+                                            Pet & Service
+                                        </div>
+                                        <div class="wz-step-sub">Tell us about your pet and what you need</div>
+
+                                        <!-- Pet -->
+                                        <div class="mb-3">
+                                            <label class="form-label fw-bold text-dark" style="font-size:13px;letter-spacing:.3px;">SELECT PET(S) <span class="text-danger">*</span></label>
+                                            <div id="petCardGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;">
+                                                <?php
+                                                $pets_result->data_seek(0); // reset result pointer
+                                                $pets_for_form = [];
+                                                while ($pt = $pets_result->fetch_assoc()) { $pets_for_form[] = $pt; }
+                                                ?>
+                                                <?php foreach ($pets_for_form as $pt): ?>
+                                                <div class="pet-select-card" 
+                                                     data-pet-id="<?= $pt['id'] ?>"
+                                                     data-pet-name="<?= htmlspecialchars($pt['name']) ?>"
+                                                     data-pet-species="<?= htmlspecialchars($pt['species']) ?>"
+                                                     onclick="togglePetCard(this)"
+                                                     style="border:2px solid #e2e8f0;border-radius:14px;padding:14px 10px;text-align:center;cursor:pointer;transition:all .2s;background:#fff;position:relative;">
+                                                    <?php if (!empty($pt['pet_picture']) && file_exists('uploads/pets/' . $pt['pet_picture'])): ?>
+                                                        <img src="uploads/pets/<?= htmlspecialchars($pt['pet_picture']) ?>" style="width:52px;height:52px;border-radius:50%;object-fit:cover;border:2.5px solid #e2e8f0;margin-bottom:8px;">
+                                                    <?php else: ?>
+                                                        <div style="width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,#e0f2fe,#bae6fd);display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:700;color:#4A7FC4;margin:0 auto 8px;"><?= strtoupper(substr($pt['name'],0,1)) ?></div>
+                                                    <?php endif; ?>
+                                                    <div style="font-weight:700;font-size:13px;color:#0f172a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"><?= htmlspecialchars($pt['name']) ?></div>
+                                                    <div style="font-size:11px;color:#94a3b8;margin-top:2px;"><?= htmlspecialchars($pt['species']) ?></div>
+                                                    <span class="pet-check-badge" style="position:absolute;top:6px;right:6px;width:20px;height:20px;border-radius:50%;background:#1E5AA8;color:#fff;font-size:11px;display:none;align-items:center;justify-content:center;"><i class="fa fa-check"></i></span>
+                                                </div>
+                                                <?php endforeach; ?>
+                                            </div>
+                                            <?php if (empty($pets_for_form)): ?>
+                                                <div style="padding:20px;text-align:center;color:#94a3b8;font-size:14px;border:2px dashed #e2e8f0;border-radius:14px;">
+                                                    <i class="fa fa-paw" style="font-size:24px;display:block;margin-bottom:8px;"></i>
+                                                    No pets registered. <a href="pets.php" style="color:#1E5AA8;font-weight:600;">Add a pet</a> first.
+                                                </div>
+                                            <?php endif; ?>
+                                            <div id="multiPetBadge" style="display:none;margin-top:10px;padding:8px 14px;background:linear-gradient(135deg,#eff6ff,#dbeafe);border-radius:10px;font-size:13px;font-weight:600;color:#1E5AA8;border:1.5px solid #bfdbfe;">
+                                                <i class="fa fa-paw me-1"></i> <span id="petCountLabel">0</span> pet(s) selected for this appointment
+                                            </div>
+                                            <input type="hidden" name="pet_name" id="petNameHidden" value="">
+                                        </div>
+
+                                        <!-- Service Type -->
+                                        <div class="mb-3">
+                                            <label class="lbl"><i class="fa fa-stethoscope me-1"></i> Service Type</label>
+                                            <select name="service_type" class="form-select" id="serviceTypeSelect" required>
+                                                <option value="">Select a Service</option>
+                                                <option value="Consultation">Consultation</option>
+                                                <option value="Vaccination and Deworming">Vaccination & Deworming</option>
+                                                <option value="Confinement">Confinement</option>
+                                                <option value="Laboratory Test">Laboratory Test</option>
+                                                <option value="Dental Prophylaxis">Dental Prophylaxis</option>
+                                                <option value="General Checkup">General Checkup</option>
+                                            </select>
+                                        </div>
+
+                                        <!-- Location -->
+                                        <div class="mb-3">
+                                            <label class="lbl"><i class="fa fa-map-marker-alt me-1"></i> Service Location</label>
+                                            <div class="loc-toggle">
+                                                <label class="loc-btn active" id="btnSite" for="locSite"><i class="fa fa-hospital"></i> On-Site Clinic</label>
+                                                <label class="loc-btn" id="btnHome" for="locHome"><i class="fa fa-home"></i> Home Service</label>
+                                            </div>
+                                            <input type="radio" name="service_location" id="locSite" value="On-Site" checked style="display:none;">
+                                            <input type="radio" name="service_location" id="locHome" value="Home Service" style="display:none;">
+                                        </div>
+
+                                        <div class="mb-3" id="homeAddressContainer" style="display:none;">
+                                            <label class="lbl">Home Address</label>
+                                            <textarea name="home_address" id="homeAddressInput" class="form-control" rows="2"
+                                                placeholder="Where should we visit?"><?php echo htmlspecialchars($myAddr); ?></textarea>
+                                        </div>
+                                    </div>
+
+                                    <!-- STEP 2: Date, Time & Doctor -->
+                                    <div class="wz-step" data-step="2">
+                                        <div class="wz-step-title">
+                                            <span class="wz-step-icon" style="background:#f0fdf4;color:#16a34a;">
+                                                <i class="fa fa-calendar-check"></i>
+                                            </span>
+                                            Schedule & Preferences
+                                        </div>
+                                        <div class="wz-step-sub">Choose when and who you'd like to see</div>
+
+                                        <!-- Date -->
+                                        <?php $today = date('Y-m-d'); ?>
+                                        <div class="mb-3">
+                                            <label class="lbl"><i class="fa fa-calendar-alt me-1"></i> Appointment Date</label>
+                                            <input type="text" name="appointment_date" id="appointmentDate" class="form-control"
+                                                placeholder="Select date" autocomplete="off" readonly required>
+                                        </div>
+
+                                        <!-- Time Slots -->
+                                        <div class="mb-3">
+                                            <label class="lbl"><i class="fa fa-clock me-1"></i> Preferred Time</label>
+                                            <input type="text" name="appointment_time" id="appointmentTime" class="form-control"
+                                                placeholder="Select date & service first" autocomplete="off" readonly required
+                                                style="cursor:pointer; background: #f8fafc; display:none;">
+                                            
+                                            <div style="margin-top:8px; font-size:12px; color:#475569;">
+                                                <strong>Available slots</strong> will appear after you choose a service type and date.
+                                            </div>
+
+                                            <!-- Smart Available Slots Container -->
+                                            <div id="availableSlotsContainer" class="mt-2" 
+                                                 style="display:none; padding:12px; background:#f8fafc; 
+                                                        border:1.5px solid #e2e8f0; border-radius:8px; max-height:300px; 
+                                                        overflow-y:auto;">
+                                            </div>
+
+                                            <!-- Slot Confirmation -->
+                                            <div id="slotConfirmation" style="display:none; margin-top:12px;"></div>
+
+                                            <!-- Old Time Picker (hidden but kept for compatibility) -->
+                                            <div id="timePickerDropdown"
+                                                style="display:none;position:absolute;top:calc(100% + 6px);left:0;right:0;z-index:9999;background:#fff;border-radius:16px;box-shadow:0 12px 40px rgba(0,0,0,0.18);border:1px solid #e2e8f0;overflow:hidden;">
+                                                <div style="padding:14px 20px 10px;border-bottom:1px solid #f1f5f9;">
+                                                    <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:#94a3b8;">Select Time</div>
+                                                </div>
+                                                <div style="display:flex;align-items:stretch;position:relative;height:200px;">
+                                                    <div style="position:absolute;top:50%;left:0;right:0;height:42px;transform:translateY(-50%);background:rgba(229,231,235,0.55);pointer-events:none;border-top:1.5px solid #e2e8f0;border-bottom:1.5px solid #e2e8f0;z-index:1;"></div>
+                                                    <div class="tp-col" id="tpHours" style="flex:1;overflow-y:scroll;scroll-snap-type:y mandatory;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding:79px 0;text-align:center;position:relative;z-index:2;"></div>
+                                                    <div class="tp-col" id="tpMins" style="flex:1;overflow-y:scroll;scroll-snap-type:y mandatory;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding:79px 0;text-align:center;position:relative;z-index:2;"></div>
+                                                    <div class="tp-col" id="tpAmpm" style="flex:1;overflow-y:scroll;scroll-snap-type:y mandatory;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding:79px 0;text-align:center;position:relative;z-index:2;"></div>
+                                                </div>
+                                                <div style="display:flex;justify-content:flex-end;gap:8px;padding:10px 16px 14px;border-top:1px solid #f1f5f9;">
+                                                    <button type="button" onclick="cancelTimePicker()" style="background:none;border:none;font-size:13px;font-weight:700;color:#94a3b8;cursor:pointer;padding:6px 14px;border-radius:8px;font-family:inherit;letter-spacing:.04em;">CANCEL</button>
+                                                    <button type="button" onclick="confirmTimePicker()" style="background:none;border:none;font-size:13px;font-weight:700;color:#e11d48;cursor:pointer;padding:6px 14px;border-radius:8px;font-family:inherit;letter-spacing:.04em;">OK</button>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <!-- End Date (conditional) -->
+                                        <div class="mb-3" id="endDateContainer" style="display:none;">
+                                            <label class="lbl"><i class="fa fa-calendar-plus me-1"></i> Discharge / End Date</label>
+                                            <input type="text" name="end_date" id="endDateInput" class="form-control"
+                                                placeholder="Select end date" autocomplete="off" readonly>
+                                            <div style="font-size:11px;color:#94a3b8;margin-top:4px;">
+                                                <i class="fa fa-info-circle me-1"></i> Expected departure for confinement/boarding.
+                                            </div>
+                                        </div>
+
+                                        <!-- Doctor -->
+                                        <div class="mb-3">
+                                            <label class="lbl"><i class="fa fa-user-md me-1"></i> Preferred Veterinarian <span style="font-weight:400;color:#94a3b8;">(Optional)</span></label>
+                                            <select name="doctor_id" id="doctorSelect" class="form-select">
+                                                <option value="">-- No Preference (Assigned by Admin) --</option>
+                                                <?php foreach ($doctors as $doc): ?>
+                                                    <option value="<?php echo $doc['id']; ?>" data-id="<?php echo $doc['id']; ?>">Dr. <?php echo htmlspecialchars($doc['fullname']); ?></option>
+                                                <?php endforeach; ?>
+                                            </select>
+                                            <div id="doctorLeaveWarn"
+                                                style="display:none;margin-top:6px;padding:8px 12px;background:#fff7ed;border:1.5px solid #fed7aa;border-radius:8px;font-size:12px;color:#9a3412;">
+                                                <i class="fa fa-exclamation-triangle me-1"></i> <span id="doctorLeaveMsg"></span>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- STEP 3: Review & Submit -->
+                                    <div class="wz-step" data-step="3">
+                                        <div class="wz-step-title">
+                                            <span class="wz-step-icon" style="background:#fff7ed;color:#ea580c;">
+                                                <i class="fa fa-check-circle"></i>
+                                            </span>
+                                            Review & Confirm
+                                        </div>
+                                        <div class="wz-step-sub">Please review your appointment details before submitting</div>
+
+                                        <div class="wz-review-card">
+                                            <div class="wz-review-row">
+                                                <span class="wz-review-label"><i class="fa fa-paw me-1"></i>Pet</span>
+                                                <span class="wz-review-value" id="reviewPet">—</span>
+                                            </div>
+                                            <div class="wz-review-row">
+                                                <span class="wz-review-label"><i class="fa fa-stethoscope me-1"></i>Service</span>
+                                                <span class="wz-review-value" id="reviewService">—</span>
+                                            </div>
+                                            <div class="wz-review-row">
+                                                <span class="wz-review-label"><i class="fa fa-map-marker-alt me-1"></i>Location</span>
+                                                <span class="wz-review-value" id="reviewLocation">—</span>
+                                            </div>
+                                            <div class="wz-review-row" style="display:none;">
+                                                <span class="wz-review-label"><i class="fa fa-home me-1"></i>Address</span>
+                                                <span class="wz-review-value" id="reviewAddress">—</span>
+                                            </div>
+                                            <div class="wz-review-row">
+                                                <span class="wz-review-label"><i class="fa fa-calendar-alt me-1"></i>Date</span>
+                                                <span class="wz-review-value" id="reviewDate">—</span>
+                                            </div>
+                                            <div class="wz-review-row">
+                                                <span class="wz-review-label"><i class="fa fa-clock me-1"></i>Time</span>
+                                                <span class="wz-review-value" id="reviewTime">—</span>
+                                            </div>
+                                            <div class="wz-review-row" id="reviewEndDateRow" style="display:none;">
+                                                <span class="wz-review-label"><i class="fa fa-calendar-plus me-1"></i>End Date</span>
+                                                <span class="wz-review-value" id="reviewEndDate">—</span>
+                                            </div>
+                                            <div class="wz-review-row">
+                                                <span class="wz-review-label"><i class="fa fa-user-md me-1"></i>Doctor</span>
+                                                <span class="wz-review-value" id="reviewDoctor">—</span>
+                                            </div>
+                                        </div>
+
+                                        <!-- Slot confirmation preview -->
+                                        <div id="reviewSlotConfirm" style="margin-bottom:16px;"></div>
+
+                                        <div style="background:#eff6ff;border-radius:12px;padding:14px 16px;font-size:12px;color:#1e40af;border:1.5px solid #bfdbfe;">
+                                            <i class="fa fa-info-circle me-1"></i> By submitting, you agree to the clinic's terms and policies. You will be notified once your appointment is approved.
+                                        </div>
+                                    </div>
+
+                                    <!-- Navigation Buttons -->
+                                    <div class="wz-nav">
+                                        <button type="button" id="wzPrev" class="wz-btn wz-btn-secondary" style="display:none;">
+                                            <i class="fa fa-arrow-left"></i> Back
+                                        </button>
+                                        <button type="button" id="wzNext" class="wz-btn wz-btn-primary">
+                                            Continue <i class="fa fa-arrow-right"></i>
+                                        </button>
+                                        <button type="submit" id="wzSubmit" class="wz-btn wz-btn-success" style="display:none;">
+                                            <i class="fa fa-paper-plane"></i> Submit Request
+                                        </button>
+                                    </div>
+                                </div>
+                            </form>
+                        <?php endif; ?>
+                    </div>
+                </div>
+            </div>
+
+            <!-- â”€â”€ RIGHT: APPOINTMENTS TABLE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+            <div class="col-xl-8 col-lg-7">
+                <div class="card-prem">
+                    <div class="card-head">
+                        <h5><span
+                                style="width:32px;height:32px;border-radius:9px;background:#f0fdf4;display:inline-flex;align-items:center;justify-content:center;color:#16a34a;font-size:14px;"><i
+                                    class="fa fa-list-alt"></i></span> Your Appointments</h5>
+
+                        <!-- Live Search -->
+                        <div class="search-wrap">
+                            <span class="si"><i class="fa fa-search"></i></span>
+                            <input type="text" id="apptSearch" placeholder="Search pet, service, statusâ€¦"
+                                autocomplete="off">
+                        </div>
+
+                        <!-- Filter tabs -->
+                        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                            <button class="filter-tab active" data-filter="all">All</button>
+                            <button class="filter-tab" data-filter="Pending">Pending</button>
+                            <?php if (count($rescheduleProposals) > 0): ?>
+                                <button class="filter-tab" data-filter="action_needed"
+                                    style="border-color:#7e22ce; color:#7e22ce; background:#f5f3ff;">
+                                    <i class="fa fa-exclamation-circle me-1"></i> Reschedule Alerts <span
+                                        style="background:#7e22ce; color:#fff; padding:1px 6px; border-radius:50px; font-size:10px; margin-left:4px;"><?php echo count($rescheduleProposals); ?></span>
+                                </button>
+                            <?php endif; ?>
+                            <button class="filter-tab" data-filter="Approved">Approved</button>
+                            <button class="filter-tab" data-filter="Completed">Completed</button>
+                            <button class="filter-tab" data-filter="Cancelled">Cancelled</button>
+                        </div>
+                    </div>
+
+                    <style>
+                        .filter-tab {
+                            padding: 6px 14px;
+                            border-radius: 20px;
+                            border: 1.5px solid #e2e8f0;
+                            background: #E6EEF8;
+                            font-size: 12px;
+                            font-weight: 600;
+                            color: #64748b;
+                            cursor: pointer;
+                            transition: .15s;
+                            font-family: inherit;
+                        }
+
+                        .filter-tab.active,
+                        .filter-tab:hover {
+                            border-color: var(--primary);
+                            background: var(--primary);
+                            color: #fff;
+                        }
+
+                        .sidebar::-webkit-scrollbar {
+                            width: 5px;
+                        }
+
+                        .sidebar::-webkit-scrollbar-thumb {
+                            background: rgba(255, 255, 255, 0.2);
+                            border-radius: 10px;
+                        }
+
+                        .sidebar::-webkit-scrollbar-track {
+                            background: transparent;
+                        }
+                    </style>
+
+                    <div style="overflow-x:auto;">
+                        <?php if (count($rescheduleProposals) > 0): ?>
+                            <div id="rescheduleNoticeContainer"
+                                style="background:linear-gradient(135deg, #7e22ce, #a855f7); color:#fff; padding:20px; border-radius:16px; margin: 0 0 24px; position:relative; overflow:hidden; box-shadow:0 10px 25px rgba(126,34,206,0.2);">
+                                <div
+                                    style="position:absolute; top:-20px; right:-20px; font-size:120px; opacity:0.1; transform:rotate(-15deg); pointer-events:none;">
+                                    <i class="fa fa-calendar-alt"></i></div>
+                                <div style="display:flex; align-items:center; gap:15px; position:relative; z-index:1;">
+                                    <div
+                                        style="width:48px; height:48px; background:rgba(255,255,255,0.2); border-radius:14px; display:flex; align-items:center; justify-content:center; font-size:22px; flex-shrink:0;">
+                                        <i class="fa fa-clock"></i>
+                                    </div>
+                                    <div style="flex:1;">
+                                        <h6 style="font-weight:800; margin-bottom:4px; font-size:15px;">Schedule Change
+                                            Proposed</h6>
+                                        <p style="margin:0; font-size:13px; opacity:0.9;">The clinic has proposed a new
+                                            schedule for <b><?php echo count($rescheduleProposals); ?></b> of your
+                                            appointments. Please review and accept or decline.</p>
+                                    </div>
+                                    <button onclick="document.querySelector('[data-filter=\'action_needed\']').click()"
+                                        style="background:#fff; color:#7e22ce; border:none; padding:10px 22px; border-radius:50px; font-weight:800; font-size:13px; cursor:pointer; transition:.2s; box-shadow:0 4px 12px rgba(0,0,0,0.1);"
+                                        onmouseover="this.style.transform='scale(1.05)'"
+                                        onmouseout="this.style.transform='scale(1)'">
+                                        Review Now
+                                    </button>
+                                </div>
+                            </div>
+                        <?php endif; ?>
+                        <?php if (count($apptRows) > 0): ?>
+                            <table class="appt-table" id="apptTable">
+                                <thead>
+                                    <tr>
+                                        <th>Details</th>
+                                        <th>Schedule</th>
+                                        <th>Service Flow</th>
+                                        <th>Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="apptBody">
+                                    <?php foreach ($apptRows as $row):
+                                        $status = $row['status'];
+                                        $badgeCls = match (true) {
+                                            $status === 'Pending' => 'badge-pending',
+                                            $status === 'Approved' => 'badge-approved',
+                                            $status === 'Completed' => 'badge-completed',
+                                            $status === 'Reschedule Proposed' => 'badge-proposed',
+                                            $status === 'Reschedule Requested' => 'badge-proposed',
+                                            str_contains($status, 'Cancel') || str_contains($status, 'Reject') => 'badge-cancelled',
+                                            default => 'badge-default'
+                                        };
+                                        $badgeDot = match (true) {
+                                            $status === 'Pending' => '#ea580c',
+                                            $status === 'Approved' => '#16a34a',
+                                            $status === 'Completed' => '#2563eb',
+                                            $status === 'Reschedule Proposed' => '#7e22ce',
+                                            $status === 'Reschedule Requested' => '#7c3aed',
+                                            str_contains($status, 'Cancel') || str_contains($status, 'Reject') => '#e11d48',
+                                            default => '#94a3b8'
+                                        };
+                                        $rowData = json_encode($row, JSON_HEX_TAG | JSON_HEX_QUOT | JSON_HEX_AMP);
+                                        ?>
+                                        <tr class="appt-row" data-status="<?php echo htmlspecialchars($status); ?>"
+                                            data-action-needed="<?php echo (isset($row['client_action_needed']) && $row['client_action_needed'] == 1 && !str_contains($status, 'Cancel') && !str_contains($status, 'Reject')) ? '1' : '0'; ?>"
+                                            onclick="openDetailModal(<?php echo htmlspecialchars($rowData, ENT_QUOTES); ?>)">
+                                            <td>
+                                                <div style="display:flex;align-items:center;gap:12px;">
+                                                    <?php 
+                                                    $petPic = $row['pet_picture'] ?? '';
+                                                    echo function_exists('petAvatarHtml') 
+                                                        ? petAvatarHtml($petPic, $row['pet_name'], 42) 
+                                                        : '<div class="pet-avatar"><i class="fa fa-paw"></i></div>'; 
+                                                    ?>
+                                                    <div>
+                                                        <div style="font-weight:700;color:#0f172a;font-size:14px;">
+                                                            <?php echo htmlspecialchars($row['pet_name']); ?>
+                                                        </div>
+                                                        <div style="font-size:12px;font-weight:600;color:var(--secondary);">
+                                                            <?php echo htmlspecialchars($row['service_type']); ?>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </td>
+                                            <td>
+                                                <div style="font-weight:600;color:#0f172a;font-size:13px;"><i
+                                                        class="far fa-calendar-alt"
+                                                        style="color:#94a3b8;margin-right:5px;"></i><?php echo date("M d, Y", strtotime($row['appointment_date'])); ?>
+                                                </div>
+                                                <div style="font-size:12px;color:#64748b;margin-top:2px;"><i
+                                                        class="far fa-clock"
+                                                        style="margin-right:4px;"></i><?php echo date("h:i A", strtotime($row['appointment_time'])); ?>
+                                                </div>
+                                            </td>
+                                            <td>
+                                                <?php if ($row['service_location'] === 'Home Service'): ?>
+                                                    <span
+                                                        style="display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:8px;background:#e0f2fe;color:#0369a1;font-size:12px;font-weight:600;"><i
+                                                            class="fa fa-home"></i> Home Visit</span>
+                                                <?php else: ?>
+                                                    <span
+                                                        style="display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:8px;background:#f1f5f9;color:#475569;font-size:12px;font-weight:600;"><i
+                                                            class="fa fa-hospital"></i> On-Site</span>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td>
+                                                <span class="badge-s <?php echo $badgeCls; ?>">
+                                                    <span
+                                                        style="width:7px;height:7px;border-radius:50%;background:<?php echo $badgeDot; ?>;flex-shrink:0;"></span>
+                                                    <?php echo htmlspecialchars($status); ?>
+                                                </span>
+                                            </td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+
+                            <!-- Empty search state -->
+                            <div id="noSearchResult" style="display:none;text-align:center;padding:40px;color:#94a3b8;">
+                                <i class="fa fa-search"
+                                    style="font-size:32px;margin-bottom:10px;display:block;opacity:.35;"></i>
+                                No appointments match your search.
+                            </div>
+
+                        <?php else: ?>
+                            <div class="no-appt">
+                                <i class="fa fa-calendar-times"></i>
+                                <div style="font-weight:700;font-size:16px;color:#475569;margin-bottom:6px;">No Appointments
+                                    Yet</div>
+                                <div style="font-size:13px;">Use the form on the left to book your first session.</div>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- â”€â”€ NO PET REGISTERED MODAL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+    <?php if ($pets_result->num_rows == 0): ?>
+        <div id="noPetBackdrop">
+            <div id="noPetModal">
+                <div class="npm-header">
+                    <div class="npm-icon"><i class="fa fa-paw"></i></div>
+                    <div class="npm-title">No Pet Registered Yet</div>
+                    <p class="npm-sub">You need to register a pet profile before you can book an appointment.</p>
+                </div>
+                <div class="npm-body">
+                    <div class="npm-steps">
+                        <div class="npm-step">
+                            <div class="npm-step-num">1</div>
+                            <div class="npm-step-text"><strong>Go to Profile &amp; Pets</strong> â€” add your furry
+                                companion's details (name, species, breed, etc.)</div>
+                        </div>
+                        <div class="npm-step">
+                            <div class="npm-step-num">2</div>
+                            <div class="npm-step-text"><strong>Come back here</strong> â€” once registered, the booking form
+                                will be ready for you automatically.</div>
+                        </div>
+                        <div class="npm-step">
+                            <div class="npm-step-num">3</div>
+                            <div class="npm-step-text"><strong>Book your appointment</strong> â€” select your pet, service,
+                                date &amp; time.</div>
+                        </div>
+                    </div>
+                    <button class="npm-btn-primary" onclick="openRegisterPetModal()"><i
+                            class="fa fa-plus-circle me-2"></i>Register a Pet Now</button>
+                    <button class="npm-btn-secondary" onclick="closeNoPetModal()">I'll do this later</button>
+                </div>
+            </div>
+        </div>
+    <?php endif; ?>
+
+    <!-- â”€â”€ REGISTER ANIMAL MODAL (embedded, posts to pets.php) â”€â”€ -->
+    <div class="modal fade" id="registerPetModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable">
+            <div class="modal-content border-0"
+                style="border-radius:24px;box-shadow:0 20px 50px rgba(15,23,42,0.12);border:1px solid #e2e8f0;overflow:hidden;">
+                <!-- Modal Header -->
+                <div class="modal-header border-0 pb-0 pt-4 px-4">
+                    <div class="d-flex align-items-center gap-3">
+                        <div
+                            style="width:48px;height:48px;background:#eff6ff;color:#2563eb;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;">
+                            <i class="fa fa-paw"></i>
+                        </div>
+                        <div>
+                            <h5 class="fw-bold mb-0" style="color:#0f172a;font-size:18px;">Register Animal</h5>
+                            <p class="mb-0 small" style="color:#94a3b8;">Add your pet's profile to get started</p>
+                        </div>
+                    </div>
+                    <button type="button" class="btn-close ms-auto" data-bs-dismiss="modal"></button>
+                </div>
+                <!-- Modal Body -->
+                <div class="modal-body px-4 pb-4 pt-3">
+                    <form method="POST" action="pets.php" enctype="multipart/form-data">
+
+                        <!-- Pet Picture -->
+                        <div class="mb-3">
+                            <label class="d-flex align-items-center gap-2 mb-2"
+                                style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:#94a3b8;">
+                                <i class="fa fa-image"></i> Pet Picture <span style="font-weight:400;opacity:.6;">â€”
+                                    Optional</span>
+                            </label>
+                            <input type="file" name="pet_pic" class="form-control"
+                                accept="image/png, image/jpeg, image/webp"
+                                style="border-radius:12px;padding:10px 14px;border:1px solid #e2e8f0;font-size:14px;background:#fcfdfe;">
+                        </div>
+
+                        <!-- Pet Name -->
+                        <div class="mb-3">
+                            <label class="d-flex align-items-center gap-2 mb-2"
+                                style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:#94a3b8;">
+                                <i class="fa fa-tag"></i> Pet Name
+                            </label>
+                            <input type="text" name="name" class="form-control" required placeholder="E.g. Max"
+                                style="border-radius:12px;padding:12px 16px;border:1px solid #e2e8f0;font-size:15px;background:#fcfdfe;transition:.2s;">
+                        </div>
+
+                        <!-- Species + Breed -->
+                        <div class="row g-3 mb-3">
+                            <div class="col-6">
+                                <label class="d-flex align-items-center gap-2 mb-2"
+                                    style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:#94a3b8;">
+                                    <i class="fa fa-paw"></i> Species
+                                </label>
+                                <select name="species" class="form-select" required
+                                    style="border-radius:12px;padding:12px 16px;border:1px solid #e2e8f0;font-size:15px;background:#fcfdfe;cursor:pointer;transition:.2s;">
+                                    <option value="Dog">Dog</option>
+                                    <option value="Cat">Cat</option>
+                                </select>
+                            </div>
+                            <div class="col-6">
+                                <label class="d-flex align-items-center gap-2 mb-2"
+                                    style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:#94a3b8;">
+                                    <i class="fa fa-certificate"></i> Breed <span
+                                        style="font-weight:400;opacity:.6;">Optional</span>
+                                </label>
+                                <input type="text" name="breed" class="form-control" placeholder="E.g. Beagle"
+                                    style="border-radius:12px;padding:12px 16px;border:1px solid #e2e8f0;font-size:15px;background:#fcfdfe;transition:.2s;">
+                            </div>
+                        </div>
+
+                        <!-- Age + Weight -->
+                        <div class="row g-3 mb-3">
+                            <div class="col-6">
+                                <label class="d-flex align-items-center gap-2 mb-2"
+                                    style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:#94a3b8;">
+                                    <i class="fa fa-birthday-cake"></i> Age (Years) <span
+                                        style="font-weight:400;opacity:.6;">Optional</span>
+                                </label>
+                                <input type="number" name="age" class="form-control" min="0" placeholder="Optional"
+                                    style="border-radius:12px;padding:12px 16px;border:1px solid #e2e8f0;font-size:15px;background:#fcfdfe;transition:.2s;">
+                            </div>
+                            <div class="col-6">
+                                <label class="d-flex align-items-center gap-2 mb-2"
+                                    style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:#94a3b8;">
+                                    <i class="fa fa-weight"></i> Weight (kg) <span
+                                        style="font-weight:400;opacity:.6;">Optional</span>
+                                </label>
+                                <input type="number" step="0.1" name="weight" class="form-control" min="0"
+                                    placeholder="Optional"
+                                    style="border-radius:12px;padding:12px 16px;border:1px solid #e2e8f0;font-size:15px;background:#fcfdfe;transition:.2s;">
+                            </div>
+                        </div>
+
+                        <!-- Divider -->
+                        <div style="border-top:1px solid #f1f5f9;margin:8px 0 16px;"></div>
+
+                        <!-- Vaccine Dates -->
+                        <div class="row g-3 mb-4">
+                            <div class="col-6">
+                                <label class="d-flex align-items-center gap-2 mb-2"
+                                    style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:#16a34a;">
+                                    <i class="fa fa-syringe"></i> Last Vaccine
+                                </label>
+                                <input type="text" name="last_vaccination" class="form-control flatpickr-rpa"
+                                    placeholder="Select Date"
+                                    style="border-radius:12px;padding:12px 16px;border:1px solid #e2e8f0;font-size:15px;background:#fff;transition:.2s;">
+                            </div>
+                            <div class="col-6">
+                                <label class="d-flex align-items-center gap-2 mb-2"
+                                    style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:#dc2626;">
+                                    <i class="fa fa-calendar-plus"></i> Next Vaccine
+                                </label>
+                                <input type="text" name="next_vaccination" class="form-control flatpickr-rpa"
+                                    placeholder="Select Date"
+                                    style="border-radius:12px;padding:12px 16px;border:1px solid #e2e8f0;font-size:15px;background:#fff;transition:.2s;">
+                            </div>
+                        </div>
+
+                        <!-- Submit -->
+                        <button type="submit" name="add_pet" class="btn w-100 py-3 fw-bold fs-6"
+                            style="background:linear-gradient(135deg,#1E5AA8,#2563eb);color:#fff;border-radius:14px;border:none;box-shadow:0 4px 12px rgba(37,99,235,.25);transition:.2s;font-family:'Inter',sans-serif;">
+                            <i class="fa fa-paw me-2"></i> Save Pet Profile
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- â”€â”€ DETAIL MODAL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+    <div class="dmodal-backdrop" id="detailBackdrop">
+        <div class="dmodal" id="detailModal">
+            <div class="dmodal-header">
+                <h5><span
+                        style="width:36px;height:36px;background:#eff6ff;border-radius:10px;display:inline-flex;align-items:center;justify-content:center;font-size:15px;color:#2563eb;flex-shrink:0;"><i
+                            class="fa fa-calendar-day"></i></span> Appointment Details</h5>
+                <button class="dmodal-close" onclick="closeDetailModal()">&#x2715;</button>
+            </div>
+            <div class="dmodal-body">
+                <!-- Service hero -->
+                <div class="service-hero">
+                    <div class="sname" id="dm-service"></div>
+                    <div class="slim" id="dm-datetime"></div>
+                </div>
+
+                <!-- Status badge centered -->
+                <div style="text-align:center;margin-bottom:18px;" id="dm-status-wrap"></div>
+
+                <!-- Info grid -->
+                <div class="info-grid">
+                    <div class="info-item">
+                        <label><i class="fa fa-paw me-1"></i>Pet Name</label>
+                        <div class="val" id="dm-pet"></div>
+                    </div>
+                    <div class="info-item">
+                        <label><i class="fa fa-user-md me-1"></i>Doctor</label>
+                        <div class="val" id="dm-doctor"></div>
+                    </div>
+                    <div class="info-item">
+                        <label><i class="fa fa-map-marker-alt me-1"></i>Location</label>
+                        <div class="val" id="dm-location"></div>
+                    </div>
+                    <div class="info-item">
+                        <label><i class="fa fa-tag me-1"></i>Booked On</label>
+                        <div class="val" id="dm-created"></div>
+                    </div>
+                    <div class="info-item full" id="dm-address-wrap" style="display:none;">
+                        <label><i class="fa fa-home me-1"></i>Home Address</label>
+                        <div class="val" id="dm-address" style="font-size:13px;font-weight:500;"></div>
+                    </div>
+                </div>
+
+                <!-- Admin notice -->
+                <div class="notice-box warn" id="dm-notice" style="display:none;">
+                    <b><i class="fa fa-exclamation-triangle me-1"></i> Message from Clinic:</b>
+                    <div id="dm-notice-text" style="margin-top:4px;"></div>
+                </div>
+            </div>
+            <div class="dmodal-footer" id="dm-footer">
+                <!-- Buttons injected by JS -->
+            </div>
+        </div>
+    </div>
+
+    <!-- â”€â”€ CLIENT RESCHEDULE REQUEST MODAL â”€â”€ -->
+    <div id="rescheduleBackdrop" class="dmodal-backdrop">
+        <div class="dmodal" style="max-width:440px;">
+            <div class="dmodal-header">
+                <h5><i class="fa fa-calendar-plus me-1 text-primary"></i> Request Reschedule</h5>
+                <button class="dmodal-close" onclick="closeRescheduleModal()">&times;</button>
+            </div>
+            <div class="dmodal-body">
+                <form method="POST" id="reschedForm">
+                    <input type="hidden" name="request_reschedule" value="1">
+                    <input type="hidden" name="reschedule_apt_id" id="resched-aid">
+                    <input type="hidden" name="appt_type" id="resched-type">
+
+                    <div
+                        style="background:#f8fafc; border-radius:12px; padding:15px; margin-bottom:20px; border:1px solid #e2e8f0;">
+                        <div
+                            style="font-size:11px; font-weight:800; color:#94a3b8; text-transform:uppercase; margin-bottom:4px;">
+                            Shifting Schedule For</div>
+                        <div id="resched-pet" style="font-weight:700; color:#0f172a; font-size:15px;">Buddy</div>
+                        <div id="resched-old-date" style="font-size:13px; color:#64748b;">Oct 24, 2023 at 09:00 AM</div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="lbl">Proposed New Date & Time</label>
+                        <input type="text" name="new_proposed_date_time" id="resched-new-date" class="form-control"
+                            placeholder="Select new schedule..." required>
+                        <input type="hidden" name="new_proposed_date" id="h-resched-date">
+                        <input type="hidden" name="new_proposed_time" id="h-resched-time">
+                    </div>
+
+                    <div class="mb-4">
+                        <label class="lbl">Reason for Shifting</label>
+                        <textarea name="reschedule_reason" class="form-control" rows="3"
+                            placeholder="e.g. Work emergency, pet not feeling well enough to travel..."
+                            required></textarea>
+                    </div>
+
+                    <p style="font-size:12px; color:#64748b; line-height:1.5; margin-bottom:20px;">
+                        <i class="fa fa-info-circle me-1 text-primary"></i> Your request will be sent to the clinic
+                        staff. You will be notified once they review and update your schedule.
+                    </p>
+
+                    <button type="submit" class="btn-submit">Send Reschedule Request</button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('reschedForm') && document.getElementById('reschedForm').addEventListener('submit', function (e) {
+            var dt = document.getElementById('resched-new-date').value;
+            if (dt) {
+                var parts = dt.split(' ');
+                document.getElementById('h-resched-date').value = parts[0];
+                document.getElementById('h-resched-time').value = parts[1] || '08:00';
+            }
+        });
+    </script>
+
+
+    <!-- SCRIPTS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // â”€â”€ TOAST AUTO DISMISS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        (function () {
+            var t = document.getElementById('toastMsg');
+            if (t) setTimeout(function () { t.style.opacity = '0'; t.style.transform = 'translateY(-16px)'; setTimeout(function () { t.remove(); }, 400); }, 4000);
+        })();
+
+        // â”€â”€ NO PET MODAL AUTO-SHOW â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        (function () {
+            var backdrop = document.getElementById('noPetBackdrop');
+            if (!backdrop) return; // user has pets, modal not rendered
+            // Small delay so page renders first, then modal fades in smoothly
+            setTimeout(function () {
+                backdrop.classList.add('visible');
+            }, 350);
+        })();
+
+        function closeNoPetModal() {
+            var backdrop = document.getElementById('noPetBackdrop');
+            if (!backdrop) return;
+            backdrop.classList.remove('visible');
+            setTimeout(function () { backdrop.style.display = 'none'; }, 280);
+        }
+
+        function openRegisterPetModal() {
+            closeNoPetModal();
+            setTimeout(function () {
+                var modal = new bootstrap.Modal(document.getElementById('registerPetModal'));
+                modal.show();
+                // Init flatpickr on the vaccine fields inside this modal
+                if (typeof flatpickr !== 'undefined') {
+                    document.querySelectorAll('.flatpickr-rpa').forEach(function (el) {
+                        if (!el._flatpickr) flatpickr(el, { dateFormat: 'Y-m-d' });
+                    });
+                }
+            }, 300);
+        }
+
+        // Close on backdrop click
+        document.addEventListener('DOMContentLoaded', function () {
+            var backdrop = document.getElementById('noPetBackdrop');
+            if (backdrop) {
+                backdrop.addEventListener('click', function (e) {
+                    if (e.target === backdrop) closeNoPetModal();
+                });
+            }
+        });
+
+        // Close on Escape key (won't conflict with detail modal since it checks which is open)
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape') {
+                var backdrop = document.getElementById('noPetBackdrop');
+                if (backdrop && backdrop.classList.contains('visible')) closeNoPetModal();
+            }
+        });
+
+
+        // â”€â”€ LIVE SEARCH â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        (function () {
+            var inp = document.getElementById('apptSearch');
+            var body = document.getElementById('apptBody');
+            var noRes = document.getElementById('noSearchResult');
+            var activeFilter = 'all';
+
+            function applyFilters() {
+                if (!body) return;
+                var q = (inp ? inp.value : '').toLowerCase().trim();
+                var rows = body.querySelectorAll('.appt-row');
+                var visible = 0;
+                rows.forEach(function (r) {
+                    var statusMatch = activeFilter === 'all' ||
+                        (activeFilter === 'action_needed' ? r.dataset.actionNeeded === '1' : r.dataset.status === activeFilter);
+                    var textMatch = !q || r.innerText.toLowerCase().includes(q);
+                    var show = statusMatch && textMatch;
+                    r.style.display = show ? '' : 'none';
+                    if (show) visible++;
+                });
+                if (noRes) noRes.style.display = visible === 0 ? 'block' : 'none';
+            }
+            window.applyFilters = applyFilters;
+
+            if (inp) inp.addEventListener('input', applyFilters);
+
+            // Filter tabs
+            document.querySelectorAll('.filter-tab').forEach(function (btn) {
+                btn.addEventListener('click', function () {
+                    document.querySelectorAll('.filter-tab').forEach(function (b) { b.classList.remove('active'); });
+                    btn.classList.add('active');
+                    activeFilter = btn.dataset.filter;
+                    applyFilters();
+                });
+            });
+        })();
+
+        // â”€â”€ DETAIL MODAL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        function statusBadgeHtml(s) {
+            var cls = 'badge-default', dot = '#94a3b8';
+            if (s === 'Pending') { cls = 'badge-pending'; dot = '#ea580c'; }
+            else if (s === 'Approved') { cls = 'badge-approved'; dot = '#16a34a'; }
+            else if (s === 'Completed') { cls = 'badge-completed'; dot = '#2563eb'; }
+            else if (s === 'Reschedule Proposed') { cls = 'badge-proposed'; dot = '#7e22ce'; }
+            else if (s.includes('Cancel') || s.includes('Reject')) { cls = 'badge-cancelled'; dot = '#e11d48'; }
+            return '<span class="badge-s ' + cls + '" style="font-size:14px;padding:7px 18px;"><span style="width:9px;height:9px;border-radius:50%;background:' + dot + ';flex-shrink:0;"></span>' + esc(s) + '</span>';
+        }
+
+        function esc(s) { return s ? String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : '-'; }
+
+        function fmtDate(d) { if (!d) return '-'; var o = new Date(d + 'T00:00:00'); return o.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }); }
+        function fmtTime(t) { if (!t) return ''; var p = t.split(':'); var h = parseInt(p[0]), m = p[1], ap = h >= 12 ? 'PM' : 'AM'; h = h % 12 || 12; return h + ':' + m + ' ' + ap; }
+        function fmtDT(d, t) { return fmtDate(d) + (t ? ' at ' + fmtTime(t) : ''); }
+        function fmtFull(s) { if (!s) return '-'; return new Date(s).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true }); }
+
+        function openDetailModal(data) {
+            document.getElementById('dm-service').textContent = data.service_type || 'Appointment';
+            document.getElementById('dm-datetime').textContent = fmtDT(data.appointment_date, data.appointment_time);
+            document.getElementById('dm-status-wrap').innerHTML = statusBadgeHtml(data.status);
+            document.getElementById('dm-pet').textContent = data.pet_name || '-';
+            document.getElementById('dm-doctor').textContent = data.doctor_name || 'Clinic Assigned';
+            document.getElementById('dm-location').textContent = data.service_location || '-';
+            document.getElementById('dm-created').textContent = fmtFull(data.created_at);
+
+            var addrW = document.getElementById('dm-address-wrap');
+            if (data.service_location === 'Home Service' && data.home_address) {
+                addrW.style.display = 'block';
+                document.getElementById('dm-address').textContent = data.home_address;
+            } else { addrW.style.display = 'none'; }
+
+            // Admin notice / reschedule
+            var notice = document.getElementById('dm-notice');
+            var noticeTxt = document.getElementById('dm-notice-text');
+            if (data.admin_message) {
+                notice.style.display = 'block';
+                noticeTxt.textContent = data.admin_message;
+            } else { notice.style.display = 'none'; }
+
+            // Footer buttons
+            var footer = document.getElementById('dm-footer');
+            footer.innerHTML = '';
+
+            // Close btn always
+            var closeBtn = document.createElement('button');
+            closeBtn.className = 'btn-action gray'; closeBtn.textContent = 'Close';
+            closeBtn.onclick = closeDetailModal;
+            footer.appendChild(closeBtn);
+
+            // Pending: cancel button
+            if (data.status === 'Pending') {
+                var cancelBtn = document.createElement('button');
+                cancelBtn.className = 'btn-action danger-solid';
+                cancelBtn.innerHTML = '<i class="fa fa-times-circle me-1"></i> Cancel Request';
+                cancelBtn.onclick = function () {
+                    if (!confirm('Are you sure you want to cancel this pending request?')) return;
+                    var f = document.createElement('form'); f.method = 'POST'; f.style.display = 'none';
+                    f.innerHTML = '<input name="cancel_appt" value="1"><input name="cancel_appt_id" value="' + data.id + '"><input name="appt_type" value="' + (data._type || 'Appointment') + '">';
+                    document.body.appendChild(f); f.submit();
+                };
+                footer.appendChild(cancelBtn);
+            }
+
+            // Approved: allow client to request reschedule
+            if (data.status === 'Approved') {
+                var reschedBtn = document.createElement('button');
+                reschedBtn.className = 'btn-action gray';
+                reschedBtn.innerHTML = '<i class="fa fa-calendar-alt me-1"></i> Request Reschedule';
+                reschedBtn.onclick = function () { openRescheduleModal(data); };
+                footer.insertBefore(reschedBtn, closeBtn);
+            }
+
+
+            // Reschedule proposed: accept/decline
+            if (data.client_action_needed == 1 && data.admin_message) {
+                var acceptBtn = document.createElement('button');
+                acceptBtn.className = 'btn-action green';
+                acceptBtn.innerHTML = '<i class="fa fa-check me-1"></i> Accept Reschedule';
+                acceptBtn.onclick = function () {
+                    if (!confirm('Accept the proposed reschedule and confirm appointment?')) return;
+                    var f = document.createElement('form'); f.method = 'POST'; f.style.display = 'none';
+                    f.innerHTML = '<input name="accept_reschedule" value="1"><input name="reschedule_apt_id" value="' + data.id + '"><input name="appt_type" value="' + (data._type || 'Appointment') + '">';
+                    document.body.appendChild(f); f.submit();
+                };
+                var declineBtn = document.createElement('button');
+                declineBtn.className = 'btn-action red';
+                declineBtn.innerHTML = '<i class="fa fa-times me-1"></i> Decline';
+                declineBtn.onclick = function () {
+                    if (!confirm('Decline this reschedule? The request will be permanently cancelled.')) return;
+                    var f = document.createElement('form'); f.method = 'POST'; f.style.display = 'none';
+                    f.innerHTML = '<input name="decline_reschedule" value="1"><input name="reschedule_apt_id" value="' + data.id + '"><input name="appt_type" value="' + (data._type || 'Appointment') + '">';
+                    document.body.appendChild(f); f.submit();
+                };
+                footer.insertBefore(declineBtn, closeBtn);
+                footer.insertBefore(acceptBtn, declineBtn);
+            }
+
+            // Show modal
+            var bd = document.getElementById('detailBackdrop');
+            bd.classList.add('open');
+            setTimeout(function () { bd.style.opacity = '1'; }, 10);
+        }
+
+        function closeDetailModal() {
+            var bd = document.getElementById('detailBackdrop');
+            bd.style.opacity = '0';
+            setTimeout(function () { bd.classList.remove('open'); bd.style.opacity = ''; }, 180);
+        }
+
+        document.getElementById('detailBackdrop').addEventListener('click', function (e) {
+            if (e.target === this) closeDetailModal();
+        });
+        document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeDetailModal(); });
+
+        function openRescheduleModal(data) {
+            closeDetailModal();
+            document.getElementById('resched-aid').value = data.id;
+            document.getElementById('resched-type').value = data._type || 'Appointment';
+            document.getElementById('resched-pet').textContent = data.pet_name;
+            document.getElementById('resched-old-date').textContent = fmtDT(data.appointment_date, data.appointment_time);
+
+            var bd = document.getElementById('rescheduleBackdrop');
+            bd.classList.add('open');
+            setTimeout(function () { bd.style.opacity = '1'; }, 10);
+
+            // Initialize flatpickr for the new date
+            flatpickr('#resched-new-date', {
+                minDate: 'today',
+                dateFormat: 'Y-m-d H:i',
+                enableTime: true,
+                defaultDate: data.appointment_date + ' ' + (data.appointment_time || '08:00'),
+                disableMobile: true
+            });
+        }
+
+        function closeRescheduleModal() {
+            var bd = document.getElementById('rescheduleBackdrop');
+            bd.style.opacity = '0';
+            setTimeout(function () { bd.classList.remove('open'); bd.style.opacity = ''; }, 180);
+        }
+    </script>
+
+    <!-- Flatpickr + Doctor Leave JS -->
+    <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+    <script src="js_smart_slots.js"></script>
+    <script src="js_appointment_wizard.js"></script>
+    <style>
+        .tp-col::-webkit-scrollbar {
+            display: none;
+        }
+
+        .tp-item {
+            height: 42px;
+            line-height: 42px;
+            font-size: 18px;
+            font-weight: 600;
+            color: #94a3b8;
+            scroll-snap-align: center;
+            cursor: pointer;
+            transition: color .15s, font-size .15s;
+            user-select: none;
+        }
+
+        .tp-item.selected {
+            color: #0f172a;
+            font-size: 20px;
+        }
+    </style>
+    <script>
+        (function () {
+            var doctorLeaves = <?php echo $doctorLeavesJSON; ?>;
+            var fpDate, fpTime, fpEnd;
+
+            // â”€â”€ Date picker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            fpDate = flatpickr('#appointmentDate', {
+                minDate: 'today',
+                dateFormat: 'Y-m-d',
+                disableMobile: true,
+                onChange: function (sel, ds) {
+                    // Update end date min
+                    if (fpEnd) fpEnd.set('minDate', ds);
+                    checkDoctorLeave(ds);
+                    if (typeof loadAvailableSlots === 'function') {
+                        loadAvailableSlots();
+                    }
+                }
+            });
+
+            // â”€â”€ Custom Drum Time Picker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            (function () {
+                var hours = [], mins = [], ampm = ['AM', 'PM'];
+                for (var i = 1; i <= 12; i++) hours.push((i < 10 ? '0' : '') + i);
+                for (var i = 0; i < 60; i += 5) mins.push((i < 10 ? '0' : '') + i);
+
+                function buildCol(el, items, startIdx) {
+                    el.innerHTML = '';
+                    items.forEach(function (v) {
+                        var d = document.createElement('div');
+                        d.className = 'tp-item'; d.textContent = v;
+                        el.appendChild(d);
+                    });
+                    scrollToIdx(el, startIdx);
+                }
+
+                function scrollToIdx(el, idx) {
+                    el.scrollTop = idx * 42;
+                }
+
+                function getIdx(el) {
+                    return Math.round(el.scrollTop / 42);
+                }
+
+                function highlightAll() {
+                    [colH, colM, colA].forEach(function (col) {
+                        var idx = getIdx(col);
+                        Array.from(col.children).forEach(function (c, i) { c.classList.toggle('selected', i === idx); });
+                    });
+                }
+
+                var colH = document.getElementById('tpHours');
+                var colM = document.getElementById('tpMins');
+                var colA = document.getElementById('tpAmpm');
+                var pickerOpen = false;
+
+                buildCol(colH, hours, 7); // default 08
+                buildCol(colM, mins, 0);  // default :00
+                buildCol(colA, ampm, 0);  // default AM
+
+                [colH, colM, colA].forEach(function (col) {
+                    col.addEventListener('scroll', function () { clearTimeout(col._st); col._st = setTimeout(function () { var i = getIdx(col); scrollToIdx(col, i); highlightAll(); }, 80); });
+                });
+                highlightAll();
+
+                window.openTimePicker = function () {
+                    var dp = document.getElementById('timePickerDropdown');
+                    dp.style.display = pickerOpen ? 'none' : 'block';
+                    pickerOpen = !pickerOpen;
+                    highlightAll();
+                };
+                window.cancelTimePicker = function () {
+                    document.getElementById('timePickerDropdown').style.display = 'none';
+                    pickerOpen = false;
+                };
+                window.confirmTimePicker = function () {
+                    var h = hours[getIdx(colH)] || '08';
+                    var m = mins[getIdx(colM)] || '00';
+                    var a = ampm[getIdx(colA)] || 'AM';
+                    document.getElementById('appointmentTime').value = h + ':' + m + ' ' + a;
+                    document.getElementById('timePickerDropdown').style.display = 'none';
+                    pickerOpen = false;
+                };
+
+                // Close on outside click
+                document.addEventListener('click', function (e) {
+                    var dp = document.getElementById('timePickerDropdown');
+                    var inp = document.getElementById('appointmentTime');
+                    if (pickerOpen && !dp.contains(e.target) && e.target !== inp) {
+                        dp.style.display = 'none'; pickerOpen = false;
+                    }
+                });
+            })();
+
+            // â”€â”€ End date picker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            fpEnd = flatpickr('#endDateInput', {
+                minDate: 'today',
+                dateFormat: 'Y-m-d',
+                disableMobile: true
+            });
+
+            // â”€â”€ Doctor leave validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            function checkDoctorLeave(selectedDate) {
+                var sel = document.getElementById('doctorSelect');
+                var warn = document.getElementById('doctorLeaveWarn');
+                var warnMsg = document.getElementById('doctorLeaveMsg');
+                if (!sel) return;
+
+                // Reset all options
+                Array.from(sel.options).forEach(function (opt) {
+                    if (!opt.value) return;
+                    opt.disabled = false;
+                    opt.text = opt.text.replace(' (Unavailable this day)', '');
+                });
+
+                if (!selectedDate) { if (warn) warn.style.display = 'none'; return; }
+
+                var hasWarn = false;
+                Array.from(sel.options).forEach(function (opt) {
+                    if (!opt.value) return;
+                    var docId = opt.value;
+                    var leaves = doctorLeaves[docId] || [];
+                    if (leaves.indexOf(selectedDate) !== -1) {
+                        opt.disabled = true;
+                        opt.text += ' (Unavailable this day)';
+                        // If this doctor was selected, reset
+                        if (sel.value === docId) { sel.value = ''; }
+                        hasWarn = true;
+                    }
+                });
+
+                if (warn) {
+                    if (hasWarn) {
+                        warn.style.display = 'block';
+                        warnMsg.textContent = 'One or more doctors are on leave on this date and cannot be selected.';
+                    } else {
+                        warn.style.display = 'none';
+                    }
+                }
+            }
+
+            // Also run when doctor dropdown changes
+            var docSel = document.getElementById('doctorSelect');
+            if (docSel) {
+                docSel.addEventListener('change', function () {
+                    var dateVal = document.getElementById('appointmentDate').value;
+                    if (!dateVal) return;
+                    var docId = this.value;
+                    var warn = document.getElementById('doctorLeaveWarn');
+                    var warnMsg = document.getElementById('doctorLeaveMsg');
+                    var leaves = doctorLeaves[docId] || [];
+                    if (docId && leaves.indexOf(dateVal) !== -1) {
+                        this.value = '';
+                        if (warn) { warn.style.display = 'block'; warnMsg.textContent = 'This doctor is on leave on the selected date. Please choose another.'; }
+                    }
+                });
+            }
+
+            // â”€â”€ Submit guard: save signature + validate time â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            var form = document.getElementById('appointmentForm');
+            if (form) {
+                form.addEventListener('submit', function (e) {
+                    var c = document.getElementById('signatureCanvas');
+                    if (c) document.getElementById('signatureData').value = c.toDataURL('image/png');
+
+                    var dateVal = document.getElementById('appointmentDate').value;
+                    var timeVal = document.getElementById('appointmentTime').value;
+                    var today = new Date();
+                    var todayStr = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
+                    if (dateVal === todayStr && timeVal) {
+                        var nowTime = String(today.getHours()).padStart(2, '0') + ':' + String(today.getMinutes()).padStart(2, '0');
+                        if (timeVal < nowTime) {
+                            e.preventDefault();
+                            alert('You cannot book an appointment for a time that has already passed today.');
+                            return;
+                        }
+                    }
+
+                    // End date check
+                    var edInp = document.getElementById('endDateInput');
+                    if (edInp && edInp.hasAttribute('required') && edInp.value && edInp.value < dateVal) {
+                        e.preventDefault();
+                        alert('The Discharge/End Date cannot be earlier than the Start Date!');
+                    }
+                });
+            }
+        })();
+    </script>
+
+    <!-- FEEDBACK MODAL -->
+    <?php if ($pending_feedback): ?>
+        <div class="modal fade" id="autoFeedbackModal" data-bs-backdrop="static" tabindex="-1">
+            <div class="modal-dialog modal-dialog-centered">
+                <div class="modal-content feedback-modal-content">
+                    <div class="feedback-header text-center">
+                        <button type="button" class="btn-close position-absolute" data-bs-dismiss="modal"
+                            style="top:20px; right:20px;"></button>
+                        <div class="feedback-icon-bg">
+                            <i class="fa fa-comments text-primary" style="font-size:35px;"></i>
+                        </div>
+                        <h3 class="fw-bold text-dark mb-1">Submit Your Feedback</h3>
+                        <p class="text-muted small">We'd love to hear about your experience with
+                            <b><?php echo htmlspecialchars($pending_feedback['pet_name']); ?></b>'s
+                            <?php echo htmlspecialchars($pending_feedback['service_type']); ?>.</p>
+                    </div>
+                    <div class="feedback-body">
+                        <div class="feedback-stars mb-4 d-flex justify-content-center gap-2">
+                            <i class="fa fa-star star-item" data-value="1"></i>
+                            <i class="fa fa-star star-item" data-value="2"></i>
+                            <i class="fa fa-star star-item" data-value="3"></i>
+                            <i class="fa fa-star star-item" data-value="4"></i>
+                            <i class="fa fa-star star-item" data-value="5"></i>
+                        </div>
+
+                        <form id="feedbackForm">
+                            <input type="hidden" name="appointment_id" value="<?php echo $pending_feedback['id']; ?>">
+                            <input type="hidden" name="rating" id="feedbackRatingInput" value="0">
+                            <input type="hidden" name="submit_review" value="1">
+
+                            <div class="mb-3 text-start">
+                                <textarea name="comments" class="form-control feedback-textarea" rows="3"
+                                    placeholder="Your message (Optional)..."></textarea>
+                            </div>
+
+                            <button type="button" class="feedback-btn" onclick="submitFeedbackAjax()">
+                                <i class="fa fa-paper-plane me-2"></i> SEND FEEDBACK
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <script>
+            document.addEventListener('DOMContentLoaded', function () {
+                var fbModal = new bootstrap.Modal(document.getElementById('autoFeedbackModal'));
+                fbModal.show();
+
+                // Star Interaction
+                const stars = document.querySelectorAll('.star-item');
+                stars.forEach(s => {
+                    s.addEventListener('click', function () {
+                        const val = this.getAttribute('data-value');
+                        document.getElementById('feedbackRatingInput').value = val;
+                        stars.forEach(st => {
+                            if (st.getAttribute('data-value') <= val) st.classList.add('active');
+                            else st.classList.remove('active');
+                        });
+                    });
+                });
+            });
+
+            function submitFeedbackAjax() {
+                const rating = document.getElementById('feedbackRatingInput').value;
+                if (rating == "0") {
+                    alert("Please select a rating star first.");
+                    return;
+                }
+
+                const btn = document.querySelector('.feedback-btn');
+                const originalText = btn.innerHTML;
+                btn.innerHTML = '<i class="fa fa-spinner fa-spin me-2"></i> SENDING...';
+                btn.disabled = true;
+
+                const formData = new FormData(document.getElementById('feedbackForm'));
+                fetch('feedback.php', {
+                    method: 'POST',
+                    body: formData
+                })
+                    .then(() => {
+                        btn.innerHTML = '<i class="fa fa-check me-2"></i> THANK YOU!';
+                        btn.style.background = '#10b981';
+                        setTimeout(() => {
+                            bootstrap.Modal.getInstance(document.getElementById('autoFeedbackModal')).hide();
+                        }, 1500);
+                    })
+                    .catch(() => {
+                        alert("Something went wrong. Please try again.");
+                        btn.innerHTML = originalText;
+                        btn.disabled = false;
+                    });
+            }
+        </script>
+    <?php endif; ?>
+
+    <?php include("chat_widget.php"); ?>
+    <script src="mousetrail.js"></script>
+</body>
+
+</html>

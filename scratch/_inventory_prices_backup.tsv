@@ -1,0 +1,158 @@
+id	item_name	price_per_unit	cost_price	expiry_date	unit_of_measure	supplier
+1	vaccine	10.00	0.00	2027-02-02	piece	NULL
+3	Rabies Vaccine	265.00	0.00	2026-04-01	piece	NULL
+5	Dog Rabies vaccine	0.00	0.00	NULL	piece	NULL
+6	Dog DHPP/DAPP vaccine	0.00	0.00	NULL	piece	NULL
+7	Dog Bordetella vaccine	0.00	0.00	NULL	piece	NULL
+8	Dog Leptospirosis vaccine	0.00	0.00	NULL	piece	NULL
+9	Dog Canine Influenza vaccine	0.00	0.00	NULL	piece	NULL
+10	Dog Lyme disease vaccine	0.00	0.00	NULL	piece	NULL
+11	Cat Rabies vaccine	0.00	0.00	NULL	piece	NULL
+12	FVRCP vaccine	0.00	0.00	NULL	piece	NULL
+13	FeLV vaccine	0.00	0.00	NULL	piece	NULL
+14	Chlamydia vaccine	0.00	0.00	NULL	piece	NULL
+15	Pyrantel pamoate	0.00	0.00	NULL	piece	NULL
+16	Fenbendazole	0.00	0.00	NULL	piece	NULL
+17	Praziquantel	0.00	0.00	NULL	piece	NULL
+18	Albendazole	0.00	0.00	NULL	piece	NULL
+19	Febantel	0.00	0.00	NULL	piece	NULL
+20	Milbemycin oxime	0.00	0.00	NULL	piece	NULL
+21	Moxidectin	0.00	0.00	NULL	piece	NULL
+22	Emodepside	0.00	0.00	NULL	piece	NULL
+23	Ivermectin	0.00	0.00	NULL	piece	NULL
+24	Doramectin	0.00	0.00	NULL	piece	NULL
+25	Eprinomectin	0.00	0.00	NULL	piece	NULL
+26	Fipronil	0.00	0.00	NULL	piece	NULL
+27	Fluralaner	0.00	0.00	NULL	piece	NULL
+28	Afoxolaner	0.00	0.00	NULL	piece	NULL
+29	Sarolaner	0.00	0.00	NULL	piece	NULL
+30	Lotilaner	0.00	0.00	NULL	piece	NULL
+31	Selamectin	0.00	0.00	NULL	piece	NULL
+32	Imidacloprid	0.00	0.00	NULL	piece	NULL
+33	Permethrin	0.00	0.00	NULL	piece	NULL
+34	Amitraz	0.00	0.00	NULL	piece	NULL
+35	Lime sulfur dip	0.00	0.00	NULL	piece	NULL
+36	Amoxicillin	0.00	0.00	NULL	piece	NULL
+37	Amoxicillin-Clavulanate	0.00	0.00	NULL	piece	NULL
+38	Cephalexin	0.00	0.00	NULL	piece	NULL
+39	Cefovecin	0.00	0.00	NULL	piece	NULL
+40	Doxycycline	0.00	0.00	NULL	piece	NULL
+41	Enrofloxacin	0.00	0.00	NULL	piece	NULL
+42	Marbofloxacin	0.00	0.00	NULL	piece	NULL
+43	Clindamycin	0.00	0.00	NULL	piece	NULL
+44	Metronidazole	0.00	0.00	NULL	piece	NULL
+45	Trimethoprim-Sulfamethoxazole	0.00	0.00	NULL	piece	NULL
+46	Gentamicin	0.00	0.00	NULL	piece	NULL
+47	Carprofen	0.00	0.00	NULL	piece	NULL
+48	Meloxicam	0.00	0.00	NULL	piece	NULL
+49	Robenacoxib	0.00	0.00	NULL	piece	NULL
+50	Firocoxib	0.00	0.00	NULL	piece	NULL
+51	Grapiprant	0.00	0.00	NULL	piece	NULL
+52	Butorphanol	0.00	0.00	NULL	piece	NULL
+53	Buprenorphine	0.00	0.00	NULL	piece	NULL
+54	Tramadol	0.00	0.00	NULL	piece	NULL
+55	Dexamethasone	0.00	0.00	NULL	piece	NULL
+56	Prednisolone	0.00	0.00	NULL	piece	NULL
+57	Prednisone	0.00	0.00	NULL	piece	NULL
+58	Hydrocortisone	0.00	0.00	NULL	piece	NULL
+59	Triamcinolone	0.00	0.00	NULL	piece	NULL
+60	Diphenhydramine	0.00	0.00	NULL	piece	NULL
+61	Chlorpheniramine	0.00	0.00	NULL	piece	NULL
+62	Cetirizine	100.00	80.00	2026-10-21	piece	
+63	Apoquel	100.00	90.00	2026-10-23	piece	
+64	Lokivetmab injectable	0.00	0.00	NULL	piece	NULL
+65	Epinephrine	0.00	0.00	NULL	piece	NULL
+66	Atropine	0.00	0.00	NULL	piece	NULL
+67	Diazepam	0.00	0.00	NULL	piece	NULL
+68	Midazolam	0.00	0.00	NULL	piece	NULL
+69	Lidocaine	0.00	0.00	NULL	piece	NULL
+70	Dextrose 50%	0.00	0.00	NULL	piece	NULL
+71	Calcium gluconate	0.00	0.00	NULL	piece	NULL
+72	Naloxone	0.00	0.00	NULL	piece	NULL
+73	Yohimbine	0.00	0.00	NULL	piece	NULL
+74	Atipamezole	0.00	0.00	NULL	piece	NULL
+75	Activated charcoal	0.00	0.00	NULL	piece	NULL
+76	Ketamine	0.00	0.00	NULL	piece	NULL
+77	Propofol	0.00	0.00	NULL	piece	NULL
+78	Alfaxalone	0.00	0.00	NULL	piece	NULL
+79	Isoflurane	0.00	0.00	NULL	piece	NULL
+80	Sevoflurane	0.00	0.00	NULL	piece	NULL
+81	Xylazine	0.00	0.00	NULL	piece	NULL
+82	Dexmedetomidine	0.00	0.00	NULL	piece	NULL
+83	Medetomidine	0.00	0.00	NULL	piece	NULL
+84	Metoclopramide	0.00	0.00	NULL	piece	NULL
+85	Maropitant	0.00	0.00	NULL	piece	NULL
+86	Omeprazole	0.00	0.00	NULL	piece	NULL
+87	Famotidine	0.00	0.00	NULL	piece	NULL
+88	Sucralfate	0.00	0.00	NULL	piece	NULL
+89	Kaolin-Pectin	0.00	0.00	NULL	piece	NULL
+90	Probiotics	0.00	0.00	NULL	piece	NULL
+91	Psyllium fiber	0.00	0.00	NULL	piece	NULL
+92	Artificial tears	0.00	0.00	NULL	piece	NULL
+93	Tobramycin eye drops	0.00	0.00	NULL	piece	NULL
+94	Chloramphenicol eye drops	0.00	0.00	NULL	piece	NULL
+95	Ciprofloxacin eye drops	0.00	0.00	NULL	piece	NULL
+96	Atropine ophthalmic	0.00	0.00	NULL	piece	NULL
+97	Fluorescein stain strips	0.00	0.00	NULL	piece	NULL
+98	Ear cleaning solution	0.00	0.00	NULL	piece	NULL
+99	Gentamicin ear drops	0.00	0.00	NULL	piece	NULL
+100	Miconazole ear preparations	0.00	0.00	NULL	piece	NULL
+101	Otic antibiotic/steroid combinations	0.00	0.00	NULL	piece	NULL
+102	Ear mite treatment	0.00	0.00	NULL	piece	NULL
+103	Chlorhexidine shampoo	0.00	0.00	NULL	piece	NULL
+104	Benzoyl peroxide shampoo	0.00	0.00	NULL	piece	NULL
+105	Miconazole shampoo	0.00	0.00	NULL	piece	NULL
+106	Ketoconazole shampoo	0.00	0.00	NULL	piece	NULL
+107	Silver sulfadiazine cream	0.00	0.00	NULL	piece	NULL
+108	Mupirocin ointment	0.00	0.00	NULL	piece	NULL
+109	Triple antibiotic ointment	0.00	0.00	NULL	piece	NULL
+110	Lactated Ringer's Solution	0.00	0.00	NULL	piece	NULL
+111	Normal Saline (0.9%)	0.00	0.00	NULL	piece	NULL
+112	Dextrose solutions	0.00	0.00	NULL	piece	NULL
+113	Plasma-Lyte	0.00	0.00	NULL	piece	NULL
+114	Sterile Water	0.00	0.00	NULL	piece	NULL
+115	Vitamin B Complex	0.00	0.00	NULL	piece	NULL
+116	Vitamin C	0.00	0.00	NULL	piece	NULL
+117	Iron supplements	0.00	0.00	NULL	piece	NULL
+118	Calcium supplements	0.00	0.00	NULL	piece	NULL
+119	Joint supplements	0.00	0.00	NULL	piece	NULL
+120	Omega-3 supplements	0.00	0.00	NULL	piece	NULL
+121	Liver support supplements	0.00	0.00	NULL	piece	NULL
+122	Probiotics (supplement)	0.00	0.00	NULL	piece	NULL
+123	Oxytocin	0.00	0.00	NULL	piece	NULL
+124	Cabergoline	0.00	0.00	NULL	piece	NULL
+125	Cloprostenol	0.00	0.00	NULL	piece	NULL
+126	Calcium borogluconate	0.00	0.00	NULL	piece	NULL
+127	Pregnancy test kits	0.00	0.00	NULL	piece	NULL
+128	Blood glucose test strips	0.00	0.00	NULL	piece	NULL
+129	Urine dipsticks	0.00	0.00	NULL	piece	NULL
+130	Fecal flotation solution	0.00	0.00	NULL	piece	NULL
+131	Heartworm test kits	0.00	0.00	NULL	piece	NULL
+132	FeLV/FIV rapid test kits	0.00	0.00	NULL	piece	NULL
+133	Parvovirus rapid test kits	0.00	0.00	NULL	piece	NULL
+134	Povidone-iodine	0.00	0.00	NULL	piece	NULL
+135	Chlorhexidine solution	0.00	0.00	NULL	piece	NULL
+136	Hydrogen peroxide	0.00	0.00	NULL	piece	NULL
+137	Sterile saline	0.00	0.00	NULL	piece	NULL
+138	Alcohol	0.00	0.00	NULL	piece	NULL
+139	Gauze	0.00	0.00	NULL	piece	NULL
+140	Cotton	0.00	0.00	NULL	piece	NULL
+141	Bandages	0.00	0.00	NULL	piece	NULL
+142	Elastic wraps	0.00	0.00	NULL	piece	NULL
+143	Surgical tape	0.00	0.00	NULL	piece	NULL
+144	Hemostatic powder	0.00	0.00	NULL	piece	NULL
+145	1 mL syringes	0.00	0.00	NULL	piece	NULL
+146	3 mL syringes	0.00	0.00	NULL	piece	NULL
+147	5 mL syringes	0.00	0.00	NULL	piece	NULL
+148	10 mL syringes	0.00	0.00	NULL	piece	NULL
+149	20 mL syringes	0.00	0.00	NULL	piece	NULL
+150	50-60 mL syringes	0.00	0.00	NULL	piece	NULL
+151	Needles 18G-27G	0.00	0.00	NULL	piece	NULL
+152	IV catheters	0.00	0.00	NULL	piece	NULL
+153	Butterfly needles	0.00	0.00	NULL	piece	NULL
+154	Blood collection tubes	0.00	0.00	NULL	piece	NULL
+155	IV giving sets	0.00	0.00	NULL	piece	NULL
+156	Gloves	0.00	0.00	NULL	piece	NULL
+157	Face masks	0.00	0.00	NULL	piece	NULL
+158	50?60 mL syringes	0.00	0.00	NULL	piece	NULL
+159	Needles 18G?27G	0.00	0.00	NULL	piece	NULL

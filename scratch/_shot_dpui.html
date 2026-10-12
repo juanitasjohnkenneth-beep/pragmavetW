@@ -1,0 +1,1115 @@
+
+Notice: session_start(): Ignoring session_start() because a session is already active in C:\xampp\htdocs\pragmavet\doctor_patients.php on line 2
+<!DOCTYPE html>
+<html lang="en">
+<head><base href="http://localhost/pragmavet/"><style>#pragmaReminderModal{display:none!important}</style>
+    <script src="theme.js?v=1791720408"></script>
+    <link rel="stylesheet" href="theme.css?v=1791720408">
+    <title>Patient EMR Directory | Doctor Workstation</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link href="https://cdn.datatables.net/1.13.7/css/dataTables.bootstrap5.min.css" rel="stylesheet">
+
+    <style>
+        :root {
+            --primary: #2563eb;
+            --secondary: #475569;
+            --dark: #0f172a;
+            --light-bg: #f8fafc;
+            --sidebar-width: 260px;
+        }
+
+        body {
+            background: #f8fafc !important;
+            font-family: 'Inter', sans-serif;
+            color: #334155;
+            overflow-x: hidden;
+        }
+
+        .main-content {
+            margin-left: 260px !important;
+            width: calc(100% - 260px) !important;
+            max-width: calc(100% - 260px) !important;
+            padding: 24px 28px !important;
+            min-height: 100vh;
+            box-sizing: border-box !important;
+        }
+
+        @media (max-width: 1200px) {
+            .main-content { padding: 20px 20px !important; }
+        }
+
+        @media (max-width: 768px) {
+            .main-content { margin-left: 0 !important; width: 100% !important; max-width: 100% !important; padding: 16px !important; }
+            .sidebar { position: relative !important; width: 100% !important; height: auto !important; }
+        }
+
+        /* ── EMR Lookup: PragmaVet blue ── */
+        .ep-eyebrow { display:inline-flex; align-items:center; gap:6px; background:#eff6ff; color:#2563eb; font-size:11px; font-weight:800; letter-spacing:.4px; text-transform:uppercase; padding:4px 12px; border-radius:99px; margin-bottom:8px; }
+        .ep-chip { display:inline-flex; align-items:center; gap:7px; background:#fff; border:1px solid #e8edf3; border-radius:99px; padding:8px 14px; font-size:13px; color:#475569; box-shadow:0 2px 8px rgba(15,23,42,.04); }
+        .ep-chip b { color:#0f172a; }
+        .ep-chip-green { background:#f0fdf4; border-color:#bbf7d0; color:#15803d; } .ep-chip-green b { color:#15803d; }
+        .ep-card { border:1px solid #e8edf3 !important; border-radius:18px !important; box-shadow:0 2px 12px rgba(15,23,42,.04) !important; padding:8px 20px 18px !important; }
+        #petsTable { border-collapse:separate; border-spacing:0; }
+        #petsTable thead th { background:#fff !important; color:#94a3b8 !important; font-size:11px !important; font-weight:800 !important; letter-spacing:.06em; text-transform:uppercase; border-bottom:1px solid #eef2f6 !important; padding:14px 12px !important; }
+        #petsTable tbody td { padding:12px !important; border-bottom:1px solid #f1f5f9; }
+        #petsTable tbody tr:last-child td { border-bottom:0; }
+        #petsTable tbody tr:hover td { background:#f8fbff; }
+        table.dataTable thead > tr > th.sorting:before, table.dataTable thead > tr > th.sorting:after,
+        table.dataTable thead > tr > th.sorting_asc:before, table.dataTable thead > tr > th.sorting_asc:after,
+        table.dataTable thead > tr > th.sorting_desc:before, table.dataTable thead > tr > th.sorting_desc:after { font-size:9px; opacity:.25; }
+        table.dataTable thead > tr > th.sorting_asc:before, table.dataTable thead > tr > th.sorting_desc:after { opacity:.9; color:#2563eb; }
+        .ep-av { width:40px; height:40px; border-radius:12px; background:linear-gradient(135deg,#dbeafe,#bfdbfe); color:#1d4ed8; font-weight:800; display:inline-flex; align-items:center; justify-content:center; flex-shrink:0; object-fit:cover; }
+        .ep-id { font-family:ui-monospace,Consolas,monospace; font-size:11px; color:#94a3b8; }
+        .ep-species { display:inline-block; background:#eff6ff; color:#1d4ed8; border:1px solid #dbeafe; border-radius:99px; padding:2px 10px; font-size:11.5px; font-weight:700; }
+        .ep-recs { display:inline-flex; align-items:center; background:#f8fafc; color:#94a3b8; border:1px solid #e2e8f0; border-radius:99px; padding:4px 12px; font-size:12px; font-weight:700; }
+        .ep-recs-has { background:#eff6ff; color:#2563eb; border-color:#bfdbfe; }
+        .ep-view, .ep-start { background-image:none !important; border-radius:10px !important; padding:7px 14px !important; font-weight:700 !important; font-size:13px !important; white-space:nowrap; }
+        .ep-view { background:#fff !important; color:#2563eb !important; border:1px solid #bfdbfe !important; box-shadow:none !important; }
+        .ep-view:hover { background:#eff6ff !important; color:#1d4ed8 !important; }
+        .ep-start { background:#2563eb !important; color:#fff !important; border:0 !important; box-shadow:0 4px 12px rgba(37,99,235,.22) !important; }
+        .ep-start:hover { background:#1d4ed8 !important; color:#fff !important; }
+        .dataTables_info { color:#64748b !important; font-size:13px; padding-top:16px !important; }
+        .dataTables_paginate { padding-top:12px !important; }
+        .dataTables_paginate .pagination { gap:4px; }
+        .dataTables_paginate .page-link { border:1px solid #e2e8f0 !important; border-radius:10px !important; color:#475569 !important; font-weight:600; font-size:13px; min-width:36px; text-align:center; box-shadow:none !important; }
+        .dataTables_paginate .page-item.active .page-link { background:#2563eb !important; border-color:#2563eb !important; color:#fff !important; }
+        .dataTables_paginate .page-item.disabled .page-link { color:#cbd5e1 !important; background:#fff !important; }
+        .ep-mhead { background:linear-gradient(135deg,#1d4ed8,#2563eb 60%,#3b82f6); color:#fff; padding:18px 24px; }
+        .ep-mhead h5 { color:#fff !important; -webkit-text-fill-color:#fff; }
+        .ep-mhead .btn-close { filter:invert(1) grayscale(1) brightness(2); }
+        #emrModal .modal-content { overflow:hidden; }
+        #emrModal .btn-primary { background:#2563eb !important; background-image:none !important; border:0 !important; color:#fff !important; box-shadow:0 4px 12px rgba(37,99,235,.22) !important; }
+        #emrModal .btn-primary:hover { background:#1d4ed8 !important; }
+        #emrModal .btn-light { background:#f1f5f9 !important; background-image:none !important; border:0 !important; color:#475569 !important; box-shadow:none !important; }
+        #emrModal .btn-outline-primary { background:#fff !important; background-image:none !important; color:#2563eb !important; border:1px solid #bfdbfe !important; box-shadow:none !important; }
+        #emrModal .nav-pills { background:#f1f5f9; padding:5px; border-radius:14px; gap:4px !important; }
+        #emrModal .nav-pills .nav-link { background:transparent !important; background-image:none !important; color:#475569 !important; border:0 !important; border-radius:10px !important; box-shadow:none !important; opacity:1 !important; }
+        #emrModal .nav-pills .nav-link:hover { color:#1d4ed8 !important; }
+        #emrModal .nav-pills .nav-link.active { background:#fff !important; color:#1d4ed8 !important; box-shadow:0 2px 8px rgba(15,23,42,.08) !important; }
+        #emrModal .nav-pills .nav-link .badge { background:#dbeafe !important; color:#1d4ed8 !important; }
+        .ep-summary { background:linear-gradient(135deg,#eff6ff,#f8fbff); border:1px solid #dbeafe; border-radius:14px; }
+        .custom-card {
+            background: white;
+            border: none;
+            border-radius: 16px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.04);
+            padding: 24px;
+        }
+
+        .search-input-group {
+            background: white;
+            border: 1px solid #e2e8f0;
+            border-radius: 50px;
+            padding: 2px 15px;
+            display: flex;
+            align-items: center;
+            width: 300px;
+            transition: 0.3s;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.02);
+        }
+
+        .search-input-group:focus-within {
+            border-color: #2563eb;
+            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.12);
+            width: 340px;
+        }
+
+        .search-input-group i { color: #94a3b8; font-size: 14px; flex-shrink: 0; }
+        .search-input-group:focus-within i { color: #2563eb; }
+        /* the global form styles add their own border, background and shadow to inputs; keep this one flat inside the pill */
+        .search-input-group input,
+        .search-input-group input:focus {
+            border: none !important;
+            background: transparent !important;
+            box-shadow: none !important;
+            border-radius: 0 !important;
+            padding: 9px 10px !important;
+            height: auto !important;
+            min-height: 0 !important;
+            margin: 0 !important;
+            font-size: 13.5px;
+            font-weight: 500;
+            color: #0f172a;
+            width: 100%;
+            outline: none !important;
+        }
+        .search-input-group input::placeholder { color: #94a3b8; }
+        @media (max-width: 768px) { .search-input-group, .search-input-group:focus-within { width: 100%; } }
+
+        /* ====== WHITE SIDEBAR THEME ====== */
+        .sidebar {
+            background: #ffffff !important;
+            width: var(--sidebar-width, 260px) !important;
+            height: 100vh !important;
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            padding: 28px 20px 24px !important;
+            z-index: 1000 !important;
+            display: flex !important;
+            flex-direction: column !important;
+            border-right: 1px solid #eef2f6 !important;
+            box-shadow: none !important;
+            overflow-y: auto !important;
+        }
+
+        .sidebar-brand {
+            display: flex !important;
+            align-items: center !important;
+            gap: 12px !important;
+            margin-bottom: 24px !important;
+            padding: 0 4px !important;
+            text-decoration: none !important;
+        }
+
+        .sidebar-brand-icon {
+            width: 44px !important;
+            height: 44px !important;
+            min-width: 44px !important;
+            border-radius: 13px !important;
+            background: #2563eb !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            color: #ffffff !important;
+            font-size: 20px !important;
+            flex-shrink: 0 !important;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+        }
+
+        .sidebar-brand span {
+            font-weight: 800 !important;
+            color: #182032 !important;
+            font-size: 22px !important;
+            letter-spacing: -0.4px !important;
+        }
+
+        .sidebar-user {
+            margin-bottom: 24px !important;
+            padding: 15px 18px !important;
+            border-radius: 14px !important;
+            background: #f8fafc !important;
+            border: 1px solid #eef2f6 !important;
+        }
+
+        .sidebar-user .welcome {
+            font-size: 13px !important;
+            color: #64748b !important;
+            font-weight: 500 !important;
+            line-height: 1.3 !important;
+        }
+
+        .sidebar-user .uname {
+            font-weight: 700 !important;
+            color: #0f172a !important;
+            font-size: 15.5px !important;
+            margin-top: 3px !important;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+        }
+
+        .sidebar a {
+            display: flex !important;
+            align-items: center !important;
+            gap: 14px !important;
+            padding: 12px 16px !important;
+            border-radius: 12px !important;
+            color: #334155 !important;
+            text-decoration: none !important;
+            margin-bottom: 4px !important;
+            font-weight: 600 !important;
+            font-size: 14.5px !important;
+            transition: all 0.2s ease !important;
+            letter-spacing: -0.1px !important;
+        }
+
+        .sidebar a i {
+            width: 22px !important;
+            text-align: center !important;
+            font-size: 16px !important;
+            color: #64748b !important;
+            transition: color 0.2s !important;
+            flex-shrink: 0 !important;
+        }
+
+        .sidebar a:hover {
+            background: #f8fafc !important;
+            color: #0f172a !important;
+        }
+
+        .sidebar a:hover i {
+            color: #2563eb !important;
+        }
+
+        .sidebar a.active {
+            background: #2563eb !important;
+            color: #ffffff !important;
+            font-weight: 700 !important;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+        }
+
+        .sidebar a.active i {
+            color: #ffffff !important;
+        }
+
+        .sidebar .sidebar-logout {
+            margin-top: auto !important;
+            padding-top: 20px !important;
+            border-top: 1px solid #f1f5f9 !important;
+        }
+
+        .sidebar .sidebar-logout a {
+            color: #dc2626 !important;
+            font-weight: 600 !important;
+            margin-bottom: 0 !important;
+        }
+
+        .sidebar .sidebar-logout a i {
+            color: #dc2626 !important;
+        }
+
+        .sidebar .sidebar-logout a:hover {
+            background: #fef2f2 !important;
+            color: #b91c1c !important;
+        }
+
+        .sidebar::-webkit-scrollbar { width: 5px; }
+        .sidebar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.06); border-radius: 10px; }
+        .sidebar::-webkit-scrollbar-track { background: transparent; }
+    </style>
+    <link rel="stylesheet" href="assets/pragmavet.css">
+    <link href="assets/global-style.css" rel="stylesheet">
+</head>
+<body>
+
+<div class="sidebar">
+    <div class="sidebar-brand">
+        <div class="sidebar-brand-icon"><i class="fa fa-user-md"></i></div>
+        <span>PragmaVet</span>
+    </div>
+    <div class="sidebar-user">
+        <div class="welcome">Welcome Doctor,</div>
+        <div class="uname">Test User</div>
+    </div>
+    <a href="doctor.php" class=""><i class="fa fa-calendar-check"></i> <span>Schedule & Availability</span></a>
+    <a href="doctor_consultations.php" class=""><i class="fa fa-stethoscope"></i> <span>Active Consultations</span></a>
+    <a href="doctor_patients.php" class="active"><i class="fa fa-paw"></i> <span>Patient EMR Lookup</span></a>
+    <a href="doctor_inventory.php" class=""><i class="fa fa-boxes"></i> <span>Pharmacy Stock</span></a>
+        <a href="admin_certificates.php" class=""><i class="fa fa-file-contract"></i> <span>Cert Requests</span><span style="margin-left:auto;background:#ef4444;color:#fff;font-size:11px;font-weight:800;min-width:22px;height:22px;border-radius:999px;display:inline-flex;align-items:center;justify-content:center;padding:0 7px;">1</span></a>
+    <div class="sidebar-logout">
+        <a href="logout.php"><i class="fa fa-sign-out-alt"></i> <span>Logout</span></a>
+    </div>
+</div>
+
+<style>.pv-nav-btn, .pv-nav-backdrop { display: none; }</style>
+<link rel="stylesheet" href="assets/pv-responsive.css?v=7" media="(max-width: 991.98px)">
+<script src="assets/pv-responsive.js?v=7" async></script>
+<button type="button" class="sbell-fab" id="sbellLink" onclick="sbellToggle(event)" title="Notifications" aria-label="Notifications">
+    <i class="fa fa-bell"></i>
+    <span class="sbell-count" id="sbellBadge" style="display:none;">0</span>
+</button>
+
+<div class="sbell-backdrop" id="sbellBackdrop" onclick="sbellClose()"></div>
+<aside class="sbell-panel" id="sbellPanel" aria-label="Notifications">
+    <div class="sbell-head">
+        <div><h6>Notifications</h6><div class="sbell-sub" id="sbellSub">Loading…</div></div>
+        <div class="d-flex gap-2 align-items-center">
+            <button type="button" class="sbell-mark" onclick="sbellMarkAll()" title="Mark all as read"><i class="fa fa-check-double me-1"></i>Mark all read</button>
+            <button type="button" class="sbell-x" onclick="sbellClose()" title="Close"><i class="fa fa-xmark"></i></button>
+        </div>
+    </div>
+    <div class="sbell-list" id="sbellList"></div>
+</aside>
+
+<style>
+    /* Floating bell — top-right of the screen */
+    .sbell-fab { position:fixed; top:22px; right:26px; z-index:2010; width:48px; height:48px; border-radius:50%; border:1px solid #e2e8f0; background:#fff !important; color:#334155 !important;
+                 display:flex; align-items:center; justify-content:center; font-size:19px; box-shadow:0 8px 24px rgba(15,23,42,.12) !important; cursor:pointer; transition:transform .15s, box-shadow .15s, color .15s; padding:0; }
+    .sbell-fab:hover { transform:translateY(-2px); color:#2563eb !important; box-shadow:0 12px 28px rgba(37,99,235,.2) !important; }
+    .sbell-fab.active { background:#2563eb !important; color:#fff !important; border-color:#2563eb; }
+    .sbell-fab.ring i { animation:sbellRing 1s ease 2; transform-origin:50% 0; }
+    @keyframes sbellRing { 0%,100%{transform:rotate(0)} 20%{transform:rotate(16deg)} 40%{transform:rotate(-14deg)} 60%{transform:rotate(9deg)} 80%{transform:rotate(-5deg)} }
+    .sbell-count { position:absolute; top:-4px; right:-4px; min-width:21px; height:21px; border-radius:999px; background:#ef4444; color:#fff; font-size:11px; font-weight:800; display:flex; align-items:center; justify-content:center; padding:0 6px; border:2px solid #fff; }
+    /* keep page headers clear of the bell */
+    .main-wrapper > .top-action-bar, .main-wrapper > .d-flex:first-child { padding-right:70px; }
+    /* Vet pages: the bell sits in the page header next to the other buttons, so it never covers them */
+    .sbell-fab.sbell-inline { position:relative; top:auto; right:auto; margin-left:4px; flex-shrink:0; }
+    .main-wrapper:not(:has(> .top-action-bar)):not(:has(> .d-flex:first-child)) { padding-top:84px; }
+    .sbell-backdrop { position:fixed; inset:0; background:rgba(15,23,42,.18); z-index:1990; opacity:0; pointer-events:none; transition:opacity .2s; }
+    .sbell-backdrop.open { opacity:1; pointer-events:auto; }
+    .sbell-panel { position:fixed; top:80px; right:26px; width:390px; max-width:calc(100vw - 32px); max-height:calc(100vh - 100px); background:#fff; z-index:2000; border-radius:18px; border:1px solid #e8edf3;
+                   box-shadow:0 20px 50px rgba(15,23,42,.18); transform:translateY(-8px) scale(.98); transform-origin:top right; opacity:0; pointer-events:none; transition:transform .2s ease, opacity .2s ease; display:flex; flex-direction:column; overflow:hidden; }
+    .sbell-panel.open { transform:none; opacity:1; pointer-events:auto; }
+    .sbell-head { padding:20px 18px 14px; border-bottom:1px solid #f1f5f9; display:flex; justify-content:space-between; align-items:flex-start; gap:10px; }
+    .sbell-head h6 { font-weight:800; font-size:17px; color:#0f172a; margin:0; }
+    .sbell-sub { font-size:12px; color:#64748b; margin-top:2px; }
+    .sbell-mark { border:none; background:#eff6ff !important; color:#2563eb !important; font-size:12px; font-weight:700; border-radius:999px; padding:6px 11px; box-shadow:none !important; white-space:nowrap; }
+    .sbell-x { border:none; background:#f1f5f9 !important; color:#64748b !important; width:30px; height:30px; border-radius:50%; display:flex; align-items:center; justify-content:center; padding:0; box-shadow:none !important; }
+    .sbell-list { flex:1; overflow-y:auto; padding:8px; }
+    .sbell-item { display:flex; gap:11px; padding:12px; border-radius:14px; cursor:pointer; transition:background .15s; position:relative; }
+    .sbell-item:hover { background:#f8fafc; }
+    .sbell-item.unread { background:#f5f9ff; }
+    .sbell-item.unread::after { content:''; position:absolute; top:16px; right:12px; width:8px; height:8px; border-radius:50%; background:#2563eb; }
+    .sbell-ic { width:36px; height:36px; border-radius:11px; display:flex; align-items:center; justify-content:center; flex-shrink:0; font-size:14px; }
+    .sbell-msg { font-size:13px; color:#334155; line-height:1.4; padding-right:14px; }
+    .sbell-item.unread .sbell-msg { color:#0f172a; font-weight:600; }
+    .sbell-time { font-size:11.5px; color:#94a3b8; margin-top:3px; }
+    .sbell-empty { text-align:center; color:#94a3b8; padding:50px 20px; font-size:13px; }
+    .sbell-empty i { font-size:34px; opacity:.35; display:block; margin-bottom:10px; }
+    @media (max-width: 768px) { .sbell-fab { top:12px; right:12px; } .sbell-panel { top:70px; right:8px; left:8px; width:auto; } }
+</style>
+<script>
+(function () {
+    var open = false, data = [];
+    function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+    function plain(html) { var d = document.createElement('div'); d.innerHTML = html || ''; return d.textContent || ''; }
+    function ago(ts) {
+        var d = new Date(String(ts).replace(' ', 'T')), s = (Date.now() - d.getTime()) / 1000;
+        if (isNaN(s)) return '';
+        if (s < 60) return 'Just now';
+        if (s < 3600) return Math.floor(s / 60) + ' min ago';
+        if (s < 86400) return Math.floor(s / 3600) + ' h ago';
+        if (s < 172800) return 'Yesterday';
+        return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    }
+    function kind(t) {
+        t = t.toLowerCase();
+        if (t.indexOf('boarding') > -1) return ['fa-hotel', '#0891b2'];
+        if (t.indexOf('declined') > -1 || t.indexOf('cancel') > -1) return ['fa-circle-xmark', '#dc2626'];
+        if (t.indexOf('paid') > -1 || t.indexOf('fee') > -1) return ['fa-coins', '#16a34a'];
+        if (t.indexOf('stock') > -1 || t.indexOf('report') > -1) return ['fa-boxes-stacked', '#ea580c'];
+        if (t.indexOf('accepted') > -1) return ['fa-circle-check', '#16a34a'];
+        if (t.indexOf('new appointment') > -1 || t.indexOf('reschedule') > -1) return ['fa-calendar-plus', '#2563eb'];
+        return ['fa-bell', '#7c3aed'];
+    }
+    function setBadge(n) {
+        var b = document.getElementById('sbellBadge'); b.textContent = n; b.style.display = n > 0 ? '' : 'none';
+        document.getElementById('sbellSub').textContent = n > 0 ? n + ' unread' : 'You’re all caught up';
+    }
+    function render() {
+        var box = document.getElementById('sbellList');
+        if (!data.length) { box.innerHTML = '<div class="sbell-empty"><i class="fa fa-bell-slash"></i>No notifications yet.</div>'; return; }
+        box.innerHTML = data.map(function (n, i) {
+            var t = plain(n.message), k = kind(t);
+            return '<div class="sbell-item' + (n.is_read == 0 ? ' unread' : '') + '" data-i="' + i + '">'
+                 + '<div class="sbell-ic" style="background:' + k[1] + '14;color:' + k[1] + ';"><i class="fa ' + k[0] + '"></i></div>'
+                 + '<div><div class="sbell-msg">' + esc(t) + '</div><div class="sbell-time">' + ago(n.created_at) + '</div></div></div>';
+        }).join('');
+        box.querySelectorAll('.sbell-item').forEach(function (el) {
+            el.onclick = function () {
+                var n = data[+el.dataset.i];
+                fetch('api_notifications.php?action=mark_one&id=' + encodeURIComponent(n.id)).finally(function () {
+                    if (n.link) location.href = n.link; else { n.is_read = 1; render(); load(); }
+                });
+            };
+        });
+    }
+    function load() {
+        return fetch('api_notifications.php?action=fetch').then(function (r) { return r.json(); }).then(function (d) {
+            if (!d || !d.notifications) return;
+            var u = parseInt(d.unread_count, 10) || 0, b = document.getElementById('sbellLink');
+            if (window._sbellLast !== undefined && u > window._sbellLast) { b.classList.remove('ring'); void b.offsetWidth; b.classList.add('ring'); }
+            window._sbellLast = u;
+            data = d.notifications; setBadge(u);
+            if (open) render();
+        }).catch(function () {});
+    }
+    window.sbellToggle = function (e) { e.preventDefault(); open ? sbellClose() : sbellOpen(); };
+    window.sbellOpen = function () {
+        open = true; render();
+        document.getElementById('sbellPanel').classList.add('open');
+        document.getElementById('sbellBackdrop').classList.add('open');
+        document.getElementById('sbellLink').classList.add('active');
+        load();
+    };
+    window.sbellClose = function () {
+        open = false;
+        document.getElementById('sbellPanel').classList.remove('open');
+        document.getElementById('sbellBackdrop').classList.remove('open');
+        document.getElementById('sbellLink').classList.remove('active');
+    };
+    window.sbellMarkAll = function () {
+        fetch('api_notifications.php?action=mark_read').finally(function () { data.forEach(function (n) { n.is_read = 1; }); setBadge(0); render(); });
+    };
+    // Vet pages (.main-content header): move the bell into the header, after its buttons / search box
+    document.addEventListener('DOMContentLoaded', function () {
+        var hdr = document.querySelector('.main-content > .d-flex:first-child'), fab = document.getElementById('sbellLink');
+        if (!hdr || !fab || hdr.children.length < 2) return;
+        var last = hdr.lastElementChild, wrap = document.createElement('div');
+        wrap.className = 'd-flex align-items-center gap-2';
+        hdr.replaceChild(wrap, last);
+        wrap.appendChild(last);
+        wrap.appendChild(fab);
+        fab.classList.add('sbell-inline');
+    });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && open) sbellClose(); });
+    load();
+    setInterval(load, 30000);
+})();
+</script>
+<div class="main-content">
+        <div class="d-flex justify-content-between align-items-end flex-wrap gap-3 mb-3">
+        <div>
+            <span class="ep-eyebrow"><i class="fa fa-stethoscope"></i> Doctor Workstation</span>
+            <h2 class="fw-bold m-0 text-dark">Patient EMR Lookup</h2>
+            <p class="text-muted mb-0">Find a registered pet to see its medical records, vaccinations and health profile.</p>
+        </div>
+        <div class="search-input-group">
+            <i class="fa fa-search"></i>
+            <input type="text" id="customSearch" placeholder="Search Pet Name or Owner...">
+        </div>
+    </div>
+
+    <div class="d-flex gap-2 flex-wrap mb-3">
+        <span class="ep-chip"><i class="fa fa-paw" style="color:#2563eb;"></i> <b>12</b> registered pets</span>
+        <span class="ep-chip ep-chip-green" id="epChipIn" style="display:none;"><i class="fa fa-user-clock"></i> <b>0</b> checked in with you</span>
+        <span class="ep-chip" id="epChipRec"><i class="fa fa-file-medical" style="color:#16a34a;"></i> <b>0</b> with medical records</span>
+    </div>
+
+    <div class="custom-card ep-card">
+                <div class="table-responsive">
+            <table id="petsTable" class="table table-borderless align-middle mb-0">
+                <thead>
+                    <tr>
+                        <th>Pet</th>
+                        <th>Species & Breed</th>
+                        <th>Age & Weight</th>
+                        <th>Owner</th>
+                        <th>Medical Records</th>
+                        <th class="text-end">Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                                                            <tr>
+                        <td data-order="asher">
+                            <div class="d-flex align-items-center gap-2">
+                                                                <span class="ep-av">A</span>
+                                                                <div><div class="fw-bold text-dark">Asher</div>
+                                <span class="ep-id">#00008</span></div>
+                            </div>
+                        </td>
+                        <td>
+                                                        <span class="ep-species">Dog</span>
+                            <div class="small text-muted mt-1">Pomeranian</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">1 yr</div>
+                            <div class="small text-muted">5.5 kg</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">Chaw</div>
+                            <div class="small text-muted"><i class="fa fa-phone me-1" style="font-size:11px;opacity:.6;"></i>No contact number</div>
+                        </td>
+                        <td>
+                            <span class="ep-recs">
+                                <i class="fa fa-file-medical me-1"></i>0 records                            </span>
+                        </td>
+                        <td class="text-end">
+                                                        <button class="btn btn-sm ep-view" onclick='openEmrModal({&quot;id&quot;:&quot;8&quot;,&quot;name&quot;:&quot;Asher&quot;,&quot;species&quot;:&quot;Dog&quot;,&quot;breed&quot;:&quot;Pomeranian&quot;,&quot;age&quot;:&quot;1&quot;,&quot;weight&quot;:&quot;5.5&quot;,&quot;owner_name&quot;:&quot;Chaw&quot;,&quot;owner_contact&quot;:&quot;N\/A&quot;,&quot;owner_email&quot;:&quot;jpjikan@kld.edu.ph&quot;,&quot;medical_history&quot;:&quot;&quot;,&quot;gender&quot;:&quot;&quot;,&quot;gender_label&quot;:&quot;Not recorded&quot;,&quot;date_of_birth&quot;:&quot;&quot;,&quot;raw_species&quot;:&quot;Dog&quot;,&quot;raw_breed&quot;:&quot;Pomeranian&quot;,&quot;raw_age&quot;:&quot;1&quot;,&quot;raw_weight&quot;:&quot;5.5&quot;,&quot;history_records&quot;:[],&quot;vaccinations&quot;:[{&quot;id&quot;:&quot;3&quot;,&quot;pet_id&quot;:&quot;8&quot;,&quot;vaccine_name&quot;:&quot;General Vaccination&quot;,&quot;date_given&quot;:&quot;2026-03-02&quot;,&quot;next_due&quot;:&quot;2026-05-02&quot;,&quot;batch_number&quot;:null,&quot;administered_by&quot;:&quot;Not clinic-verified&quot;,&quot;status&quot;:&quot;Overdue&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 14:29:29&quot;}],&quot;open_visit&quot;:null})'>
+                                <i class="fa fa-folder-open me-1"></i> View EMR
+                            </button>
+                                                    </td>
+                    </tr>
+                                                            <tr>
+                        <td data-order="buddy">
+                            <div class="d-flex align-items-center gap-2">
+                                                                <span class="ep-av">B</span>
+                                                                <div><div class="fw-bold text-dark">buddy</div>
+                                <span class="ep-id">#00011</span></div>
+                            </div>
+                        </td>
+                        <td>
+                                                        <span class="ep-species">Not recorded</span>
+                            <div class="small text-muted mt-1">Breed not recorded</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark"><span class="text-muted fw-normal">Age not recorded</span></div>
+                            <div class="small text-muted">Weight not recorded</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">Adada</div>
+                            <div class="small text-muted"><i class="fa fa-phone me-1" style="font-size:11px;opacity:.6;"></i>091231231</div>
+                        </td>
+                        <td>
+                            <span class="ep-recs ep-recs-has">
+                                <i class="fa fa-file-medical me-1"></i>1 record                            </span>
+                        </td>
+                        <td class="text-end">
+                                                        <button class="btn btn-sm ep-view" onclick='openEmrModal({&quot;id&quot;:&quot;11&quot;,&quot;name&quot;:&quot;buddy&quot;,&quot;species&quot;:&quot;&quot;,&quot;breed&quot;:&quot;&quot;,&quot;age&quot;:&quot;0&quot;,&quot;weight&quot;:0,&quot;owner_name&quot;:&quot;adada&quot;,&quot;owner_contact&quot;:&quot;091231231&quot;,&quot;owner_email&quot;:&quot;nethjuanitas18@gmail.com&quot;,&quot;medical_history&quot;:&quot;&quot;,&quot;gender&quot;:&quot;&quot;,&quot;gender_label&quot;:&quot;Not recorded&quot;,&quot;date_of_birth&quot;:&quot;&quot;,&quot;raw_species&quot;:&quot;&quot;,&quot;raw_breed&quot;:&quot;&quot;,&quot;raw_age&quot;:&quot;0&quot;,&quot;raw_weight&quot;:null,&quot;history_records&quot;:[{&quot;record_date&quot;:&quot;2026-04-29&quot;,&quot;record_type&quot;:&quot;visit&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;title&quot;:&quot;General Checkup&quot;,&quot;doctor_name&quot;:&quot;Dr. kwak&quot;,&quot;description&quot;:&quot;diagnpsewith ratartoui&quot;,&quot;notes&quot;:&quot;eat a mouse atleast 1x a week&quot;,&quot;readonly&quot;:1}],&quot;vaccinations&quot;:[],&quot;open_visit&quot;:null})'>
+                                <i class="fa fa-folder-open me-1"></i> View EMR
+                            </button>
+                                                    </td>
+                    </tr>
+                                                            <tr>
+                        <td data-order="buddy">
+                            <div class="d-flex align-items-center gap-2">
+                                                                <span class="ep-av">B</span>
+                                                                <div><div class="fw-bold text-dark">buddy</div>
+                                <span class="ep-id">#00012</span></div>
+                            </div>
+                        </td>
+                        <td>
+                                                        <span class="ep-species">Dog</span>
+                            <div class="small text-muted mt-1">Aspin</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">2 yrs</div>
+                            <div class="small text-muted">Weight not recorded</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">Fraetin</div>
+                            <div class="small text-muted"><i class="fa fa-phone me-1" style="font-size:11px;opacity:.6;"></i>No contact number</div>
+                        </td>
+                        <td>
+                            <span class="ep-recs">
+                                <i class="fa fa-file-medical me-1"></i>0 records                            </span>
+                        </td>
+                        <td class="text-end">
+                                                        <button class="btn btn-sm ep-view" onclick='openEmrModal({&quot;id&quot;:&quot;12&quot;,&quot;name&quot;:&quot;buddy&quot;,&quot;species&quot;:&quot;dog&quot;,&quot;breed&quot;:&quot;aspin&quot;,&quot;age&quot;:&quot;2&quot;,&quot;weight&quot;:0,&quot;owner_name&quot;:&quot;fraetin&quot;,&quot;owner_contact&quot;:&quot;0&quot;,&quot;owner_email&quot;:&quot;fraetin729@gmail.com&quot;,&quot;medical_history&quot;:&quot;&quot;,&quot;gender&quot;:&quot;&quot;,&quot;gender_label&quot;:&quot;Not recorded&quot;,&quot;date_of_birth&quot;:&quot;&quot;,&quot;raw_species&quot;:&quot;dog&quot;,&quot;raw_breed&quot;:&quot;aspin&quot;,&quot;raw_age&quot;:&quot;2&quot;,&quot;raw_weight&quot;:null,&quot;history_records&quot;:[],&quot;vaccinations&quot;:[],&quot;open_visit&quot;:null})'>
+                                <i class="fa fa-folder-open me-1"></i> View EMR
+                            </button>
+                                                    </td>
+                    </tr>
+                                                            <tr>
+                        <td data-order="dagapromax">
+                            <div class="d-flex align-items-center gap-2">
+                                                                <img class="ep-av" src="uploads/pets/6abe23bedbbc9.jpg" alt="">
+                                                                <div><div class="fw-bold text-dark">dagapromax</div>
+                                <span class="ep-id">#00014</span></div>
+                            </div>
+                        </td>
+                        <td>
+                                                        <span class="ep-species">Other</span>
+                            <div class="small text-muted mt-1">Kanal Daga</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">Under 1 yr</div>
+                            <div class="small text-muted">0.5 kg</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">Tim Justin Ferrer</div>
+                            <div class="small text-muted"><i class="fa fa-phone me-1" style="font-size:11px;opacity:.6;"></i>09551738035</div>
+                        </td>
+                        <td>
+                            <span class="ep-recs ep-recs-has">
+                                <i class="fa fa-file-medical me-1"></i>3 records                            </span>
+                        </td>
+                        <td class="text-end">
+                                                        <button class="btn btn-sm ep-view" onclick='openEmrModal({&quot;id&quot;:&quot;14&quot;,&quot;name&quot;:&quot;dagapromax&quot;,&quot;species&quot;:&quot;Other&quot;,&quot;breed&quot;:&quot;Kanal Daga&quot;,&quot;age&quot;:0,&quot;weight&quot;:&quot;0.5&quot;,&quot;owner_name&quot;:&quot;tim justin ferrer&quot;,&quot;owner_contact&quot;:&quot;09551738035&quot;,&quot;owner_email&quot;:&quot;hinaruto100@gmail.com&quot;,&quot;medical_history&quot;:&quot;&quot;,&quot;gender&quot;:&quot;Female&quot;,&quot;gender_label&quot;:&quot;Female&quot;,&quot;date_of_birth&quot;:&quot;2026-09-01&quot;,&quot;raw_species&quot;:&quot;Other&quot;,&quot;raw_breed&quot;:&quot;Kanal Daga&quot;,&quot;raw_age&quot;:0,&quot;raw_weight&quot;:&quot;0.5&quot;,&quot;history_records&quot;:[{&quot;record_date&quot;:&quot;2026-10-11&quot;,&quot;record_type&quot;:&quot;visit&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;title&quot;:&quot;Consultation&quot;,&quot;doctor_name&quot;:&quot;Dr. Smith (Doctor)&quot;,&quot;description&quot;:&quot;Completed visit. No consultation notes were recorded.&quot;,&quot;notes&quot;:&quot;&quot;,&quot;readonly&quot;:1},{&quot;id&quot;:&quot;15&quot;,&quot;pet_id&quot;:&quot;14&quot;,&quot;appointment_id&quot;:&quot;98&quot;,&quot;record_type&quot;:&quot;checkup&quot;,&quot;title&quot;:&quot;Consultation&quot;,&quot;description&quot;:&quot;ADA&quot;,&quot;doctor_name&quot;:&quot;Dr. Smith (Doctor)&quot;,&quot;record_date&quot;:&quot;2026-10-09&quot;,&quot;record_time&quot;:null,&quot;status&quot;:&quot;Completed&quot;,&quot;notes&quot;:&quot;Treatment: Eat 3x a day&quot;,&quot;created_at&quot;:&quot;2026-10-09 20:21:48&quot;,&quot;updated_at&quot;:&quot;2026-10-09 20:21:48&quot;,&quot;pet_name&quot;:&quot;dagapromax&quot;},{&quot;record_date&quot;:&quot;2026-10-09&quot;,&quot;record_type&quot;:&quot;visit&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;title&quot;:&quot;Consultation&quot;,&quot;doctor_name&quot;:&quot;Dr. Smith (Doctor)&quot;,&quot;description&quot;:&quot;Completed visit. No consultation notes were recorded.&quot;,&quot;notes&quot;:&quot;&quot;,&quot;readonly&quot;:1}],&quot;vaccinations&quot;:[],&quot;open_visit&quot;:null})'>
+                                <i class="fa fa-folder-open me-1"></i> View EMR
+                            </button>
+                                                    </td>
+                    </tr>
+                                                            <tr>
+                        <td data-order="dagapromax">
+                            <div class="d-flex align-items-center gap-2">
+                                                                <img class="ep-av" src="uploads/pets/6abe248cb1ec3.jpg" alt="">
+                                                                <div><div class="fw-bold text-dark">dagapromax</div>
+                                <span class="ep-id">#00015</span></div>
+                            </div>
+                        </td>
+                        <td>
+                                                        <span class="ep-species">Other</span>
+                            <div class="small text-muted mt-1">Kanal Daga</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">Under 1 yr</div>
+                            <div class="small text-muted">0.5 kg</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">Tim Justin Ferrer</div>
+                            <div class="small text-muted"><i class="fa fa-phone me-1" style="font-size:11px;opacity:.6;"></i>09551738035</div>
+                        </td>
+                        <td>
+                            <span class="ep-recs ep-recs-has">
+                                <i class="fa fa-file-medical me-1"></i>3 records                            </span>
+                        </td>
+                        <td class="text-end">
+                                                        <button class="btn btn-sm ep-view" onclick='openEmrModal({&quot;id&quot;:&quot;15&quot;,&quot;name&quot;:&quot;dagapromax&quot;,&quot;species&quot;:&quot;Other&quot;,&quot;breed&quot;:&quot;Kanal Daga&quot;,&quot;age&quot;:0,&quot;weight&quot;:&quot;0.5&quot;,&quot;owner_name&quot;:&quot;tim justin ferrer&quot;,&quot;owner_contact&quot;:&quot;09551738035&quot;,&quot;owner_email&quot;:&quot;hinaruto100@gmail.com&quot;,&quot;medical_history&quot;:&quot;&quot;,&quot;gender&quot;:&quot;Female&quot;,&quot;gender_label&quot;:&quot;Female&quot;,&quot;date_of_birth&quot;:&quot;2026-09-01&quot;,&quot;raw_species&quot;:&quot;Other&quot;,&quot;raw_breed&quot;:&quot;Kanal Daga&quot;,&quot;raw_age&quot;:0,&quot;raw_weight&quot;:&quot;0.5&quot;,&quot;history_records&quot;:[{&quot;record_date&quot;:&quot;2026-10-11&quot;,&quot;record_type&quot;:&quot;visit&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;title&quot;:&quot;Consultation&quot;,&quot;doctor_name&quot;:&quot;Dr. Smith (Doctor)&quot;,&quot;description&quot;:&quot;Completed visit. No consultation notes were recorded.&quot;,&quot;notes&quot;:&quot;&quot;,&quot;readonly&quot;:1},{&quot;record_date&quot;:&quot;2026-10-10&quot;,&quot;record_type&quot;:&quot;visit&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;title&quot;:&quot;Consultation&quot;,&quot;doctor_name&quot;:&quot;Dr. Smith (Doctor)&quot;,&quot;description&quot;:&quot;ADA&quot;,&quot;notes&quot;:&quot;Eat 3x a day&quot;,&quot;readonly&quot;:1},{&quot;record_date&quot;:&quot;2026-10-09&quot;,&quot;record_type&quot;:&quot;visit&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;title&quot;:&quot;Consultation&quot;,&quot;doctor_name&quot;:&quot;Dr. Smith (Doctor)&quot;,&quot;description&quot;:&quot;Completed visit. No consultation notes were recorded.&quot;,&quot;notes&quot;:&quot;&quot;,&quot;readonly&quot;:1}],&quot;vaccinations&quot;:[{&quot;id&quot;:&quot;6&quot;,&quot;pet_id&quot;:&quot;15&quot;,&quot;vaccine_name&quot;:&quot;Core Vaccination&quot;,&quot;date_given&quot;:&quot;2026-09-10&quot;,&quot;next_due&quot;:&quot;2026-10-10&quot;,&quot;batch_number&quot;:null,&quot;administered_by&quot;:&quot;Not clinic-verified&quot;,&quot;status&quot;:&quot;Overdue&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-10-01 17:14:52&quot;}],&quot;open_visit&quot;:null})'>
+                                <i class="fa fa-folder-open me-1"></i> View EMR
+                            </button>
+                                                    </td>
+                    </tr>
+                                                            <tr>
+                        <td data-order="kenneth">
+                            <div class="d-flex align-items-center gap-2">
+                                                                <span class="ep-av">K</span>
+                                                                <div><div class="fw-bold text-dark">kenneth</div>
+                                <span class="ep-id">#00002</span></div>
+                            </div>
+                        </td>
+                        <td>
+                                                        <span class="ep-species">Dog</span>
+                            <div class="small text-muted mt-1">Aspin</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">1 yr</div>
+                            <div class="small text-muted">Weight not recorded</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">Tim Justin Ferrer</div>
+                            <div class="small text-muted"><i class="fa fa-phone me-1" style="font-size:11px;opacity:.6;"></i>No contact number</div>
+                        </td>
+                        <td>
+                            <span class="ep-recs ep-recs-has">
+                                <i class="fa fa-file-medical me-1"></i>3 records                            </span>
+                        </td>
+                        <td class="text-end">
+                                                        <button class="btn btn-sm ep-view" onclick='openEmrModal({&quot;id&quot;:&quot;2&quot;,&quot;name&quot;:&quot;kenneth&quot;,&quot;species&quot;:&quot;Dog&quot;,&quot;breed&quot;:&quot;aspin&quot;,&quot;age&quot;:&quot;1&quot;,&quot;weight&quot;:0,&quot;owner_name&quot;:&quot;tim justin ferrer&quot;,&quot;owner_contact&quot;:&quot;0&quot;,&quot;owner_email&quot;:&quot;hinaruto029@gmail.com&quot;,&quot;medical_history&quot;:&quot;&quot;,&quot;gender&quot;:&quot;&quot;,&quot;gender_label&quot;:&quot;Not recorded&quot;,&quot;date_of_birth&quot;:&quot;&quot;,&quot;raw_species&quot;:&quot;Dog&quot;,&quot;raw_breed&quot;:&quot;aspin&quot;,&quot;raw_age&quot;:&quot;1&quot;,&quot;raw_weight&quot;:null,&quot;history_records&quot;:[{&quot;id&quot;:&quot;1&quot;,&quot;pet_id&quot;:&quot;2&quot;,&quot;appointment_id&quot;:&quot;3&quot;,&quot;record_type&quot;:&quot;checkup&quot;,&quot;title&quot;:&quot;General Checkup&quot;,&quot;description&quot;:&quot;Routine general checkup. &quot;,&quot;doctor_name&quot;:&quot;dr ferrer&quot;,&quot;record_date&quot;:&quot;2025-03-22&quot;,&quot;record_time&quot;:&quot;10:00:00&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;updated_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;pet_name&quot;:&quot;kenneth&quot;},{&quot;id&quot;:&quot;2&quot;,&quot;pet_id&quot;:&quot;2&quot;,&quot;appointment_id&quot;:&quot;3&quot;,&quot;record_type&quot;:&quot;diagnosis&quot;,&quot;title&quot;:&quot;Diagnosis&quot;,&quot;description&quot;:&quot;pangit&quot;,&quot;doctor_name&quot;:&quot;dr ferrer&quot;,&quot;record_date&quot;:&quot;2025-03-22&quot;,&quot;record_time&quot;:&quot;10:00:00&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;updated_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;pet_name&quot;:&quot;kenneth&quot;},{&quot;id&quot;:&quot;3&quot;,&quot;pet_id&quot;:&quot;2&quot;,&quot;appointment_id&quot;:&quot;3&quot;,&quot;record_type&quot;:&quot;treatment&quot;,&quot;title&quot;:&quot;Treatment \/ Medication&quot;,&quot;description&quot;:&quot;wala&quot;,&quot;doctor_name&quot;:&quot;dr ferrer&quot;,&quot;record_date&quot;:&quot;2025-03-22&quot;,&quot;record_time&quot;:&quot;10:00:00&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;updated_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;pet_name&quot;:&quot;kenneth&quot;}],&quot;vaccinations&quot;:[],&quot;open_visit&quot;:null})'>
+                                <i class="fa fa-folder-open me-1"></i> View EMR
+                            </button>
+                                                    </td>
+                    </tr>
+                                                            <tr>
+                        <td data-order="kenneth">
+                            <div class="d-flex align-items-center gap-2">
+                                                                <img class="ep-av" src="uploads/pets/69c6297a5071d.jpg" alt="">
+                                                                <div><div class="fw-bold text-dark">kenneth</div>
+                                <span class="ep-id">#00003</span></div>
+                            </div>
+                        </td>
+                        <td>
+                                                        <span class="ep-species">Dog</span>
+                            <div class="small text-muted mt-1">Beagle</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark"><span class="text-muted fw-normal">Age not recorded</span></div>
+                            <div class="small text-muted">Weight not recorded</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">Tim Justin Ferrer</div>
+                            <div class="small text-muted"><i class="fa fa-phone me-1" style="font-size:11px;opacity:.6;"></i>No contact number</div>
+                        </td>
+                        <td>
+                            <span class="ep-recs">
+                                <i class="fa fa-file-medical me-1"></i>0 records                            </span>
+                        </td>
+                        <td class="text-end">
+                                                        <button class="btn btn-sm ep-view" onclick='openEmrModal({&quot;id&quot;:&quot;3&quot;,&quot;name&quot;:&quot;kenneth&quot;,&quot;species&quot;:&quot;Dog&quot;,&quot;breed&quot;:&quot;beagle&quot;,&quot;age&quot;:0,&quot;weight&quot;:0,&quot;owner_name&quot;:&quot;tim justin ferrer&quot;,&quot;owner_contact&quot;:&quot;0&quot;,&quot;owner_email&quot;:&quot;timferrer1@gmail.com&quot;,&quot;medical_history&quot;:&quot;&quot;,&quot;gender&quot;:&quot;&quot;,&quot;gender_label&quot;:&quot;Not recorded&quot;,&quot;date_of_birth&quot;:&quot;&quot;,&quot;raw_species&quot;:&quot;Dog&quot;,&quot;raw_breed&quot;:&quot;beagle&quot;,&quot;raw_age&quot;:null,&quot;raw_weight&quot;:null,&quot;history_records&quot;:[],&quot;vaccinations&quot;:[],&quot;open_visit&quot;:null})'>
+                                <i class="fa fa-folder-open me-1"></i> View EMR
+                            </button>
+                                                    </td>
+                    </tr>
+                                                            <tr>
+                        <td data-order="kenshin">
+                            <div class="d-flex align-items-center gap-2">
+                                                                <span class="ep-av">K</span>
+                                                                <div><div class="fw-bold text-dark">Kenshin</div>
+                                <span class="ep-id">#00005</span></div>
+                            </div>
+                        </td>
+                        <td>
+                                                        <span class="ep-species">Dog</span>
+                            <div class="small text-muted mt-1">Pango</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">13 yrs</div>
+                            <div class="small text-muted">123 kg</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">Kenneth</div>
+                            <div class="small text-muted"><i class="fa fa-phone me-1" style="font-size:11px;opacity:.6;"></i>09551738035</div>
+                        </td>
+                        <td>
+                            <span class="ep-recs">
+                                <i class="fa fa-file-medical me-1"></i>0 records                            </span>
+                        </td>
+                        <td class="text-end">
+                                                        <button class="btn btn-sm ep-view" onclick='openEmrModal({&quot;id&quot;:&quot;5&quot;,&quot;name&quot;:&quot;Kenshin&quot;,&quot;species&quot;:&quot;Dog&quot;,&quot;breed&quot;:&quot;Pango&quot;,&quot;age&quot;:&quot;13&quot;,&quot;weight&quot;:&quot;123&quot;,&quot;owner_name&quot;:&quot;Kenneth&quot;,&quot;owner_contact&quot;:&quot;09551738035&quot;,&quot;owner_email&quot;:&quot;johnonly211@gmail.com&quot;,&quot;medical_history&quot;:&quot;&quot;,&quot;gender&quot;:&quot;&quot;,&quot;gender_label&quot;:&quot;Not recorded&quot;,&quot;date_of_birth&quot;:&quot;&quot;,&quot;raw_species&quot;:&quot;Dog&quot;,&quot;raw_breed&quot;:&quot;Pango&quot;,&quot;raw_age&quot;:&quot;13&quot;,&quot;raw_weight&quot;:&quot;123&quot;,&quot;history_records&quot;:[],&quot;vaccinations&quot;:[],&quot;open_visit&quot;:null})'>
+                                <i class="fa fa-folder-open me-1"></i> View EMR
+                            </button>
+                                                    </td>
+                    </tr>
+                                                            <tr>
+                        <td data-order="kenshin">
+                            <div class="d-flex align-items-center gap-2">
+                                                                <span class="ep-av">K</span>
+                                                                <div><div class="fw-bold text-dark">Kenshin</div>
+                                <span class="ep-id">#00007</span></div>
+                            </div>
+                        </td>
+                        <td>
+                                                        <span class="ep-species">Dog</span>
+                            <div class="small text-muted mt-1">Husky</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">5 yrs</div>
+                            <div class="small text-muted">11 kg</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">Kenshin</div>
+                            <div class="small text-muted"><i class="fa fa-phone me-1" style="font-size:11px;opacity:.6;"></i>No contact number</div>
+                        </td>
+                        <td>
+                            <span class="ep-recs">
+                                <i class="fa fa-file-medical me-1"></i>0 records                            </span>
+                        </td>
+                        <td class="text-end">
+                                                        <button class="btn btn-sm ep-view" onclick='openEmrModal({&quot;id&quot;:&quot;7&quot;,&quot;name&quot;:&quot;Kenshin&quot;,&quot;species&quot;:&quot;Dog&quot;,&quot;breed&quot;:&quot;Husky&quot;,&quot;age&quot;:&quot;5&quot;,&quot;weight&quot;:&quot;11&quot;,&quot;owner_name&quot;:&quot;kenshin&quot;,&quot;owner_contact&quot;:&quot;N\/A&quot;,&quot;owner_email&quot;:&quot;brattysis18@gmail.com&quot;,&quot;medical_history&quot;:&quot;&quot;,&quot;gender&quot;:&quot;&quot;,&quot;gender_label&quot;:&quot;Not recorded&quot;,&quot;date_of_birth&quot;:&quot;&quot;,&quot;raw_species&quot;:&quot;Dog&quot;,&quot;raw_breed&quot;:&quot;Husky&quot;,&quot;raw_age&quot;:&quot;5&quot;,&quot;raw_weight&quot;:&quot;11&quot;,&quot;history_records&quot;:[],&quot;vaccinations&quot;:[{&quot;id&quot;:&quot;2&quot;,&quot;pet_id&quot;:&quot;7&quot;,&quot;vaccine_name&quot;:&quot;General Vaccination&quot;,&quot;date_given&quot;:&quot;2026-04-30&quot;,&quot;next_due&quot;:&quot;2026-04-15&quot;,&quot;batch_number&quot;:null,&quot;administered_by&quot;:&quot;Not clinic-verified&quot;,&quot;status&quot;:&quot;Overdue&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 14:29:29&quot;}],&quot;open_visit&quot;:null})'>
+                                <i class="fa fa-folder-open me-1"></i> View EMR
+                            </button>
+                                                    </td>
+                    </tr>
+                                                            <tr>
+                        <td data-order="max">
+                            <div class="d-flex align-items-center gap-2">
+                                                                <img class="ep-av" src="uploads/pets/6a6718eeccc61.jpg" alt="">
+                                                                <div><div class="fw-bold text-dark">max</div>
+                                <span class="ep-id">#00001</span></div>
+                            </div>
+                        </td>
+                        <td>
+                                                        <span class="ep-species">Dog</span>
+                            <div class="small text-muted mt-1">Aspin</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">2 yrs</div>
+                            <div class="small text-muted">8 kg</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">Tim Justin Ferrer</div>
+                            <div class="small text-muted"><i class="fa fa-phone me-1" style="font-size:11px;opacity:.6;"></i>09551738035</div>
+                        </td>
+                        <td>
+                            <span class="ep-recs ep-recs-has">
+                                <i class="fa fa-file-medical me-1"></i>4 records                            </span>
+                        </td>
+                        <td class="text-end">
+                                                        <a href="doctor_consultations.php?open=55" class="btn btn-sm ep-start" title="This patient is checked in with you">
+                                <i class="fa fa-stethoscope me-1"></i> Start Consultation
+                            </a>
+                                                    </td>
+                    </tr>
+                                                            <tr>
+                        <td data-order="mocha">
+                            <div class="d-flex align-items-center gap-2">
+                                                                <img class="ep-av" src="uploads/pets/69eee4fd37fe7.jpg" alt="">
+                                                                <div><div class="fw-bold text-dark">Mocha</div>
+                                <span class="ep-id">#00006</span></div>
+                            </div>
+                        </td>
+                        <td>
+                                                        <span class="ep-species">Dog</span>
+                            <div class="small text-muted mt-1">Dachshund</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">4 yrs</div>
+                            <div class="small text-muted">6 kg</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">Tim Justin Ferrer</div>
+                            <div class="small text-muted"><i class="fa fa-phone me-1" style="font-size:11px;opacity:.6;"></i>09551738035</div>
+                        </td>
+                        <td>
+                            <span class="ep-recs ep-recs-has">
+                                <i class="fa fa-file-medical me-1"></i>8 records                            </span>
+                        </td>
+                        <td class="text-end">
+                                                        <button class="btn btn-sm ep-view" onclick='openEmrModal({&quot;id&quot;:&quot;6&quot;,&quot;name&quot;:&quot;Mocha&quot;,&quot;species&quot;:&quot;Dog&quot;,&quot;breed&quot;:&quot;Dachshund&quot;,&quot;age&quot;:4,&quot;weight&quot;:&quot;6&quot;,&quot;owner_name&quot;:&quot;tim justin ferrer&quot;,&quot;owner_contact&quot;:&quot;09551738035&quot;,&quot;owner_email&quot;:&quot;hinaruto100@gmail.com&quot;,&quot;medical_history&quot;:&quot;&quot;,&quot;gender&quot;:&quot;Female&quot;,&quot;gender_label&quot;:&quot;Female&quot;,&quot;date_of_birth&quot;:&quot;2022-03-15&quot;,&quot;raw_species&quot;:&quot;Dog&quot;,&quot;raw_breed&quot;:&quot;Dachshund&quot;,&quot;raw_age&quot;:4,&quot;raw_weight&quot;:&quot;6&quot;,&quot;history_records&quot;:[{&quot;record_date&quot;:&quot;2026-10-12&quot;,&quot;record_type&quot;:&quot;visit&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;title&quot;:&quot;Vaccination&quot;,&quot;doctor_name&quot;:&quot;John Daviddddd&quot;,&quot;description&quot;:&quot;Completed visit. No consultation notes were recorded.&quot;,&quot;notes&quot;:&quot;&quot;,&quot;readonly&quot;:1},{&quot;record_date&quot;:&quot;2026-09-30&quot;,&quot;record_type&quot;:&quot;visit&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;title&quot;:&quot;Vaccination&quot;,&quot;doctor_name&quot;:&quot;Dr. Smith (Doctor)&quot;,&quot;description&quot;:&quot;Completed visit. No consultation notes were recorded.&quot;,&quot;notes&quot;:&quot;&quot;,&quot;readonly&quot;:1},{&quot;record_date&quot;:&quot;2026-04-30&quot;,&quot;record_type&quot;:&quot;visit&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;title&quot;:&quot;Dental Prophylaxis&quot;,&quot;doctor_name&quot;:&quot;Dr. Smith (Doctor)&quot;,&quot;description&quot;:&quot;Completed visit. No consultation notes were recorded.&quot;,&quot;notes&quot;:&quot;&quot;,&quot;readonly&quot;:1},{&quot;record_date&quot;:&quot;2026-04-17&quot;,&quot;record_type&quot;:&quot;visit&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;title&quot;:&quot;Consultation&quot;,&quot;doctor_name&quot;:&quot;\u003Cscript\u003Ealert(\u0022Hello\u0022)\u003C\/script\u003E&quot;,&quot;description&quot;:&quot;\u003Cscript\u003Ealert(\u0022Hello\u0022)\u003C\/script\u003E&quot;,&quot;notes&quot;:&quot;\u003Cscript\u003Ealert(\u0022Hello\u0022)\u003C\/script\u003E \u00b7 Rx: \u003Cscript\u003Ealert(\u0022Hello\u0022)\u003C\/script\u003E&quot;,&quot;readonly&quot;:1},{&quot;id&quot;:&quot;13&quot;,&quot;pet_id&quot;:&quot;6&quot;,&quot;appointment_id&quot;:null,&quot;record_type&quot;:&quot;follow_up&quot;,&quot;title&quot;:&quot;Follow-up Visit&quot;,&quot;description&quot;:&quot;Condition improved. No signs of infection.&quot;,&quot;doctor_name&quot;:&quot;Dr. Santos&quot;,&quot;record_date&quot;:&quot;2026-04-10&quot;,&quot;record_time&quot;:&quot;10:00:00&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 15:29:51&quot;,&quot;updated_at&quot;:&quot;2026-09-23 15:29:51&quot;,&quot;pet_name&quot;:&quot;Mocha&quot;},{&quot;id&quot;:&quot;10&quot;,&quot;pet_id&quot;:&quot;6&quot;,&quot;appointment_id&quot;:null,&quot;record_type&quot;:&quot;checkup&quot;,&quot;title&quot;:&quot;General Check-up&quot;,&quot;description&quot;:&quot;Routine check-up. No major concerns found.&quot;,&quot;doctor_name&quot;:&quot;Dr. Santos&quot;,&quot;record_date&quot;:&quot;2026-03-10&quot;,&quot;record_time&quot;:&quot;10:30:00&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 15:29:51&quot;,&quot;updated_at&quot;:&quot;2026-09-23 15:29:51&quot;,&quot;pet_name&quot;:&quot;Mocha&quot;},{&quot;id&quot;:&quot;11&quot;,&quot;pet_id&quot;:&quot;6&quot;,&quot;appointment_id&quot;:null,&quot;record_type&quot;:&quot;diagnosis&quot;,&quot;title&quot;:&quot;Diagnosis&quot;,&quot;description&quot;:&quot;Mild skin infection. Prescribed topical medication.&quot;,&quot;doctor_name&quot;:&quot;Dr. Santos&quot;,&quot;record_date&quot;:&quot;2026-03-10&quot;,&quot;record_time&quot;:&quot;11:15:00&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 15:29:51&quot;,&quot;updated_at&quot;:&quot;2026-09-23 15:29:51&quot;,&quot;pet_name&quot;:&quot;Mocha&quot;},{&quot;id&quot;:&quot;12&quot;,&quot;pet_id&quot;:&quot;6&quot;,&quot;appointment_id&quot;:null,&quot;record_type&quot;:&quot;treatment&quot;,&quot;title&quot;:&quot;Treatment \/ Medication&quot;,&quot;description&quot;:&quot;Mupirocin ointment. Apply 2x a day for 7 days.&quot;,&quot;doctor_name&quot;:&quot;Dr. Santos&quot;,&quot;record_date&quot;:&quot;2026-03-10&quot;,&quot;record_time&quot;:&quot;11:20:00&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 15:29:51&quot;,&quot;updated_at&quot;:&quot;2026-09-23 15:29:51&quot;,&quot;pet_name&quot;:&quot;Mocha&quot;}],&quot;vaccinations&quot;:[{&quot;id&quot;:&quot;1&quot;,&quot;pet_id&quot;:&quot;6&quot;,&quot;vaccine_name&quot;:&quot;General Vaccination&quot;,&quot;date_given&quot;:&quot;2026-03-25&quot;,&quot;next_due&quot;:&quot;2026-05-27&quot;,&quot;batch_number&quot;:null,&quot;administered_by&quot;:&quot;Not clinic-verified&quot;,&quot;status&quot;:&quot;Overdue&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 14:29:29&quot;},{&quot;id&quot;:&quot;5&quot;,&quot;pet_id&quot;:&quot;6&quot;,&quot;vaccine_name&quot;:&quot;DHPP (5-in-1)&quot;,&quot;date_given&quot;:&quot;2026-01-15&quot;,&quot;next_due&quot;:&quot;2027-01-15&quot;,&quot;batch_number&quot;:null,&quot;administered_by&quot;:&quot;Not clinic-verified&quot;,&quot;status&quot;:&quot;Up to date&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 15:29:51&quot;},{&quot;id&quot;:&quot;4&quot;,&quot;pet_id&quot;:&quot;6&quot;,&quot;vaccine_name&quot;:&quot;Rabies&quot;,&quot;date_given&quot;:&quot;2026-01-15&quot;,&quot;next_due&quot;:&quot;2027-01-15&quot;,&quot;batch_number&quot;:null,&quot;administered_by&quot;:&quot;Not clinic-verified&quot;,&quot;status&quot;:&quot;Up to date&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 15:29:51&quot;}],&quot;open_visit&quot;:null})'>
+                                <i class="fa fa-folder-open me-1"></i> View EMR
+                            </button>
+                                                    </td>
+                    </tr>
+                                                            <tr>
+                        <td data-order="rhus">
+                            <div class="d-flex align-items-center gap-2">
+                                                                <img class="ep-av" src="uploads/pets/69c6418793b83.jpg" alt="">
+                                                                <div><div class="fw-bold text-dark">Rhus</div>
+                                <span class="ep-id">#00004</span></div>
+                            </div>
+                        </td>
+                        <td>
+                                                        <span class="ep-species">Dog</span>
+                            <div class="small text-muted mt-1">Hybrid</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">3 yrs</div>
+                            <div class="small text-muted">12 kg</div>
+                        </td>
+                        <td>
+                                                        <div class="fw-semibold text-dark">Tim Justin Ferrer</div>
+                            <div class="small text-muted"><i class="fa fa-phone me-1" style="font-size:11px;opacity:.6;"></i>09551738035</div>
+                        </td>
+                        <td>
+                            <span class="ep-recs ep-recs-has">
+                                <i class="fa fa-file-medical me-1"></i>7 records                            </span>
+                        </td>
+                        <td class="text-end">
+                                                        <button class="btn btn-sm ep-view" onclick='openEmrModal({&quot;id&quot;:&quot;4&quot;,&quot;name&quot;:&quot;Rhus&quot;,&quot;species&quot;:&quot;Dog&quot;,&quot;breed&quot;:&quot;hybrid&quot;,&quot;age&quot;:3,&quot;weight&quot;:&quot;12&quot;,&quot;owner_name&quot;:&quot;tim justin ferrer&quot;,&quot;owner_contact&quot;:&quot;09551738035&quot;,&quot;owner_email&quot;:&quot;hinaruto100@gmail.com&quot;,&quot;medical_history&quot;:&quot;&quot;,&quot;gender&quot;:&quot;Male&quot;,&quot;gender_label&quot;:&quot;Male&quot;,&quot;date_of_birth&quot;:&quot;2023-06-10&quot;,&quot;raw_species&quot;:&quot;Dog&quot;,&quot;raw_breed&quot;:&quot;hybrid&quot;,&quot;raw_age&quot;:3,&quot;raw_weight&quot;:&quot;12&quot;,&quot;history_records&quot;:[{&quot;id&quot;:&quot;7&quot;,&quot;pet_id&quot;:&quot;4&quot;,&quot;appointment_id&quot;:&quot;43&quot;,&quot;record_type&quot;:&quot;checkup&quot;,&quot;title&quot;:&quot;Laboratory Test&quot;,&quot;description&quot;:&quot;Routine laboratory test. &quot;,&quot;doctor_name&quot;:&quot;Dr.Jsutin&quot;,&quot;record_date&quot;:&quot;2026-04-23&quot;,&quot;record_time&quot;:&quot;08:00:00&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;updated_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;pet_name&quot;:&quot;Rhus&quot;},{&quot;id&quot;:&quot;8&quot;,&quot;pet_id&quot;:&quot;4&quot;,&quot;appointment_id&quot;:&quot;43&quot;,&quot;record_type&quot;:&quot;diagnosis&quot;,&quot;title&quot;:&quot;Diagnosis&quot;,&quot;description&quot;:&quot;kennetgh&quot;,&quot;doctor_name&quot;:&quot;Dr.Jsutin&quot;,&quot;record_date&quot;:&quot;2026-04-23&quot;,&quot;record_time&quot;:&quot;08:00:00&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;updated_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;pet_name&quot;:&quot;Rhus&quot;},{&quot;id&quot;:&quot;9&quot;,&quot;pet_id&quot;:&quot;4&quot;,&quot;appointment_id&quot;:&quot;43&quot;,&quot;record_type&quot;:&quot;treatment&quot;,&quot;title&quot;:&quot;Treatment \/ Medication&quot;,&quot;description&quot;:&quot;inaacid lagnat&quot;,&quot;doctor_name&quot;:&quot;Dr.Jsutin&quot;,&quot;record_date&quot;:&quot;2026-04-23&quot;,&quot;record_time&quot;:&quot;08:00:00&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;updated_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;pet_name&quot;:&quot;Rhus&quot;},{&quot;record_date&quot;:&quot;2026-04-01&quot;,&quot;record_type&quot;:&quot;visit&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;title&quot;:&quot;Consultation&quot;,&quot;doctor_name&quot;:&quot;Dr. Smith (Doctor)&quot;,&quot;description&quot;:&quot;Completed visit. No consultation notes were recorded.&quot;,&quot;notes&quot;:&quot;&quot;,&quot;readonly&quot;:1},{&quot;id&quot;:&quot;4&quot;,&quot;pet_id&quot;:&quot;4&quot;,&quot;appointment_id&quot;:&quot;12&quot;,&quot;record_type&quot;:&quot;checkup&quot;,&quot;title&quot;:&quot;Vaccination and Deworming&quot;,&quot;description&quot;:&quot;Routine vaccination and deworming. &quot;,&quot;doctor_name&quot;:&quot;smith&quot;,&quot;record_date&quot;:&quot;2026-03-28&quot;,&quot;record_time&quot;:&quot;19:36:00&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;updated_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;pet_name&quot;:&quot;Rhus&quot;},{&quot;id&quot;:&quot;5&quot;,&quot;pet_id&quot;:&quot;4&quot;,&quot;appointment_id&quot;:&quot;12&quot;,&quot;record_type&quot;:&quot;diagnosis&quot;,&quot;title&quot;:&quot;Diagnosis&quot;,&quot;description&quot;:&quot;ewe&quot;,&quot;doctor_name&quot;:&quot;smith&quot;,&quot;record_date&quot;:&quot;2026-03-28&quot;,&quot;record_time&quot;:&quot;19:36:00&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;updated_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;pet_name&quot;:&quot;Rhus&quot;},{&quot;id&quot;:&quot;6&quot;,&quot;pet_id&quot;:&quot;4&quot;,&quot;appointment_id&quot;:&quot;12&quot;,&quot;record_type&quot;:&quot;treatment&quot;,&quot;title&quot;:&quot;Treatment \/ Medication&quot;,&quot;description&quot;:&quot;qweq&quot;,&quot;doctor_name&quot;:&quot;smith&quot;,&quot;record_date&quot;:&quot;2026-03-28&quot;,&quot;record_time&quot;:&quot;19:36:00&quot;,&quot;status&quot;:&quot;Completed&quot;,&quot;notes&quot;:null,&quot;created_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;updated_at&quot;:&quot;2026-09-23 14:29:29&quot;,&quot;pet_name&quot;:&quot;Rhus&quot;}],&quot;vaccinations&quot;:[],&quot;open_visit&quot;:null})'>
+                                <i class="fa fa-folder-open me-1"></i> View EMR
+                            </button>
+                                                    </td>
+                    </tr>
+                                    </tbody>
+            </table>
+        </div>
+            </div>
+</div>
+
+<!-- EMR Modal -->
+<div class="modal fade" id="emrModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered modal-lg">
+        <div class="modal-content border-0 shadow-lg" style="border-radius: 20px;">
+            <div class="modal-header border-0 ep-mhead">
+                <h5 class="fw-bold m-0"><i class="fa fa-file-medical me-2"></i>Pet Electronic Medical Record (EMR)</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body p-4">
+                <div class="p-3 ep-summary mb-4">
+                    <div class="row g-2 text-dark">
+                        <div class="col-md-6"><h5 class="fw-bold m-0" id="emrPetName"></h5></div>
+                        <div class="col-md-6 text-md-end"><span class="badge bg-primary" id="emrSpecies"></span></div>
+                        <div class="col-md-6 small"><i class="fa fa-dna me-1 opacity-50"></i><b>Breed:</b> <span id="emrBreed"></span></div>
+                        <div class="col-md-3 small"><i class="fa fa-calendar me-1 opacity-50"></i><b>Age:</b> <span id="emrAge"></span> yr(s)</div>
+                        <div class="col-md-3 small"><i class="fa fa-weight me-1 opacity-50"></i><b>Weight:</b> <span id="emrWeight"></span> kg</div>
+                        <div class="col-12 border-top pt-2 mt-2 small"><i class="fa fa-user me-1 opacity-50"></i><b>Owner:</b> <span id="emrOwner"></span></div>
+                    </div>
+                </div>
+
+                <ul class="nav nav-pills nav-fill gap-2 mb-3" role="tablist" style="font-size:13px;">
+                    <li class="nav-item"><button class="nav-link active fw-semibold" data-bs-toggle="pill" data-bs-target="#tabProfile" type="button" id="tabBtn-profile"><i class="fa fa-heart-pulse me-1"></i>Health Profile</button></li>
+                    <li class="nav-item"><button class="nav-link fw-semibold" data-bs-toggle="pill" data-bs-target="#tabRecords" type="button" id="tabBtn-records"><i class="fa fa-notes-medical me-1"></i>Clinical Records <span class="badge bg-light text-primary ms-1" id="emrRecCount">0</span></button></li>
+                    <li class="nav-item"><button class="nav-link fw-semibold" data-bs-toggle="pill" data-bs-target="#tabVaccines" type="button" id="tabBtn-vaccines"><i class="fa fa-syringe me-1"></i>Vaccinations <span class="badge bg-light text-primary ms-1" id="emrVacCount">0</span></button></li>
+                </ul>
+
+                <div class="tab-content">
+                    <!-- Health Profile -->
+                    <div class="tab-pane fade show active" id="tabProfile">
+                        <form method="POST">
+                            <input type="hidden" name="emr_action" value="update_profile">
+                            <input type="hidden" name="return_tab" value="profile">
+                            <input type="hidden" name="pet_id" class="emr-pet-id">
+                            <div class="row g-3">
+                                <div class="col-md-4"><label class="form-label small fw-bold text-muted">Species</label><input type="text" name="species" id="pfSpecies" class="form-control" readonly tabindex="-1" style="background:#f1f5f9;cursor:not-allowed;" title="Registered by the owner" maxlength="50"></div>
+                                <div class="col-md-4"><label class="form-label small fw-bold text-muted">Breed</label><input type="text" name="breed" id="pfBreed" class="form-control" readonly tabindex="-1" style="background:#f1f5f9;cursor:not-allowed;" title="Registered by the owner" maxlength="50"></div>
+                                <div class="col-md-4"><label class="form-label small fw-bold text-muted">Gender</label>
+                                    <select name="gender" id="pfGender" class="form-select" style="background-color:#f1f5f9;cursor:not-allowed;pointer-events:none;" tabindex="-1" title="Registered by the owner"><option value="">Not recorded</option><option>Male</option><option>Female</option></select></div>
+                                <div class="col-md-4"><label class="form-label small fw-bold text-muted">Date of Birth</label><input type="date" name="date_of_birth" id="pfDob" class="form-control" readonly tabindex="-1" style="background:#f1f5f9;cursor:not-allowed;" title="Registered by the owner" max="2026-10-11"></div>
+                                <div class="col-md-4"><label class="form-label small fw-bold text-muted">Age (years)</label><input type="number" name="age" id="pfAge" class="form-control" readonly tabindex="-1" style="background:#f1f5f9;cursor:not-allowed;" title="Registered by the owner" min="0" max="50"></div>
+                                <div class="col-md-4"><label class="form-label small fw-bold text-muted">Weight (kg)</label><input type="number" name="weight" id="pfWeight" class="form-control" min="0" step="0.01"></div>
+                                <div class="col-12"><label class="form-label small fw-bold text-muted">Medical History / Allergies / Chronic Conditions</label><textarea name="medical_history" id="pfHistory" class="form-control" rows="3"></textarea></div>
+                            </div>
+                            <button type="submit" class="btn btn-primary fw-bold rounded-pill px-4 mt-3"><i class="fa fa-save me-1"></i> Save Health Profile</button>
+                        </form>
+                    </div>
+
+                    <!-- Clinical Records -->
+                    <div class="tab-pane fade" id="tabRecords">
+                        <div class="d-flex justify-content-end mb-3">
+                            <button type="button" class="btn btn-sm btn-primary rounded-pill px-3 fw-bold" onclick="editRecord(null)"><i class="fa fa-plus me-1"></i> Add Record</button>
+                        </div>
+                        <form method="POST" id="recordForm" class="p-3 mb-3 rounded-3 border bg-white" style="display:none;">
+                            <input type="hidden" name="emr_action" value="save_record">
+                            <input type="hidden" name="return_tab" value="records">
+                            <input type="hidden" name="pet_id" class="emr-pet-id">
+                            <input type="hidden" name="record_id" id="rfId">
+                            <h6 class="fw-bold mb-3" id="rfHeading">New Clinical Record</h6>
+                            <div class="row g-2">
+                                <div class="col-md-4"><label class="form-label small fw-bold text-muted">Type</label>
+                                    <select name="record_type" id="rfType" class="form-select">
+                                        <option value="checkup">Checkup</option><option value="diagnosis">Diagnosis</option><option value="treatment">Treatment</option>
+                                        <option value="follow_up">Follow-up</option><option value="surgery">Surgery</option><option value="lab_test">Lab Test</option>
+                                        <option value="vaccination">Vaccination</option><option value="other">Other</option>
+                                    </select></div>
+                                <div class="col-md-4"><label class="form-label small fw-bold text-muted">Date</label><input type="date" name="record_date" id="rfDate" class="form-control" required></div>
+                                <div class="col-md-4"><label class="form-label small fw-bold text-muted">Status</label>
+                                    <select name="status" id="rfStatus" class="form-select"><option>Completed</option><option>Pending</option><option>In Progress</option><option>Cancelled</option></select></div>
+                                <div class="col-12"><label class="form-label small fw-bold text-muted">Title</label><input type="text" name="title" id="rfTitle" class="form-control" maxlength="200" required></div>
+                                <div class="col-12"><label class="form-label small fw-bold text-muted">Findings / Diagnosis</label><textarea name="description" id="rfDesc" class="form-control" rows="2"></textarea></div>
+                                <div class="col-12"><label class="form-label small fw-bold text-muted">Notes / Treatment</label><textarea name="notes" id="rfNotes" class="form-control" rows="2"></textarea></div>
+                            </div>
+                            <div class="d-flex gap-2 mt-3">
+                                <button type="submit" class="btn btn-primary btn-sm fw-bold rounded-pill px-3"><i class="fa fa-save me-1"></i> Save Record</button>
+                                <button type="button" class="btn btn-light btn-sm rounded-pill px-3" onclick="document.getElementById('recordForm').style.display='none'">Cancel</button>
+                            </div>
+                        </form>
+                        <div id="emrHistoryList"></div>
+                    </div>
+
+                    <!-- Vaccinations -->
+                    <div class="tab-pane fade" id="tabVaccines">
+                        <div class="d-flex justify-content-end mb-3">
+                            <button type="button" class="btn btn-sm btn-primary rounded-pill px-3 fw-bold" onclick="editVaccine(null)"><i class="fa fa-plus me-1"></i> Add Vaccination</button>
+                        </div>
+                        <form method="POST" id="vaccineForm" class="p-3 mb-3 rounded-3 border bg-white" style="display:none;">
+                            <input type="hidden" name="emr_action" value="save_vaccination">
+                            <input type="hidden" name="return_tab" value="vaccines">
+                            <input type="hidden" name="pet_id" class="emr-pet-id">
+                            <input type="hidden" name="vaccination_id" id="vfId">
+                            <h6 class="fw-bold mb-3" id="vfHeading">New Vaccination</h6>
+                            <div class="row g-2">
+                                <div class="col-md-6"><label class="form-label small fw-bold text-muted">Vaccine Name</label><input type="text" name="vaccine_name" id="vfName" class="form-control" maxlength="100" required></div>
+                                <div class="col-md-6"><label class="form-label small fw-bold text-muted">Batch Number</label><input type="text" name="batch_number" id="vfBatch" class="form-control" maxlength="50"></div>
+                                <div class="col-md-6"><label class="form-label small fw-bold text-muted">Date Given</label><input type="date" name="date_given" id="vfGiven" class="form-control" required max="2026-10-11"></div>
+                                <div class="col-md-6"><label class="form-label small fw-bold text-muted">Next Due</label><input type="date" name="next_due" id="vfDue" class="form-control"></div>
+                                <div class="col-12"><label class="form-label small fw-bold text-muted">Notes</label><textarea name="notes" id="vfNotes" class="form-control" rows="2"></textarea></div>
+                            </div>
+                            <div class="d-flex gap-2 mt-3">
+                                <button type="submit" class="btn btn-primary btn-sm fw-bold rounded-pill px-3"><i class="fa fa-save me-1"></i> Save Vaccination</button>
+                                <button type="button" class="btn btn-light btn-sm rounded-pill px-3" onclick="document.getElementById('vaccineForm').style.display='none'">Cancel</button>
+                            </div>
+                        </form>
+                        <div id="emrVaccineList"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.7/js/jquery.dataTables.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.7/js/dataTables.bootstrap5.min.js"></script>
+<script>
+$(document).ready(function() {
+    var table = $('#petsTable').DataTable({
+        "dom": "rtip",
+        "language": { "search": "", "searchPlaceholder": "Search...", "info": "Showing _START_–_END_ of _TOTAL_ pets", "infoEmpty": "No pets found", "infoFiltered": "(filtered from _MAX_)", "zeroRecords": "No pet matches your search.", "paginate": { "previous": "‹", "next": "›" } }
+    });
+    $('#customSearch').on('keyup', function () {
+        table.search(this.value).draw();
+    });
+    // Summary chips: count over all rows, not just the visible page
+    var nodes = $(table.rows().nodes());
+    var nIn = nodes.find('.ep-start').length, nRec = nodes.find('.ep-recs-has').length;
+    $('#epChipRec b').text(nRec);
+    if (nIn) $('#epChipIn').show().find('b').text(nIn);
+});
+
+// Pet checked in with this vet and not yet consulted → open its consultation; otherwise the EMR
+function openEmrOrConsult(p) {
+    if (p.open_visit) { location.href = 'doctor_consultations.php?open=' + p.open_visit; return; }
+    openEmrModal(p);
+}
+
+function openEmrModal(p, tab) {
+    document.getElementById('emrPetName').textContent = p.name;
+    document.getElementById('emrSpecies').textContent = p.species + ' (' + p.breed + ')';
+    document.getElementById('emrBreed').textContent = p.breed;
+    document.getElementById('emrAge').textContent = p.age;
+    document.getElementById('emrWeight').textContent = p.weight;
+    document.getElementById('emrOwner').textContent = p.owner_name + ' | Contact: ' + p.owner_contact + ' | ' + p.owner_email;
+
+    currentPet = p;
+    document.querySelectorAll('.emr-pet-id').forEach(function(i) { i.value = p.id; });
+
+    // Health profile form
+    document.getElementById('pfSpecies').value = p.raw_species || '';
+    document.getElementById('pfBreed').value   = p.raw_breed || '';
+    document.getElementById('pfGender').value  = p.gender || '';
+    document.getElementById('pfDob').value     = p.date_of_birth || '';
+    document.getElementById('pfAge').value     = p.raw_age ?? '';
+    document.getElementById('pfWeight').value  = p.raw_weight ?? '';
+    document.getElementById('pfHistory').value = p.medical_history || '';
+
+    // Clinical records
+    document.getElementById('recordForm').style.display = 'none';
+    document.getElementById('emrRecCount').textContent = (p.history_records || []).length;
+    var container = document.getElementById('emrHistoryList');
+    if (!p.history_records || p.history_records.length === 0) {
+        container.innerHTML = '<div class="text-center text-muted py-4"><i class="fa fa-notes-medical fa-2x opacity-25 mb-2 d-block"></i>No prior clinical records on file for this pet.</div>';
+    } else {
+        var html = '<div class="timeline">';
+        p.history_records.forEach(function(rec, i) {
+            html += '<div class="card border-0 shadow-sm mb-3" style="border-radius:12px; background:#f8fafc;">'
+                 + '<div class="card-body">'
+                 + '<div class="d-flex justify-content-between align-items-center mb-2">'
+                 + '<span class="fw-bold text-primary"><i class="fa fa-calendar me-1"></i>' + escHtml(rec.record_date || 'N/A')
+                 + ' <span class="badge bg-primary bg-opacity-10 text-primary ms-1">' + escHtml((rec.record_type || '').replace('_', ' ')) + '</span>'
+                 + ' <span class="badge bg-light text-secondary border ms-1">' + escHtml(rec.status || '') + '</span></span>'
+                 + '<span><span class="badge bg-secondary me-2">' + escHtml(rec.doctor_name || 'Clinic Vet') + '</span>'
+                 + (rec.readonly ? '<span class="badge bg-light text-muted border">From visit</span>' : '<button type="button" class="btn btn-sm btn-outline-primary rounded-pill py-0 px-2" onclick="editRecord(' + i + ')"><i class="fa fa-pen me-1"></i>Edit</button>') + '</span>'
+                 + '</div>'
+                 + '<div class="fw-semibold text-dark mb-1">' + escHtml(rec.title || '') + '</div>'
+                 + '<div class="mb-1"><b>Findings:</b> ' + escHtml(rec.description || 'N/A') + '</div>'
+                 + '<div class="small text-muted"><b>Notes / Treatment:</b> ' + escHtml(rec.notes || 'No extra notes') + '</div>'
+                 + '</div></div>';
+        });
+        html += '</div>';
+        container.innerHTML = html;
+    }
+
+    // Vaccinations
+    document.getElementById('vaccineForm').style.display = 'none';
+    var vaccs = p.vaccinations || [];
+    document.getElementById('emrVacCount').textContent = vaccs.length;
+    var vc = document.getElementById('emrVaccineList');
+    if (vaccs.length === 0) {
+        vc.innerHTML = '<div class="text-center text-muted py-4"><i class="fa fa-syringe fa-2x opacity-25 mb-2 d-block"></i>No vaccinations on file for this pet.</div>';
+    } else {
+        var vh = '<div class="table-responsive"><table class="table table-sm align-middle" style="font-size:13px;"><thead class="table-light"><tr><th>Vaccine</th><th>Given</th><th>Next Due</th><th>Status</th><th>By</th><th></th></tr></thead><tbody>';
+        vaccs.forEach(function(v, i) {
+            var cls = v.status === 'Overdue' ? 'danger' : (v.status === 'Due soon' ? 'warning' : 'success');
+            vh += '<tr><td class="fw-semibold">' + escHtml(v.vaccine_name) + (v.batch_number ? '<div class="small text-muted">Batch ' + escHtml(v.batch_number) + '</div>' : '') + '</td>'
+               + '<td>' + escHtml(v.date_given || '') + '</td><td>' + escHtml(v.next_due || '—') + '</td>'
+               + '<td><span class="badge bg-' + cls + '-subtle text-' + cls + '">' + escHtml(v.status || '') + '</span></td>'
+               + '<td class="small text-muted">' + escHtml(v.administered_by || '—') + '</td>'
+               + '<td class="text-end"><button type="button" class="btn btn-sm btn-outline-primary rounded-pill py-0 px-2" onclick="editVaccine(' + i + ')"><i class="fa fa-pen me-1"></i>Edit</button></td></tr>';
+        });
+        vc.innerHTML = vh + '</tbody></table></div>';
+    }
+
+    bootstrap.Tab.getOrCreateInstance(document.getElementById('tabBtn-' + (tab || 'profile'))).show(); // records button opens the Records tab
+    var modalEl = document.getElementById('emrModal');
+    bootstrap.Modal.getOrCreateInstance(modalEl).show();
+}
+
+var currentPet = null;
+
+function editRecord(i) {
+    var r = (i === null) ? null : currentPet.history_records[i];
+    document.getElementById('rfHeading').textContent = r ? 'Edit Clinical Record' : 'New Clinical Record';
+    document.getElementById('rfId').value     = r ? r.id : '';
+    document.getElementById('rfType').value   = r ? r.record_type : 'checkup';
+    document.getElementById('rfDate').value   = r ? r.record_date : new Date().toISOString().slice(0, 10);
+    document.getElementById('rfStatus').value = r ? (r.status || 'Completed') : 'Completed';
+    document.getElementById('rfTitle').value  = r ? (r.title || '') : '';
+    document.getElementById('rfDesc').value   = r ? (r.description || '') : '';
+    document.getElementById('rfNotes').value  = r ? (r.notes || '') : '';
+    var f = document.getElementById('recordForm');
+    f.style.display = 'block';
+    f.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function editVaccine(i) {
+    var v = (i === null) ? null : currentPet.vaccinations[i];
+    document.getElementById('vfHeading').textContent = v ? 'Edit Vaccination' : 'New Vaccination';
+    document.getElementById('vfId').value    = v ? v.id : '';
+    document.getElementById('vfName').value  = v ? v.vaccine_name : '';
+    document.getElementById('vfBatch').value = v ? (v.batch_number || '') : '';
+    document.getElementById('vfGiven').value = v ? v.date_given : new Date().toISOString().slice(0, 10);
+    document.getElementById('vfDue').value   = v ? (v.next_due || '') : '';
+    document.getElementById('vfNotes').value = v ? (v.notes || '') : '';
+    var f = document.getElementById('vaccineForm');
+    f.style.display = 'block';
+    f.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+// Reopen the pet's EMR (on the same tab) after saving
+document.addEventListener('DOMContentLoaded', function() {
+    var ALL_PETS = {"8":{"id":"8","name":"Asher","species":"Dog","breed":"Pomeranian","age":"1","weight":"5.5","owner_name":"Chaw","owner_contact":"N\/A","owner_email":"jpjikan@kld.edu.ph","medical_history":"","gender":"","gender_label":"Not recorded","date_of_birth":"","raw_species":"Dog","raw_breed":"Pomeranian","raw_age":"1","raw_weight":"5.5","history_records":[],"vaccinations":[{"id":"3","pet_id":"8","vaccine_name":"General Vaccination","date_given":"2026-03-02","next_due":"2026-05-02","batch_number":null,"administered_by":"Not clinic-verified","status":"Overdue","notes":null,"created_at":"2026-09-23 14:29:29"}],"open_visit":null},"11":{"id":"11","name":"buddy","species":"","breed":"","age":"0","weight":0,"owner_name":"adada","owner_contact":"091231231","owner_email":"nethjuanitas18@gmail.com","medical_history":"","gender":"","gender_label":"Not recorded","date_of_birth":"","raw_species":"","raw_breed":"","raw_age":"0","raw_weight":null,"history_records":[{"record_date":"2026-04-29","record_type":"visit","status":"Completed","title":"General Checkup","doctor_name":"Dr. kwak","description":"diagnpsewith ratartoui","notes":"eat a mouse atleast 1x a week","readonly":1}],"vaccinations":[],"open_visit":null},"12":{"id":"12","name":"buddy","species":"dog","breed":"aspin","age":"2","weight":0,"owner_name":"fraetin","owner_contact":"0","owner_email":"fraetin729@gmail.com","medical_history":"","gender":"","gender_label":"Not recorded","date_of_birth":"","raw_species":"dog","raw_breed":"aspin","raw_age":"2","raw_weight":null,"history_records":[],"vaccinations":[],"open_visit":null},"14":{"id":"14","name":"dagapromax","species":"Other","breed":"Kanal Daga","age":0,"weight":"0.5","owner_name":"tim justin ferrer","owner_contact":"09551738035","owner_email":"hinaruto100@gmail.com","medical_history":"","gender":"Female","gender_label":"Female","date_of_birth":"2026-09-01","raw_species":"Other","raw_breed":"Kanal Daga","raw_age":0,"raw_weight":"0.5","history_records":[{"record_date":"2026-10-11","record_type":"visit","status":"Completed","title":"Consultation","doctor_name":"Dr. Smith (Doctor)","description":"Completed visit. No consultation notes were recorded.","notes":"","readonly":1},{"id":"15","pet_id":"14","appointment_id":"98","record_type":"checkup","title":"Consultation","description":"ADA","doctor_name":"Dr. Smith (Doctor)","record_date":"2026-10-09","record_time":null,"status":"Completed","notes":"Treatment: Eat 3x a day","created_at":"2026-10-09 20:21:48","updated_at":"2026-10-09 20:21:48","pet_name":"dagapromax"},{"record_date":"2026-10-09","record_type":"visit","status":"Completed","title":"Consultation","doctor_name":"Dr. Smith (Doctor)","description":"Completed visit. No consultation notes were recorded.","notes":"","readonly":1}],"vaccinations":[],"open_visit":null},"15":{"id":"15","name":"dagapromax","species":"Other","breed":"Kanal Daga","age":0,"weight":"0.5","owner_name":"tim justin ferrer","owner_contact":"09551738035","owner_email":"hinaruto100@gmail.com","medical_history":"","gender":"Female","gender_label":"Female","date_of_birth":"2026-09-01","raw_species":"Other","raw_breed":"Kanal Daga","raw_age":0,"raw_weight":"0.5","history_records":[{"record_date":"2026-10-11","record_type":"visit","status":"Completed","title":"Consultation","doctor_name":"Dr. Smith (Doctor)","description":"Completed visit. No consultation notes were recorded.","notes":"","readonly":1},{"record_date":"2026-10-10","record_type":"visit","status":"Completed","title":"Consultation","doctor_name":"Dr. Smith (Doctor)","description":"ADA","notes":"Eat 3x a day","readonly":1},{"record_date":"2026-10-09","record_type":"visit","status":"Completed","title":"Consultation","doctor_name":"Dr. Smith (Doctor)","description":"Completed visit. No consultation notes were recorded.","notes":"","readonly":1}],"vaccinations":[{"id":"6","pet_id":"15","vaccine_name":"Core Vaccination","date_given":"2026-09-10","next_due":"2026-10-10","batch_number":null,"administered_by":"Not clinic-verified","status":"Overdue","notes":null,"created_at":"2026-10-01 17:14:52"}],"open_visit":null},"2":{"id":"2","name":"kenneth","species":"Dog","breed":"aspin","age":"1","weight":0,"owner_name":"tim justin ferrer","owner_contact":"0","owner_email":"hinaruto029@gmail.com","medical_history":"","gender":"","gender_label":"Not recorded","date_of_birth":"","raw_species":"Dog","raw_breed":"aspin","raw_age":"1","raw_weight":null,"history_records":[{"id":"1","pet_id":"2","appointment_id":"3","record_type":"checkup","title":"General Checkup","description":"Routine general checkup. ","doctor_name":"dr ferrer","record_date":"2025-03-22","record_time":"10:00:00","status":"Completed","notes":null,"created_at":"2026-09-23 14:29:29","updated_at":"2026-09-23 14:29:29","pet_name":"kenneth"},{"id":"2","pet_id":"2","appointment_id":"3","record_type":"diagnosis","title":"Diagnosis","description":"pangit","doctor_name":"dr ferrer","record_date":"2025-03-22","record_time":"10:00:00","status":"Completed","notes":null,"created_at":"2026-09-23 14:29:29","updated_at":"2026-09-23 14:29:29","pet_name":"kenneth"},{"id":"3","pet_id":"2","appointment_id":"3","record_type":"treatment","title":"Treatment \/ Medication","description":"wala","doctor_name":"dr ferrer","record_date":"2025-03-22","record_time":"10:00:00","status":"Completed","notes":null,"created_at":"2026-09-23 14:29:29","updated_at":"2026-09-23 14:29:29","pet_name":"kenneth"}],"vaccinations":[],"open_visit":null},"3":{"id":"3","name":"kenneth","species":"Dog","breed":"beagle","age":0,"weight":0,"owner_name":"tim justin ferrer","owner_contact":"0","owner_email":"timferrer1@gmail.com","medical_history":"","gender":"","gender_label":"Not recorded","date_of_birth":"","raw_species":"Dog","raw_breed":"beagle","raw_age":null,"raw_weight":null,"history_records":[],"vaccinations":[],"open_visit":null},"5":{"id":"5","name":"Kenshin","species":"Dog","breed":"Pango","age":"13","weight":"123","owner_name":"Kenneth","owner_contact":"09551738035","owner_email":"johnonly211@gmail.com","medical_history":"","gender":"","gender_label":"Not recorded","date_of_birth":"","raw_species":"Dog","raw_breed":"Pango","raw_age":"13","raw_weight":"123","history_records":[],"vaccinations":[],"open_visit":null},"7":{"id":"7","name":"Kenshin","species":"Dog","breed":"Husky","age":"5","weight":"11","owner_name":"kenshin","owner_contact":"N\/A","owner_email":"brattysis18@gmail.com","medical_history":"","gender":"","gender_label":"Not recorded","date_of_birth":"","raw_species":"Dog","raw_breed":"Husky","raw_age":"5","raw_weight":"11","history_records":[],"vaccinations":[{"id":"2","pet_id":"7","vaccine_name":"General Vaccination","date_given":"2026-04-30","next_due":"2026-04-15","batch_number":null,"administered_by":"Not clinic-verified","status":"Overdue","notes":null,"created_at":"2026-09-23 14:29:29"}],"open_visit":null},"1":{"id":"1","name":"max","species":"Dog","breed":"aspin","age":2,"weight":"8","owner_name":"tim justin ferrer","owner_contact":"09551738035","owner_email":"hinaruto100@gmail.com","medical_history":"","gender":"Male","gender_label":"Male","date_of_birth":"2024-01-20","raw_species":"Dog","raw_breed":"aspin","raw_age":2,"raw_weight":"8","history_records":[{"record_date":"2026-10-01","record_type":"visit","status":"Completed","title":"Consultation","doctor_name":"John Daviddddd","description":"Completed visit. No consultation notes were recorded.","notes":"","readonly":1},{"record_date":"2026-09-18","record_type":"visit","status":"Completed","title":"Consultation","doctor_name":"Dr. Smith (Doctor)","description":"Completed visit. No consultation notes were recorded.","notes":"","readonly":1},{"record_date":"2026-07-14","record_type":"visit","status":"Completed","title":"Consultation","doctor_name":"Dr. Smith (Doctor)","description":"Completed visit. No consultation notes were recorded.","notes":"","readonly":1},{"record_date":"2026-03-30","record_type":"visit","status":"Completed","title":"Vaccination and Deworming","doctor_name":"Dr. Smith (Doctor)","description":"Completed visit. No consultation notes were recorded.","notes":"","readonly":1}],"vaccinations":[],"open_visit":55},"6":{"id":"6","name":"Mocha","species":"Dog","breed":"Dachshund","age":4,"weight":"6","owner_name":"tim justin ferrer","owner_contact":"09551738035","owner_email":"hinaruto100@gmail.com","medical_history":"","gender":"Female","gender_label":"Female","date_of_birth":"2022-03-15","raw_species":"Dog","raw_breed":"Dachshund","raw_age":4,"raw_weight":"6","history_records":[{"record_date":"2026-10-12","record_type":"visit","status":"Completed","title":"Vaccination","doctor_name":"John Daviddddd","description":"Completed visit. No consultation notes were recorded.","notes":"","readonly":1},{"record_date":"2026-09-30","record_type":"visit","status":"Completed","title":"Vaccination","doctor_name":"Dr. Smith (Doctor)","description":"Completed visit. No consultation notes were recorded.","notes":"","readonly":1},{"record_date":"2026-04-30","record_type":"visit","status":"Completed","title":"Dental Prophylaxis","doctor_name":"Dr. Smith (Doctor)","description":"Completed visit. No consultation notes were recorded.","notes":"","readonly":1},{"record_date":"2026-04-17","record_type":"visit","status":"Completed","title":"Consultation","doctor_name":"\u003Cscript\u003Ealert(\u0022Hello\u0022)\u003C\/script\u003E","description":"\u003Cscript\u003Ealert(\u0022Hello\u0022)\u003C\/script\u003E","notes":"\u003Cscript\u003Ealert(\u0022Hello\u0022)\u003C\/script\u003E \u00b7 Rx: \u003Cscript\u003Ealert(\u0022Hello\u0022)\u003C\/script\u003E","readonly":1},{"id":"13","pet_id":"6","appointment_id":null,"record_type":"follow_up","title":"Follow-up Visit","description":"Condition improved. No signs of infection.","doctor_name":"Dr. Santos","record_date":"2026-04-10","record_time":"10:00:00","status":"Completed","notes":null,"created_at":"2026-09-23 15:29:51","updated_at":"2026-09-23 15:29:51","pet_name":"Mocha"},{"id":"10","pet_id":"6","appointment_id":null,"record_type":"checkup","title":"General Check-up","description":"Routine check-up. No major concerns found.","doctor_name":"Dr. Santos","record_date":"2026-03-10","record_time":"10:30:00","status":"Completed","notes":null,"created_at":"2026-09-23 15:29:51","updated_at":"2026-09-23 15:29:51","pet_name":"Mocha"},{"id":"11","pet_id":"6","appointment_id":null,"record_type":"diagnosis","title":"Diagnosis","description":"Mild skin infection. Prescribed topical medication.","doctor_name":"Dr. Santos","record_date":"2026-03-10","record_time":"11:15:00","status":"Completed","notes":null,"created_at":"2026-09-23 15:29:51","updated_at":"2026-09-23 15:29:51","pet_name":"Mocha"},{"id":"12","pet_id":"6","appointment_id":null,"record_type":"treatment","title":"Treatment \/ Medication","description":"Mupirocin ointment. Apply 2x a day for 7 days.","doctor_name":"Dr. Santos","record_date":"2026-03-10","record_time":"11:20:00","status":"Completed","notes":null,"created_at":"2026-09-23 15:29:51","updated_at":"2026-09-23 15:29:51","pet_name":"Mocha"}],"vaccinations":[{"id":"1","pet_id":"6","vaccine_name":"General Vaccination","date_given":"2026-03-25","next_due":"2026-05-27","batch_number":null,"administered_by":"Not clinic-verified","status":"Overdue","notes":null,"created_at":"2026-09-23 14:29:29"},{"id":"5","pet_id":"6","vaccine_name":"DHPP (5-in-1)","date_given":"2026-01-15","next_due":"2027-01-15","batch_number":null,"administered_by":"Not clinic-verified","status":"Up to date","notes":null,"created_at":"2026-09-23 15:29:51"},{"id":"4","pet_id":"6","vaccine_name":"Rabies","date_given":"2026-01-15","next_due":"2027-01-15","batch_number":null,"administered_by":"Not clinic-verified","status":"Up to date","notes":null,"created_at":"2026-09-23 15:29:51"}],"open_visit":null},"4":{"id":"4","name":"Rhus","species":"Dog","breed":"hybrid","age":3,"weight":"12","owner_name":"tim justin ferrer","owner_contact":"09551738035","owner_email":"hinaruto100@gmail.com","medical_history":"","gender":"Male","gender_label":"Male","date_of_birth":"2023-06-10","raw_species":"Dog","raw_breed":"hybrid","raw_age":3,"raw_weight":"12","history_records":[{"id":"7","pet_id":"4","appointment_id":"43","record_type":"checkup","title":"Laboratory Test","description":"Routine laboratory test. ","doctor_name":"Dr.Jsutin","record_date":"2026-04-23","record_time":"08:00:00","status":"Completed","notes":null,"created_at":"2026-09-23 14:29:29","updated_at":"2026-09-23 14:29:29","pet_name":"Rhus"},{"id":"8","pet_id":"4","appointment_id":"43","record_type":"diagnosis","title":"Diagnosis","description":"kennetgh","doctor_name":"Dr.Jsutin","record_date":"2026-04-23","record_time":"08:00:00","status":"Completed","notes":null,"created_at":"2026-09-23 14:29:29","updated_at":"2026-09-23 14:29:29","pet_name":"Rhus"},{"id":"9","pet_id":"4","appointment_id":"43","record_type":"treatment","title":"Treatment \/ Medication","description":"inaacid lagnat","doctor_name":"Dr.Jsutin","record_date":"2026-04-23","record_time":"08:00:00","status":"Completed","notes":null,"created_at":"2026-09-23 14:29:29","updated_at":"2026-09-23 14:29:29","pet_name":"Rhus"},{"record_date":"2026-04-01","record_type":"visit","status":"Completed","title":"Consultation","doctor_name":"Dr. Smith (Doctor)","description":"Completed visit. No consultation notes were recorded.","notes":"","readonly":1},{"id":"4","pet_id":"4","appointment_id":"12","record_type":"checkup","title":"Vaccination and Deworming","description":"Routine vaccination and deworming. ","doctor_name":"smith","record_date":"2026-03-28","record_time":"19:36:00","status":"Completed","notes":null,"created_at":"2026-09-23 14:29:29","updated_at":"2026-09-23 14:29:29","pet_name":"Rhus"},{"id":"5","pet_id":"4","appointment_id":"12","record_type":"diagnosis","title":"Diagnosis","description":"ewe","doctor_name":"smith","record_date":"2026-03-28","record_time":"19:36:00","status":"Completed","notes":null,"created_at":"2026-09-23 14:29:29","updated_at":"2026-09-23 14:29:29","pet_name":"Rhus"},{"id":"6","pet_id":"4","appointment_id":"12","record_type":"treatment","title":"Treatment \/ Medication","description":"qweq","doctor_name":"smith","record_date":"2026-03-28","record_time":"19:36:00","status":"Completed","notes":null,"created_at":"2026-09-23 14:29:29","updated_at":"2026-09-23 14:29:29","pet_name":"Rhus"}],"vaccinations":[],"open_visit":null}};
+    var params = new URLSearchParams(location.search);
+    var open = params.get('open');
+    if (open && ALL_PETS[open]) {
+        openEmrModal(ALL_PETS[open]);
+        var tabBtn = document.getElementById('tabBtn-' + (params.get('tab') || 'profile'));
+        if (tabBtn) bootstrap.Tab.getOrCreateInstance(tabBtn).show();
+        history.replaceState(null, '', 'doctor_patients.php');
+    }
+});
+
+function escHtml(t) {
+    var d = document.createElement('div');
+    d.appendChild(document.createTextNode(t || ''));
+    return d.innerHTML;
+}
+</script>
+<script src="mousetrail.js"></script>
+<script>window.addEventListener("load",function(){setTimeout(function(){document.querySelector(".ep-view").click();},300);});</script></body>
+</html>

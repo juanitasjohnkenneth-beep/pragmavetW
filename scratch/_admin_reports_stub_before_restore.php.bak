@@ -1,0 +1,8 @@
+<?php
+// The Reports Center was merged into the Admin Dashboard (admin.php): descriptive analytics, printing and CSV export live there.
+// Old links and bookmarks are forwarded with their period (and export) choices.
+session_start();
+$keep = array_intersect_key($_GET, array_flip(['period', 'start_date', 'end_date']));
+if (!empty($_GET['export_report'])) $keep['export'] = $_GET['export_report'] === 'system' ? 'accounts' : $_GET['export_report'];
+header('Location: admin.php' . ($keep ? '?' . http_build_query($keep) : ''));
+exit();

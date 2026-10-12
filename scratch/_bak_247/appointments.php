@@ -1,0 +1,4726 @@
+    <?php
+session_start();
+include("dbconnection.php");
+include_once("paymongo_config.php");
+include_once("includes/pm_verify.php");
+
+if (!isset($_SESSION['user_id'])) {
+    header("Location: index.php");
+    exit();
+}
+include_once("includes/rbac_guard.php");
+include_once("includes/doctor_weekly_schedule.php");
+// RBAC: Client Portal access control
+$user_role = rbac_get_role();
+if (!in_array($user_role, ['user', 'client'])) {
+    header("Location: " . rbac_home_url($user_role));
+    exit();
+}
+
+
+$user_id = $_SESSION['user_id'];
+$user_name = $_SESSION['user'];
+include_once("includes/staff_notify.php");
+include_once("includes/client_notify.php");
+include_once("includes/service_prices.php");
+
+// ===== RESERVATION FEE: Initiate PayMongo Checkout =====
+if (isset($_GET['initpay']) && $_GET['initpay'] === 'reservation' && isset($_GET['appt_id'])) {
+    $appt_id = intval($_GET['appt_id']);
+    $aq = $conn->prepare("SELECT id, pet_name, service_type, downpayment_status FROM appointments WHERE id=? AND user_id=?");
+    $aq->bind_param("ii", $appt_id, $user_id);
+    $aq->execute();
+    $appt = $aq->get_result()->fetch_assoc();
+    if (!$appt) {
+        $_SESSION['message'] = "Invalid appointment.";
+        $_SESSION['msg_type'] = "danger";
+        header("Location: appointments.php");
+        exit();
+    }
+    if ($appt['downpayment_status'] === 'Paid') {
+        $_SESSION['message'] = "The reservation fee for this appointment is already paid.";
+        $_SESSION['msg_type'] = "info";
+        header("Location: appointments.php");
+        exit();
+    }
+    $protocol = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ? 'https' : 'http';
+    $domain = $protocol . '://' . $_SERVER['HTTP_HOST'];
+    $label = "PragmaVet Reservation Fee - " . $appt['service_type'] . " for " . $appt['pet_name'];
+    $result = paymongo_create_checkout(
+        150.00,
+        $label,
+        $domain . '/pragmavet/appointments.php?pm_success=reservation&appt_id=' . $appt_id,
+        $domain . '/pragmavet/appointments.php?pm_cancelled=1&appt_id=' . $appt_id,
+        ['appt_id' => (string)$appt_id, 'type' => 'reservation']
+    );
+    if (isset($result['url'])) {
+        // Remember which checkout this is, so the return page can confirm it with PayMongo
+        $_SESSION['pm_resfee'][$appt_id] = ['id' => $result['id'] ?? null, 'amount' => 150.00];
+        header("Location: " . $result['url']);
+        exit();
+    } else {
+        $err = $result['error'] ?? json_encode($result);
+        $_SESSION['message'] = "Payment gateway error: " . $err;
+        $_SESSION['msg_type'] = "danger";
+        header("Location: appointments.php");
+        exit();
+    }
+}
+
+// ===== RESERVATION FEE: PayMongo Success Callback =====
+if (isset($_GET['pm_success']) && $_GET['pm_success'] === 'reservation' && isset($_GET['appt_id'])) {
+    $appt_id = intval($_GET['appt_id']);
+    $pending = $_SESSION['pm_resfee'][$appt_id] ?? null;
+    $own = $conn->query("SELECT downpayment_status FROM appointments WHERE id=$appt_id AND user_id=$user_id")->fetch_assoc();
+
+    if ($own && $own['downpayment_status'] === 'Paid') {
+        // Already recorded (e.g. the page was refreshed): don't record or notify twice
+        unset($_SESSION['pm_resfee'][$appt_id]);
+        $_SESSION['message'] = "The reservation fee for this appointment is already paid.";
+        $_SESSION['msg_type'] = "info";
+    } elseif (!$own || !$pending || !pm_checkout_paid($pending['id'], $pending['amount'])) {
+        // Only trust the return URL if PayMongo confirms this checkout session was paid
+        $_SESSION['message'] = "We could not confirm this payment with PayMongo. Your appointment is saved, but the reservation fee is still unpaid. If you were charged, please contact the clinic.";
+        $_SESSION['msg_type'] = "danger";
+    } else {
+        unset($_SESSION['pm_resfee'][$appt_id]);
+        $conn->query("UPDATE appointments SET downpayment_amount=150.00, downpayment_status='Paid', downpayment_paid_at=NOW() WHERE id=$appt_id AND user_id=$user_id");
+        $conn->query("UPDATE billing SET downpayment_amount=150.00, downpayment_status='Paid', downpayment_paid_at=NOW(), payment_status='Partial' WHERE appointment_id=$appt_id AND is_boarding=0");
+        $note = $conn->prepare("INSERT INTO notifications (user_id, message, is_read, created_at) VALUES (?, ?, 0, NOW())");
+        if ($note) {
+            $notif_msg = "Reservation fee of P150 paid for Appointment #$appt_id. Your slot is secured.";
+            notify_staff($conn, "$user_name paid the P150 reservation fee for appointment #$appt_id.", staff_link_for('Appointment', $appt_id));
+            $note->bind_param("is", $user_id, $notif_msg);
+            $note->execute();
+        }
+        $_SESSION['message'] = "Reservation fee paid! Your appointment slot is secured. Staff will confirm shortly.";
+        $_SESSION['msg_type'] = "success";
+    }
+    header("Location: appointments.php");
+    exit();
+}
+
+// ===== RESERVATION FEE: Payment Cancelled =====
+if (isset($_GET['pm_cancelled']) && isset($_GET['appt_id'])) {
+    $_SESSION['message'] = "Payment was cancelled. Your appointment is saved but the reservation fee was not paid.";
+    $_SESSION['msg_type'] = "warning";
+    header("Location: appointments.php");
+    exit();
+}
+
+
+// Include pet data helper for multi-pet and profile sync
+include_once("includes/pet_data_helper.php");
+
+// ── Check for unrated completed appointment for auto-popup ──
+// Only ask about a recent visit (completed within the last 14 days) that hasn't been rated yet
+$pending_feedback = $conn->query("
+    SELECT id, pet_name, service_type FROM appointments
+    WHERE user_id=$user_id AND status='Completed' AND id NOT IN (SELECT appointment_id FROM feedbacks)
+      AND appointment_date >= DATE_SUB(CURDATE(), INTERVAL 14 DAY)
+    ORDER BY appointment_date DESC LIMIT 1
+")->fetch_assoc();
+if (!$pending_feedback) {
+    // Check boarding too
+    $pending_feedback = $conn->query("
+        SELECT id, pet_name, service_type FROM boarding_reservations
+        WHERE user_id=$user_id AND status='Completed' AND id NOT IN (SELECT appointment_id FROM feedbacks)
+          AND COALESCE(end_date, appointment_date) >= DATE_SUB(CURDATE(), INTERVAL 14 DAY)
+        ORDER BY appointment_date DESC LIMIT 1
+    ")->fetch_assoc();
+}
+
+// ── Fetch pets for booking form ───────────────────────────────────────────────
+// Also fetch pets with IDs and pictures for multi-pet selection
+$pets_for_form = [];
+$stmt_pets = $conn->prepare("SELECT id, name, species, breed, age, pet_picture FROM pets WHERE user_id=? ORDER BY name ASC");
+if ($stmt_pets) {
+    $stmt_pets->bind_param("i", $user_id);
+    $stmt_pets->execute();
+    $pets_result = $stmt_pets->get_result();
+    if ($pets_result) {
+        while ($p = $pets_result->fetch_assoc()) {
+            $pets_for_form[] = $p;
+        }
+    }
+} else {
+    $r_p = $conn->query("SELECT * FROM pets WHERE user_id=$user_id ORDER BY name ASC");
+    if ($r_p) {
+        while ($p = $r_p->fetch_assoc()) {
+            $pets_for_form[] = $p;
+        }
+    }
+}
+
+// ── Fetch doctors ─────────────────────────────────────────────────────────────
+$doctors = [];
+$r = $conn->query("SELECT id, fullname FROM users WHERE role='doctor' ORDER BY fullname ASC");
+if ($r)
+    while ($d = $r->fetch_assoc())
+        $doctors[] = $d;
+
+// ── Doctor leave dates (for client-side validation) ───────────────────────────
+$unavailability = [];
+$now = date('Y-m-d');
+$ru = $conn->query("SELECT doctor_id, unavailable_date FROM doctor_unavailability WHERE unavailable_date >= '$now'");
+if ($ru)
+    while ($u = $ru->fetch_assoc()) {
+        $unavailability[$u['doctor_id']][] = $u['unavailable_date'];
+    }
+$doctorLeavesJSON = json_encode($unavailability);
+
+// Fetch all existing booked appointment slots (for disabling taken time slots)
+$booked_slots = [];
+$r_booked = $conn->query("
+    SELECT appointment_date, TIME_FORMAT(appointment_time, '%H:%i') as slot_time 
+    FROM appointments 
+    WHERE appointment_date >= CURDATE() 
+      AND status NOT IN ('Cancelled', 'Rejected')
+");
+if ($r_booked) {
+    while ($b = $r_booked->fetch_assoc()) {
+        $key = $b['appointment_date'] . '|' . $b['slot_time'];
+        $booked_slots[$key] = true;
+    }
+}
+$bookedSlotsJSON = json_encode($booked_slots);
+
+// ── Smart Scheduling: Holidays ────────────────────────────────────────────
+$holiday_dates = [];
+$r_hols = $conn->query("SELECT holiday_date, holiday_name FROM clinic_holidays WHERE is_active=1 AND holiday_date >= CURDATE() ORDER BY holiday_date ASC");
+$holiday_map = []; // date => name
+if ($r_hols) while ($h = $r_hols->fetch_assoc()) {
+    $holiday_dates[] = $h['holiday_date'];
+    $holiday_map[$h['holiday_date']] = $h['holiday_name'];
+}
+$holidaysJSON = json_encode($holiday_dates);
+
+// ── Smart Scheduling: Per-Doctor Schedules ───────────────────────────────
+$doctor_sched_map = [];
+$r_ds = $conn->query("SELECT doctor_id, TIME_FORMAT(work_start,'%H:%i') as work_start, TIME_FORMAT(work_end,'%H:%i') as work_end, TIME_FORMAT(break_start,'%H:%i') as break_start, TIME_FORMAT(break_end,'%H:%i') as break_end, buffer_mins, max_appts_per_day FROM doctor_schedules WHERE is_active=1");
+if ($r_ds) while ($ds = $r_ds->fetch_assoc()) $doctor_sched_map[(int)$ds['doctor_id']] = $ds;
+$doctorSchedulesJSON = json_encode($doctor_sched_map);
+$doctorWeeklyJSON    = json_encode(dws_get_all($conn));
+
+// ── Smart Scheduling: recommend a veterinarian from live availability ──
+// For each vet over the next 30 days: skip Sundays, clinic holidays, the vet's leave days, days off in their weekly
+// schedule and days already at their daily limit. The vet with the most free capacity this week (then the earliest
+// open day) is recommended and pre-selected; the client can still pick another vet.
+$vet_smart = [];
+$recommended_vet = 0;
+$db_today = $conn->query("SELECT CURDATE() d")->fetch_assoc()['d'];
+$vet_day_load = [];
+$r_vl = $conn->query("SELECT doctor_id, appointment_date d, COUNT(*) c FROM appointments
+                      WHERE doctor_id IS NOT NULL AND status IN ('Pending', 'Approved', 'Checked In', 'Reschedule Requested', 'Reschedule Proposed')
+                        AND appointment_date BETWEEN '$db_today' + INTERVAL 1 DAY AND '$db_today' + INTERVAL 30 DAY
+                      GROUP BY doctor_id, appointment_date");
+if ($r_vl) while ($vl = $r_vl->fetch_assoc()) $vet_day_load[(int)$vl['doctor_id']][$vl['d']] = (int)$vl['c'];
+foreach ($doctors as $doc) {
+    $vid  = (int)$doc['id'];
+    $week = dws_get_week($conn, $vid);
+    $cap  = !empty($doctor_sched_map[$vid]['max_appts_per_day']) ? (int)$doctor_sched_map[$vid]['max_appts_per_day'] : 10;
+    $next = null; $booked7 = 0; $free7 = 0; $days7 = 0;
+    for ($i = 1; $i <= 30; $i++) {
+        $d   = date('Y-m-d', strtotime("$db_today +$i day"));
+        $cnt = $vet_day_load[$vid][$d] ?? 0;
+        if ($i <= 7) $booked7 += $cnt;
+        $open = date('w', strtotime($d)) !== '0' && !isset($holiday_map[$d]) && !in_array($d, $unavailability[$vid] ?? [], true)
+             && !empty($week[(int)date('w', strtotime($d))]['is_working']) && $cnt < $cap;
+        if ($open) {
+            if ($next === null) $next = $d;
+            if ($i <= 7) { $free7 += $cap - $cnt; $days7++; }
+        }
+    }
+    $vet_smart[$vid] = ['next' => $next, 'booked7' => $booked7, 'free7' => $free7, 'days7' => $days7];
+}
+$best = null;
+foreach ($vet_smart as $vid => $v) {
+    if ($v['next'] === null) continue;
+    if ($best === null || $v['free7'] > $vet_smart[$best]['free7'] || ($v['free7'] === $vet_smart[$best]['free7'] && $v['next'] < $vet_smart[$best]['next'])) $best = $vid;
+}
+$recommended_vet = $best ?? (int)($doctors[0]['id'] ?? 0);
+$recommended_name = '';
+foreach ($doctors as $doc) if ((int)$doc['id'] === $recommended_vet) $recommended_name = $doc['fullname'];
+
+// ── Smart Scheduling: Duration-Aware Booked Slots ───────────────────────
+// Each entry: {s: startMins, d: durationMins} so JS can check overlaps
+$booked_detailed = [];
+$r_bd = $conn->query("
+    SELECT a.appointment_date,
+           TIME_FORMAT(a.appointment_time,'%H:%i') as slot_time,
+           IFNULL(sd.duration_minutes, 30) as duration_minutes
+    FROM appointments a
+    LEFT JOIN service_durations sd ON a.service_type = sd.service_type
+    WHERE a.appointment_date >= CURDATE()
+      AND a.status NOT IN ('Cancelled','Rejected')
+");
+if ($r_bd) {
+    while ($b = $r_bd->fetch_assoc()) {
+        $d = $b['appointment_date'];
+        if (!isset($booked_detailed[$d])) $booked_detailed[$d] = [];
+        list($bh, $bm) = explode(':', $b['slot_time']);
+        $booked_detailed[$d][] = ['s' => (int)$bh * 60 + (int)$bm, 'd' => (int)$b['duration_minutes']];
+    }
+}
+$bookedDetailedJSON = json_encode($booked_detailed);
+
+// ── Service durations map for frontend ───────────────────────────────────
+$svc_dur_map = [];
+$r_svd = $conn->query("SELECT service_type, duration_minutes FROM service_durations");
+if ($r_svd) while ($sv = $r_svd->fetch_assoc()) $svc_dur_map[$sv['service_type']] = (int)$sv['duration_minutes'];
+$serviceDurationsJSON = json_encode($svc_dur_map);
+
+// ── Smart Suggestion: Appointment density per date (next 30 days) ────────────────
+$appt_density = [];
+$r_dens = $conn->query("
+    SELECT appointment_date, COUNT(*) as cnt
+    FROM appointments
+    WHERE appointment_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 30 DAY)
+      AND status NOT IN ('Cancelled','Rejected')
+    GROUP BY appointment_date
+");
+if ($r_dens) while ($dens = $r_dens->fetch_assoc())
+    $appt_density[$dens['appointment_date']] = (int)$dens['cnt'];
+$apptDensityJSON = json_encode($appt_density);
+
+// ── POST: Book appointment ────────────────────────────────────────────────────
+if (isset($_POST['book'])) {
+    $pet = $_POST['pet_name'];
+    $service = $_POST['service_type'];
+    if (stripos($service, 'boarding') !== false) {
+        $msg = "Pet boarding is booked on the Pet Boarding page, where you choose a cage and dates.";
+        if (!empty($_POST['return_appt_id'])) { echo "APPT_ERROR:" . $msg; exit(); }
+        $_SESSION['message'] = $msg;
+        $_SESSION['msg_type'] = "warning";
+        header("Location: boarding.php");
+        exit();
+    }
+    $date = $_POST['appointment_date'];
+    $time = $_POST['appointment_time'];
+    $location = $_POST['service_location'];
+    $address = empty($_POST['home_address']) ? NULL : trim($_POST['home_address']);
+    $end_date = empty($_POST['end_date']) ? NULL : $_POST['end_date'];
+    $doctor_id = empty($_POST['doctor_id']) ? NULL : (int) $_POST['doctor_id'];
+    $signature_data = empty($_POST['signature_data']) ? NULL : $_POST['signature_data'];
+
+    // ─── SMART SCHEDULING VALIDATION ───────────────────────────────────────
+    
+    // 1. Validate date is not in the past or same day
+    $today = date('Y-m-d');
+    $tomorrow = date('Y-m-d', strtotime('+1 day'));
+    if ($date < $tomorrow) {
+        $_SESSION['message'] = "❌ Appointments must be booked at least 24 hours in advance. Earliest available: $tomorrow";
+        $_SESSION['msg_type'] = "danger";
+        if (!empty($_POST['return_appt_id'])) {
+            echo "APPT_ERROR:" . "❌ Appointments must be booked at least 24 hours in advance. Earliest available: $tomorrow";
+            exit();
+        }
+        header("Location: appointments.php");
+        exit();
+    }
+
+    // 1b. Check if date falls on a public holiday
+    if (isset($holiday_map[$date])) {
+        $hol_fmt = date('F j, Y', strtotime($date));
+        $_SESSION['message'] = "The clinic is closed on $hol_fmt ({$holiday_map[$date]}). Please choose another date.";
+        $_SESSION['msg_type'] = "danger";
+        if (!empty($_POST['return_appt_id'])) {
+            echo "APPT_ERROR:" . "The clinic is closed on $hol_fmt ({$holiday_map[$date]}). Please choose another date.";
+            exit();
+        }
+        header("Location: appointments.php");
+        exit();
+    }
+
+    // 1c. Block Sundays server-side
+    if (date('N', strtotime($date)) == 7) {
+        $_SESSION['message'] = "The clinic is closed on Sundays. Please select a weekday.";
+        $_SESSION['msg_type'] = "danger";
+        if (!empty($_POST['return_appt_id'])) {
+            echo "APPT_ERROR:" . "The clinic is closed on Sundays. Please select a weekday.";
+            exit();
+        }
+        header("Location: appointments.php");
+        exit();
+    }
+
+    // 2. Get service duration from service_durations table
+    $duration_minutes = 30;
+    $stmt_duration = $conn->prepare("SELECT duration_minutes FROM service_durations WHERE service_type = ?");
+    if ($stmt_duration) {
+        $stmt_duration->bind_param("s", $service);
+        $stmt_duration->execute();
+        $service_result = $stmt_duration->get_result();
+        $service_duration = $service_result ? $service_result->fetch_assoc() : null;
+        $duration_minutes = $service_duration ? $service_duration['duration_minutes'] : 30;
+    } else {
+        error_log('appointments.php: failed to prepare service duration query - ' . $conn->error);
+    }
+
+    // Calculate appointment end time
+    $appointment_end_time = date('H:i:s', strtotime($time . ' +' . $duration_minutes . ' minutes'));
+
+    // 2b. Every appointment has a veterinarian (the wizard recommends one) — so every check below always runs
+    if (empty($doctor_id) || !$conn->query("SELECT id FROM users WHERE id = " . (int)$doctor_id . " AND role = 'doctor'")->num_rows) {
+        $msg = "Please choose a veterinarian for this appointment.";
+        if (!empty($_POST['return_appt_id'])) { echo "APPT_ERROR:" . $msg; exit(); }
+        $_SESSION['message'] = $msg;
+        $_SESSION['msg_type'] = "danger";
+        header("Location: appointments.php");
+        exit();
+    }
+
+    // Only one booking at a time is checked and saved for this vet and day, so two clients can't take the same slot together
+    // (the lock is released automatically when this request ends)
+    $lock_ok = (int)($conn->query("SELECT GET_LOCK('pv_book_" . (int)$doctor_id . "_" . $conn->real_escape_string($date) . "', 10) l")->fetch_assoc()['l'] ?? 0);
+    if (!$lock_ok) {
+        $msg = "Many bookings are being made right now. Please try again in a moment.";
+        if (!empty($_POST['return_appt_id'])) { echo "APPT_ERROR:" . $msg; exit(); }
+        $_SESSION['message'] = $msg;
+        $_SESSION['msg_type'] = "warning";
+        header("Location: appointments.php");
+        exit();
+    }
+
+    // 3. Validate against smart scheduling rules for the chosen veterinarian
+    if (!empty($doctor_id)) {
+        // 3a. Check if doctor is on leave
+        $chk = $conn->prepare("SELECT id FROM doctor_unavailability WHERE doctor_id=? AND unavailable_date=?");
+        if (!$chk) {
+            error_log('appointments.php: prepare failed on doctor_unavailability - ' . $conn->error);
+            $_SESSION['message'] = "❌ Database error. Please try again.";
+        $_SESSION['msg_type'] = "danger";
+        if (!empty($_POST['return_appt_id'])) {
+            echo "APPT_ERROR:" . "❌ Database error. Please try again.";
+            exit();
+        }
+        header("Location: appointments.php");
+        exit();
+        }
+        $chk->bind_param("is", $doctor_id, $date);
+        $chk->execute();
+        if ($chk->get_result()->num_rows > 0) {
+            $_SESSION['message'] = "❌ The selected doctor is not available on this date (on leave). Please choose another date or doctor.";
+        $_SESSION['msg_type'] = "danger";
+        if (!empty($_POST['return_appt_id'])) {
+            echo "APPT_ERROR:" . "❌ The selected doctor is not available on this date (on leave). Please choose another date or doctor.";
+            exit();
+        }
+        header("Location: appointments.php");
+        exit();
+        }
+        
+        // 3b. Get doctor's working hours and settings
+        $doc_stmt = $conn->prepare("SELECT fullname FROM users WHERE id = ? AND role = 'doctor'");
+        if (!$doc_stmt) {
+            error_log('appointments.php: prepare failed on users lookup - ' . $conn->error);
+            $_SESSION['message'] = "❌ Database error. Please try again.";
+        $_SESSION['msg_type'] = "danger";
+        if (!empty($_POST['return_appt_id'])) {
+            echo "APPT_ERROR:" . "❌ Database error. Please try again.";
+            exit();
+        }
+        header("Location: appointments.php");
+        exit();
+        }
+        $doc_stmt->bind_param("i", $doctor_id);
+        $doc_stmt->execute();
+        $doc_result = $doc_stmt->get_result();
+        if ($doc_result->num_rows === 0) {
+            $_SESSION['message'] = "❌ Doctor not found. Please try again.";
+        $_SESSION['msg_type'] = "danger";
+        if (!empty($_POST['return_appt_id'])) {
+            echo "APPT_ERROR:" . "❌ Doctor not found. Please try again.";
+            exit();
+        }
+        header("Location: appointments.php");
+        exit();
+        }
+        
+        $doctor_info = $doc_result->fetch_assoc();
+        // 3b. Get doctor schedule from DB (fall back to clinic defaults)
+        $sched            = $doctor_sched_map[$doctor_id] ?? null;
+        $doc_start_time   = $sched ? ($sched['work_start']  . ':00') : '08:00:00';
+        $doc_end_time     = $sched ? ($sched['work_end']    . ':00') : '17:00:00';
+        $break_start_time = ($sched && !empty($sched['break_start'])) ? ($sched['break_start'] . ':00') : '12:00:00';
+        $break_end_time   = ($sched && !empty($sched['break_end']))   ? ($sched['break_end']   . ':00') : '13:00:00';
+        $buffer_mins      = $sched ? (int)$sched['buffer_mins']       : 15;
+        $max_appts        = $sched ? (int)$sched['max_appts_per_day'] : 10;
+
+        // 3b-2. Doctor's weekly schedule overrides hours for that weekday
+        $day_sched = dws_get_day($conn, (int)$doctor_id, $date);
+        if (!$day_sched['is_working']) {
+            $msg = "The selected doctor does not work on " . date('l', strtotime($date)) . "s. Please choose another date or doctor.";
+            $_SESSION['message'] = $msg;
+            $_SESSION['msg_type'] = "danger";
+            if (!empty($_POST['return_appt_id'])) {
+                echo "APPT_ERROR:" . $msg;
+                exit();
+            }
+            header("Location: appointments.php");
+            exit();
+        }
+        $doc_start_time   = $day_sched['work_start'] . ':00';
+        $doc_end_time     = $day_sched['work_end'] . ':00';
+        $has_break        = !empty($day_sched['break_start']) && !empty($day_sched['break_end']);
+        $break_start_time = $has_break ? $day_sched['break_start'] . ':00' : null;
+        $break_end_time   = $has_break ? $day_sched['break_end'] . ':00' : null;
+
+        // 3c. Validate time is within working hours
+        $slot_time     = strtotime($time);
+        $slot_end      = strtotime($appointment_end_time);
+        $working_start = strtotime($doc_start_time);
+        $working_end   = strtotime($doc_end_time);
+
+        if ($slot_time < $working_start || $slot_end > $working_end) {
+            $_SESSION['message'] = "❌ Requested time is outside doctor's working hours (" . substr($doc_start_time, 0, 5) . " - " . substr($doc_end_time, 0, 5) . ").";
+        $_SESSION['msg_type'] = "danger";
+        if (!empty($_POST['return_appt_id'])) {
+            echo "APPT_ERROR:" . "❌ Requested time is outside doctor's working hours (" . substr($doc_start_time, 0, 5) . " - " . substr($doc_end_time, 0, 5) . ").";
+            exit();
+        }
+        header("Location: appointments.php");
+        exit();
+        }
+        
+        // 3c-2. Validate slot does not overlap the doctor's break time
+        $break_s = $has_break ? strtotime($break_start_time) : 0;
+        $break_e = $has_break ? strtotime($break_end_time) : 0;
+        if ($has_break && !($slot_end <= $break_s || $slot_time >= $break_e)) {
+            $_SESSION['message'] = "This time slot overlaps the doctor's break ("
+                . substr($break_start_time, 0, 5) . " - " . substr($break_end_time, 0, 5)
+                . "). Please choose a slot before or after the break.";
+        $_SESSION['msg_type'] = "danger";
+        if (!empty($_POST['return_appt_id'])) {
+            echo "APPT_ERROR:" . "This time slot overlaps the doctor's break ("
+                . substr($break_start_time, 0, 5) . " - " . substr($break_end_time, 0, 5)
+                . "). Please choose a slot before or after the break.";
+            exit();
+        }
+        header("Location: appointments.php");
+        exit();
+        }
+
+        // 3d. Check for slot conflicts with existing appointments (prevent double-booking)
+        $conflict_stmt = $conn->prepare("
+            SELECT id, appointment_time, service_type 
+            FROM appointments 
+            WHERE doctor_id = ? AND appointment_date = ? AND status IN ('Pending', 'Approved')
+        ");
+        if (!$conflict_stmt) {
+            error_log('appointments.php: prepare failed on conflict check - ' . $conn->error);
+            $_SESSION['message'] = "❌ Database error. Please try again.";
+        $_SESSION['msg_type'] = "danger";
+        if (!empty($_POST['return_appt_id'])) {
+            echo "APPT_ERROR:" . "❌ Database error. Please try again.";
+            exit();
+        }
+        header("Location: appointments.php");
+        exit();
+        }
+        $conflict_stmt->bind_param("is", $doctor_id, $date);
+        $conflict_stmt->execute();
+        $conflict_result = $conflict_stmt->get_result();
+        
+        while ($existing = $conflict_result->fetch_assoc()) {
+            $existing_start = strtotime($existing['appointment_time']);
+            $existing_duration = 30;
+            $stmt_duration_existing = $conn->prepare("SELECT duration_minutes FROM service_durations WHERE service_type = ?");
+            if ($stmt_duration_existing) {
+                $stmt_duration_existing->bind_param("s", $existing['service_type']);
+                $stmt_duration_existing->execute();
+                $existing_result = $stmt_duration_existing->get_result();
+                $existing_service = $existing_result ? $existing_result->fetch_assoc() : null;
+                $existing_duration = $existing_service ? $existing_service['duration_minutes'] : 30;
+            }
+            $existing_end = $existing_start + ($existing_duration * 60);
+            
+            // Add buffer on both sides
+            $buffer_seconds = $buffer_mins * 60;
+            $check_start = $existing_start - $buffer_seconds;
+            $check_end = $existing_end + $buffer_seconds;
+            
+            // Check if proposed slot overlaps with existing appointment + buffer
+            if (!($slot_end <= $check_start || $slot_time >= $check_end)) {
+                $next_available = date('H:i', $existing_end + $buffer_seconds);
+                $_SESSION['message'] = "❌ This time slot is taken or too close to another appointment. Try " . $next_available . " or later.";
+        $_SESSION['msg_type'] = "danger";
+        if (!empty($_POST['return_appt_id'])) {
+            echo "APPT_ERROR:" . "❌ This time slot is taken or too close to another appointment. Try " . $next_available . " or later.";
+            exit();
+        }
+        header("Location: appointments.php");
+        exit();
+            }
+        }
+        
+        // 3e. Check doctor capacity for the day
+        $capacity_stmt = $conn->prepare("
+            SELECT COUNT(*) as count FROM appointments 
+            WHERE doctor_id = ? AND appointment_date = ? AND status IN ('Pending', 'Approved')
+        ");
+        if (!$capacity_stmt) {
+            error_log('appointments.php: prepare failed on capacity check - ' . $conn->error);
+            $_SESSION['message'] = "❌ Database error. Please try again.";
+        $_SESSION['msg_type'] = "danger";
+        if (!empty($_POST['return_appt_id'])) {
+            echo "APPT_ERROR:" . "❌ Database error. Please try again.";
+            exit();
+        }
+        header("Location: appointments.php");
+        exit();
+        }
+        $capacity_stmt->bind_param("is", $doctor_id, $date);
+        $capacity_stmt->execute();
+        $capacity_result = $capacity_stmt->get_result()->fetch_assoc();
+        $current_count = $capacity_result['count'];
+        
+        if ($current_count >= $max_appts) {
+            $_SESSION['message'] = "❌ Dr. " . htmlspecialchars($doctors[array_search($doctor_id, array_column($doctors, 'id'))]['fullname'] ?? 'Unknown') . " is fully booked on this date. Please try another date or doctor.";
+        $_SESSION['msg_type'] = "danger";
+        if (!empty($_POST['return_appt_id'])) {
+            echo "APPT_ERROR:" . "❌ Dr. " . htmlspecialchars($doctors[array_search($doctor_id, array_column($doctors, 'id'))]['fullname'] ?? 'Unknown') . " is fully booked on this date. Please try another date or doctor.";
+            exit();
+        }
+        header("Location: appointments.php");
+        exit();
+        }
+    }
+    
+    // Handle multi-pet support: parse pet_name as JSON or comma-separated
+    $pet_names_arr = [];
+    $pet_ids_arr = [];
+    
+    // Check if pet_name contains JSON array (from multi-pet selection)
+    $first_char = substr($pet, 0, 1);
+    if ($first_char === '[' || $first_char === '{') {
+        $pet_data = json_decode($pet, true);
+        if (is_array($pet_data)) {
+            foreach ($pet_data as $p) {
+                $pet_names_arr[] = $p['name'] ?? $p;
+                $pet_ids_arr[] = $p['id'] ?? null;
+            }
+        }
+    } else {
+        // Single pet (backward compat)
+        $pet_names_arr[] = $pet;
+        $pet_ids_arr[] = null;
+    }
+    
+    // Only the client's own pets can be linked to the booking (anything else is kept as a name only)
+    foreach ($pet_ids_arr as $k => $pid) {
+        if ($pid === null || $pid === '') { $pet_ids_arr[$k] = null; continue; }
+        $own = $conn->query("SELECT id FROM pets WHERE id = " . (int)$pid . " AND user_id = " . (int)$user_id)->fetch_assoc();
+        $pet_ids_arr[$k] = $own ? (int)$own['id'] : null;
+    }
+
+    // Generate display name (comma-separated for multi-pet)
+    $display_name = implode(', ', $pet_names_arr);
+    $is_multi = count($pet_names_arr) > 1 ? 1 : 0;
+    
+    // All smart scheduling validations passed - proceed with booking
+    $stmt = $conn->prepare("INSERT INTO appointments(user_id, pet_name, service_type, appointment_date, appointment_time, service_location, home_address, end_date, doctor_id, signature_data, is_multi_pet) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    if (!$stmt) {
+        $_SESSION['message'] = "❌ Error preparing booking: " . htmlspecialchars($conn->error);
+        $_SESSION['msg_type'] = "danger";
+        if (!empty($_POST['return_appt_id'])) {
+            echo "APPT_ERROR:" . "❌ Error preparing booking: " . htmlspecialchars($conn->error);
+            exit();
+        }
+        header("Location: appointments.php");
+        exit();
+    }
+    $stmt->bind_param("isssssssssi", $user_id, $display_name, $service, $date, $time, $location, $address, $end_date, $doctor_id, $signature_data, $is_multi);
+    if ($stmt->execute()) {
+        $appointment_id = $stmt->insert_id;
+        
+        // Insert into appointment_pets junction table
+        if (function_exists('insertAppointmentPets') && !empty($pet_names_arr)) {
+            insertAppointmentPets($conn, $appointment_id, $user_id, $pet_ids_arr, $pet_names_arr);
+        }
+        
+        $msg_pet = htmlspecialchars($display_name);
+        notify_staff($conn, "New appointment request from $user_name: $display_name, $service on " . date('M d, Y', strtotime($date)) . " at " . date('g:i A', strtotime($time)) . ".", staff_link_for('Appointment', $appointment_id));
+        $_SESSION['message'] = "✅ Appointment for <b>$msg_pet</b> booked successfully! We look forward to seeing you.";
+        $_SESSION['msg_type'] = "success";
+        
+        // Return appointment ID to JS for payment step
+        if (!empty($_POST['return_appt_id'])) {
+            echo "APPT_ID:" . $appointment_id;
+            exit();
+        }
+    } else {
+        if (strpos($conn->error, 'Duplicate entry') !== false || strpos($conn->error, 'unique') !== false) {
+            $_SESSION['message'] = "❌ This time slot was just taken. Please refresh and choose another time.";
+        } else {
+            $_SESSION['message'] = "❌ Error booking appointment: " . htmlspecialchars($conn->error);
+        }
+        $_SESSION['msg_type'] = "danger";
+    }
+    header("Location: appointments.php");
+    exit();
+}
+
+// ── POST: Cancel pending ──────────────────────────────────────────────────────
+if (isset($_POST['cancel_appt'])) {
+    $cid = (int) $_POST['cancel_appt_id'];
+    $type = $_POST['appt_type'] ?? 'Appointment';
+
+    if ($type === 'Boarding') {
+        // Same rule as the Pet Boarding page: Pending/Approved and at least 24 hours before check-in
+        $bq = $conn->prepare("SELECT status, appointment_date, pet_name FROM boarding_reservations WHERE id=? AND user_id=?");
+        $bq->bind_param("ii", $cid, $user_id);
+        $bq->execute();
+        $brow = $bq->get_result()->fetch_assoc();
+        $why = board_cancel_problem($brow);
+        if ($why) {
+            $_SESSION['message'] = $why;
+            $_SESSION['msg_type'] = "danger";
+            header("Location: appointments.php");
+            exit();
+        }
+        $stmt = $conn->prepare("UPDATE boarding_reservations SET status='Cancelled' WHERE id=? AND user_id=? AND status IN ('Pending','Approved')");
+    } else {
+        // Same rule as boarding: cancel at least 24 hours before the scheduled time (clinic clock)
+        $tq = $conn->query("SELECT TIMESTAMPDIFF(MINUTE, NOW(), TIMESTAMP(appointment_date, appointment_time)) mins FROM appointments WHERE id = " . (int)$cid . " AND user_id = " . (int)$user_id)->fetch_assoc();
+        if ($tq && $tq['mins'] !== null && (int)$tq['mins'] < 1440) {
+            $_SESSION['message'] = "Appointments can only be cancelled at least 24 hours before the scheduled time. Please message the clinic if you can't make it.";
+            $_SESSION['msg_type'] = "danger";
+            header("Location: appointments.php");
+            exit();
+        }
+        // Clients can cancel while the visit is still upcoming: pending requests and approved bookings (same as the Cancel button)
+        $stmt = $conn->prepare("UPDATE appointments SET status='Cancelled', admin_message='Cancelled by the client', client_action_needed=0 WHERE id=? AND user_id=? AND status IN ('Pending','Approved')");
+    }
+
+    $stmt->bind_param("ii", $cid, $user_id);
+    if ($stmt->execute() && $stmt->affected_rows > 0) {
+        $_SESSION['message'] = $type === 'Boarding' ? "Boarding reservation cancelled." : "Appointment cancelled.";
+        $_SESSION['msg_type'] = "success";
+        if ($type === 'Boarding') {
+            notify_clinic_appt($conn, "$user_name cancelled boarding reservation #$cid for {$brow['pet_name']} (check-in " . date('M d, Y', strtotime($brow['appointment_date'])) . "). The cage is free again.", 'Boarding', $cid);
+        } else {
+            $ca = $conn->query("SELECT pet_name, service_type, appointment_date, appointment_time FROM appointments WHERE id = $cid")->fetch_assoc();
+            if ($ca) notify_clinic_appt($conn, "$user_name cancelled appointment #$cid: {$ca['pet_name']}, {$ca['service_type']} on " . date('M d, Y', strtotime($ca['appointment_date'])) . " at " . date('g:i A', strtotime($ca['appointment_time'])) . ".", 'Appointment', $cid);
+        }
+    } else {
+        $_SESSION['message'] = "Could not cancel — this appointment may already be checked in, completed or cancelled.";
+        $_SESSION['msg_type'] = "danger";
+    }
+    header("Location: appointments.php");
+    exit();
+}
+
+// ── POST: Accept reschedule ───────────────────────────────────────────────────
+if (isset($_POST['accept_reschedule'])) {
+    $aid = (int) $_POST['reschedule_apt_id'];
+    $type = $_POST['appt_type'] ?? 'Appointment';
+
+    if ($type === 'Boarding') {
+        $stmt = $conn->prepare("UPDATE boarding_reservations SET appointment_date=proposed_reschedule_date, end_date=proposed_reschedule_end_date, status='Approved', client_action_needed=0 WHERE id=? AND user_id=?");
+        $msg_suffix = 'boarding reservation';
+    } else {
+        $stmt = $conn->prepare("UPDATE appointments SET appointment_date=proposed_reschedule_date, appointment_time=proposed_reschedule_time, status='Approved', client_action_needed=0 WHERE id=? AND user_id=?");
+        $msg_suffix = 'appointment';
+    }
+
+    $stmt->bind_param("ii", $aid, $user_id);
+    if ($stmt->execute()) {
+        $_SESSION['message'] = "Reschedule accepted. Your $msg_suffix is now Approved for the new date.";
+        $_SESSION['msg_type'] = "success";
+        notify_clinic_appt($conn, "$user_name accepted the new schedule for $msg_suffix #$aid.", $type, $aid);
+    }
+    header("Location: appointments.php");
+    exit();
+}
+
+// ── POST: Decline reschedule ──────────────────────────────────────────────────
+if (isset($_POST['decline_reschedule'])) {
+    $aid = (int) $_POST['reschedule_apt_id'];
+    $type = $_POST['appt_type'] ?? 'Appointment';
+
+    if ($type === 'Boarding') {
+        $stmt = $conn->prepare("UPDATE boarding_reservations SET status='Cancelled', client_action_needed=0 WHERE id=? AND user_id=?");
+        $msg_suffix = 'boarding reservation';
+    } else {
+        $stmt = $conn->prepare("UPDATE appointments SET status='Cancelled', client_action_needed=0 WHERE id=? AND user_id=?");
+        $msg_suffix = 'appointment';
+    }
+
+    $stmt->bind_param("ii", $aid, $user_id);
+    if ($stmt->execute()) {
+        $_SESSION['message'] = "Reschedule declined. Request has been cancelled.";
+        $_SESSION['msg_type'] = "danger";
+        notify_clinic_appt($conn, "$user_name declined the new schedule for $msg_suffix #$aid, so it was cancelled.", $type, $aid);
+    }
+    header("Location: appointments.php");
+    exit();
+}
+
+// ── POST: Request reschedule (Client side) ──────────────────────────
+if (isset($_POST['request_reschedule'])) {
+    $aid = (int) $_POST['reschedule_apt_id'];
+    $type = $_POST['appt_type'] ?? 'Appointment';
+    $new_date = $_POST['new_proposed_date'] ?? '';
+    $new_time = $_POST['new_proposed_time'] ?? '08:00';
+    $reason = trim($_POST['reschedule_reason'] ?? '');
+    if (!preg_match('/^\d{2}:\d{2}$/', $new_time)) $new_time = '08:00';
+
+    // Reschedule dates must be at least 24 hours in advance
+    $tomorrow = date('Y-m-d', strtotime('+1 day'));
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $new_date) || $new_date < $tomorrow) {
+        $_SESSION['message'] = "Reschedule dates must be booked at least 24 hours in advance. Earliest available: $tomorrow";
+        $_SESSION['msg_type'] = "danger";
+        header("Location: appointments.php");
+        exit();
+    }
+
+    // ── Client declined the clinic's proposed schedule and picked their own date ──
+    // Same appointment goes back to Pending for staff approval; the reservation fee already paid still applies.
+    if (!empty($_POST['decline_rebook']) && $type !== 'Boarding') {
+        $chk = $conn->prepare("SELECT id, doctor_id, pet_name FROM appointments WHERE id=? AND user_id=? AND status='Reschedule Proposed'");
+        $chk->bind_param("ii", $aid, $user_id);
+        $chk->execute();
+        $ap = $chk->get_result()->fetch_assoc();
+        $err = '';
+        if (!$ap) {
+            $err = "This schedule proposal is no longer active.";
+        } elseif ((int)date('w', strtotime($new_date)) === 0) {
+            $err = "The clinic is closed on Sundays. Please choose another date.";
+        } else {
+            $hol = $conn->prepare("SELECT 1 FROM clinic_holidays WHERE holiday_date=? AND is_active=1");
+            $hol->bind_param("s", $new_date); $hol->execute();
+            if ($hol->get_result()->num_rows) $err = "That date is a clinic holiday. Please choose another date.";
+        }
+        if (!$err && !empty($ap['doctor_id'])) {
+            $doc = (int)$ap['doctor_id'];
+            $day = dws_get_day($conn, $doc, $new_date);
+            $lv = $conn->prepare("SELECT 1 FROM doctor_unavailability WHERE doctor_id=? AND unavailable_date=?");
+            $lv->bind_param("is", $doc, $new_date); $lv->execute();
+            $t_end = date('H:i', strtotime($new_time . ' +30 minutes'));
+            if (!$day['is_working'] || $lv->get_result()->num_rows) {
+                $err = "Your veterinarian is not available on that date. Please choose another date.";
+            } elseif ($new_time < $day['work_start'] || $t_end > $day['work_end']
+                      || ($day['break_start'] && $new_time < $day['break_end'] && $t_end > $day['break_start'])) {
+                $err = "That time is outside your veterinarian's hours (" . $day['work_start'] . "–" . $day['work_end'] . "). Please choose another time.";
+            } else {
+                $nt = $new_time . ':00';
+                $cf = $conn->prepare("SELECT 1 FROM appointments WHERE doctor_id=? AND appointment_date=? AND appointment_time=? AND id<>? AND status IN ('Pending','Approved')");
+                $cf->bind_param("issi", $doc, $new_date, $nt, $aid); $cf->execute();
+                if ($cf->get_result()->num_rows) $err = "That time slot is already taken. Please choose another time.";
+            }
+        }
+        if ($err) {
+            $_SESSION['message'] = $err;
+            $_SESSION['msg_type'] = "danger";
+            header("Location: appointments.php?open_appt=$aid");
+            exit();
+        }
+        $note = "Client declined the clinic's proposed schedule and requested $new_date $new_time" . ($reason !== '' ? ". Reason: $reason" : '') . ".";
+        $up = $conn->prepare("UPDATE appointments SET appointment_date=?, appointment_time=?, status='Pending', proposed_reschedule_date=NULL, proposed_reschedule_time=NULL, client_action_needed=0, admin_message=? WHERE id=? AND user_id=? AND status='Reschedule Proposed'");
+        $up->bind_param("sssii", $new_date, $new_time, $note, $aid, $user_id);
+        if ($up->execute() && $up->affected_rows > 0) {
+            $_SESSION['message'] = "Proposal declined. Your new preferred schedule (" . date('M d, Y', strtotime($new_date)) . " at " . date('g:i A', strtotime($new_time)) . ") was sent to the clinic for approval. Your reservation fee still applies — no need to pay again.";
+            $_SESSION['msg_type'] = "success";
+            notify_clinic_appt($conn, "Client $user_name declined the proposed schedule for appointment ID $aid and requested $new_date $new_time.", 'Appointment', $aid);
+        } else {
+            $_SESSION['message'] = "Could not submit your new schedule. Please try again.";
+            $_SESSION['msg_type'] = "danger";
+        }
+        header("Location: appointments.php");
+        exit();
+    }
+
+    // ── Regular reschedule request on an Approved / Pending booking ──
+    // Boarding stays have no "requested" status: the front desk checks the cage and proposes the dates, which the client then confirms
+    if ($type === 'Boarding') {
+        $bq = $conn->prepare("SELECT pet_name, appointment_date, end_date FROM boarding_reservations WHERE id=? AND user_id=? AND status IN ('Pending','Approved')");
+        $bq->bind_param("ii", $aid, $user_id);
+        $bq->execute();
+        $bs = $bq->get_result()->fetch_assoc();
+        if ($bs) {
+            $nights = max(1, (int)round((strtotime($bs['end_date']) - strtotime($bs['appointment_date'])) / 86400));
+            $new_end = date('Y-m-d', strtotime("$new_date +$nights day"));
+            notify_clinic_appt($conn, "$user_name asked to move boarding reservation #$aid for {$bs['pet_name']} to " . date('M d', strtotime($new_date)) . " - " . date('M d, Y', strtotime($new_end)) . "." . ($reason !== '' ? " Reason: " . rtrim($reason, '.') . "." : '') . " Propose the new dates from Pet Boarding Care.", 'Boarding', $aid);
+            $_SESSION['message'] = "Reschedule request sent. The clinic will check cage availability and send you the new dates to confirm.";
+            $_SESSION['msg_type'] = "success";
+        } else {
+            $_SESSION['message'] = "Could not submit request. Please try again.";
+            $_SESSION['msg_type'] = "danger";
+        }
+        header("Location: appointments.php");
+        exit();
+    }
+    $table = $type === 'Boarding' ? 'boarding_reservations' : 'appointments';
+    $stmt = $conn->prepare("UPDATE $table SET status='Reschedule Requested', proposed_reschedule_date=?, proposed_reschedule_time=?, admin_message=? WHERE id=? AND user_id=? AND (status='Approved' OR status='Pending')");
+    $stmt->bind_param("sssii", $new_date, $new_time, $reason, $aid, $user_id);
+    if ($stmt->execute() && $stmt->affected_rows > 0) {
+        $_SESSION['message'] = "Reschedule request sent to clinic for review.";
+        $_SESSION['msg_type'] = "success";
+        $notif = "Client $user_name requested reschedule for $type ID $aid to $new_date.";
+        notify_clinic_appt($conn, $notif, $type, $aid);
+    } else {
+        $_SESSION['message'] = "Could not submit request. Please try again.";
+        $_SESSION['msg_type'] = "danger";
+    }
+    header("Location: appointments.php");
+    exit();
+}
+
+// ── POST: Cancel pending ──────────────────────────────────────────────────────
+if (isset($_POST['cancel_appt'])) {
+    $cid = (int) $_POST['cancel_appt_id'];
+    $type = $_POST['appt_type'] ?? 'Appointment';
+
+    if ($type === 'Boarding') {
+        // Same rule as the Pet Boarding page: Pending/Approved and at least 24 hours before check-in
+        $bq = $conn->prepare("SELECT status, appointment_date, pet_name FROM boarding_reservations WHERE id=? AND user_id=?");
+        $bq->bind_param("ii", $cid, $user_id);
+        $bq->execute();
+        $brow = $bq->get_result()->fetch_assoc();
+        $why = board_cancel_problem($brow);
+        if ($why) {
+            $_SESSION['message'] = $why;
+            $_SESSION['msg_type'] = "danger";
+            header("Location: appointments.php");
+            exit();
+        }
+        $stmt = $conn->prepare("UPDATE boarding_reservations SET status='Cancelled' WHERE id=? AND user_id=? AND status IN ('Pending','Approved')");
+    } else {
+        // Same rule as boarding: cancel at least 24 hours before the scheduled time (clinic clock)
+        $tq = $conn->query("SELECT TIMESTAMPDIFF(MINUTE, NOW(), TIMESTAMP(appointment_date, appointment_time)) mins FROM appointments WHERE id = " . (int)$cid . " AND user_id = " . (int)$user_id)->fetch_assoc();
+        if ($tq && $tq['mins'] !== null && (int)$tq['mins'] < 1440) {
+            $_SESSION['message'] = "Appointments can only be cancelled at least 24 hours before the scheduled time. Please message the clinic if you can't make it.";
+            $_SESSION['msg_type'] = "danger";
+            header("Location: appointments.php");
+            exit();
+        }
+        // Clients can cancel while the visit is still upcoming: pending requests and approved bookings (same as the Cancel button)
+        $stmt = $conn->prepare("UPDATE appointments SET status='Cancelled', admin_message='Cancelled by the client', client_action_needed=0 WHERE id=? AND user_id=? AND status IN ('Pending','Approved')");
+    }
+
+    $stmt->bind_param("ii", $cid, $user_id);
+    if ($stmt->execute() && $stmt->affected_rows > 0) {
+        $_SESSION['message'] = $type === 'Boarding' ? "Boarding reservation cancelled." : "Appointment cancelled.";
+        $_SESSION['msg_type'] = "success";
+        if ($type === 'Boarding') {
+            notify_clinic_appt($conn, "$user_name cancelled boarding reservation #$cid for {$brow['pet_name']} (check-in " . date('M d, Y', strtotime($brow['appointment_date'])) . "). The cage is free again.", 'Boarding', $cid);
+        } else {
+            $ca = $conn->query("SELECT pet_name, service_type, appointment_date, appointment_time FROM appointments WHERE id = $cid")->fetch_assoc();
+            if ($ca) notify_clinic_appt($conn, "$user_name cancelled appointment #$cid: {$ca['pet_name']}, {$ca['service_type']} on " . date('M d, Y', strtotime($ca['appointment_date'])) . " at " . date('g:i A', strtotime($ca['appointment_time'])) . ".", 'Appointment', $cid);
+        }
+    } else {
+        $_SESSION['message'] = "Could not cancel — this appointment may already be checked in, completed or cancelled.";
+        $_SESSION['msg_type'] = "danger";
+    }
+    header("Location: appointments.php");
+    exit();
+}
+
+// ── POST: Accept reschedule ───────────────────────────────────────────────────
+if (isset($_POST['accept_reschedule'])) {
+    $aid = (int) $_POST['reschedule_apt_id'];
+    $type = $_POST['appt_type'] ?? 'Appointment';
+
+    if ($type === 'Boarding') {
+        $stmt = $conn->prepare("UPDATE boarding_reservations SET appointment_date=proposed_reschedule_date, end_date=proposed_reschedule_end_date, status='Approved', client_action_needed=0 WHERE id=? AND user_id=?");
+        $msg_suffix = 'boarding reservation';
+    } else {
+        $stmt = $conn->prepare("UPDATE appointments SET appointment_date=proposed_reschedule_date, appointment_time=proposed_reschedule_time, status='Approved', client_action_needed=0 WHERE id=? AND user_id=?");
+        $msg_suffix = 'appointment';
+    }
+
+    $stmt->bind_param("ii", $aid, $user_id);
+    if ($stmt->execute()) {
+        $_SESSION['message'] = "Reschedule accepted. Your $msg_suffix is now Approved for the new date.";
+        $_SESSION['msg_type'] = "success";
+        notify_clinic_appt($conn, "$user_name accepted the new schedule for $msg_suffix #$aid.", $type, $aid);
+    }
+    header("Location: appointments.php");
+    exit();
+}
+
+// ── POST: Decline reschedule ──────────────────────────────────────────────────
+if (isset($_POST['decline_reschedule'])) {
+    $aid = (int) $_POST['reschedule_apt_id'];
+    $type = $_POST['appt_type'] ?? 'Appointment';
+
+    if ($type === 'Boarding') {
+        $stmt = $conn->prepare("UPDATE boarding_reservations SET status='Cancelled', client_action_needed=0 WHERE id=? AND user_id=?");
+        $msg_suffix = 'boarding reservation';
+    } else {
+        $stmt = $conn->prepare("UPDATE appointments SET status='Cancelled', client_action_needed=0 WHERE id=? AND user_id=?");
+        $msg_suffix = 'appointment';
+    }
+
+    $stmt->bind_param("ii", $aid, $user_id);
+    if ($stmt->execute()) {
+        $_SESSION['message'] = "Reschedule declined. Request has been cancelled.";
+        $_SESSION['msg_type'] = "danger";
+        notify_clinic_appt($conn, "$user_name declined the new schedule for $msg_suffix #$aid, so it was cancelled.", $type, $aid);
+    }
+    header("Location: appointments.php");
+    exit();
+}
+
+// ── POST: Request reschedule (Client side) ──────────────────────────
+if (isset($_POST['request_reschedule'])) {
+    $aid = (int) $_POST['reschedule_apt_id'];
+    $type = $_POST['appt_type'] ?? 'Appointment';
+    $new_date = $_POST['new_proposed_date'];
+    $new_time = $_POST['new_proposed_time'] ?? '08:00';
+    $reason = trim($_POST['reschedule_reason'] ?? '');
+
+    // Smart scheduling validation: Reschedule dates must be at least 24 hours in advance
+    $tomorrow = date('Y-m-d', strtotime('+1 day'));
+    if ($new_date < $tomorrow) {
+        $_SESSION['message'] = "Reschedule dates must be booked at least 24 hours in advance. Earliest available: $tomorrow";
+        $_SESSION['msg_type'] = "danger";
+        header("Location: appointments.php");
+        exit();
+    }
+
+    $table = $type === 'Boarding' ? 'boarding_reservations' : 'appointments';
+
+    $stmt = $conn->prepare("UPDATE $table SET status='Reschedule Requested', proposed_reschedule_date=?, proposed_reschedule_time=?, admin_message=? WHERE id=? AND user_id=? AND (status='Approved' OR status='Pending')");
+    $stmt->bind_param("sssii", $new_date, $new_time, $reason, $aid, $user_id);
+
+    if ($stmt->execute() && $stmt->affected_rows > 0) {
+        $_SESSION['message'] = "Reschedule request sent to clinic for review.";
+        $_SESSION['msg_type'] = "success";
+        $notif = "Client $user_name requested reschedule for $type ID $aid to $new_date.";
+        notify_clinic_appt($conn, $notif, $type, $aid);
+    } else {
+        $_SESSION['message'] = "Could not submit request. Please try again.";
+        $_SESSION['msg_type'] = "danger";
+    }
+    header("Location: appointments.php");
+    exit();
+}
+
+// ── Helper: get pet display data with profile sync ──
+function enrichAppointmentPetData($conn, $row) {
+    // Sync pet profile data from appointment_pets
+    if (function_exists('syncAppointmentPetData')) {
+        syncAppointmentPetData($conn, $row['id']);
+    }
+    // Get pets from junction table
+    if (function_exists('getAppointmentPets')) {
+        $pets = getAppointmentPets($conn, $row['id']);
+        if (!empty($pets)) {
+            $names = array_column($pets, 'display_name');
+            $row['pet_name'] = implode(', ', $names);
+            // Use first pet's picture
+            if (!empty($pets[0]['display_picture'])) {
+                $row['pet_picture'] = $pets[0]['display_picture'];
+            }
+        }
+    }
+    return $row;
+}
+
+// ── Fetch ALL appointments (past + future) ────────────────────────────────────
+$stmt = $conn->prepare("SELECT a.*, IFNULL(d.fullname,'Clinic') as doctor_name FROM appointments a LEFT JOIN users d ON a.doctor_id=d.id WHERE a.user_id=? ORDER BY a.appointment_date DESC, a.appointment_time DESC");
+$stmt->bind_param("i", $user_id);
+$stmt->execute();
+$appointments = $stmt->get_result();
+$apptRows = [];
+while ($row = $appointments->fetch_assoc()) {
+    $row['_type'] = 'Appointment';
+    $row = enrichAppointmentPetData($conn, $row);
+    $apptRows[] = $row;
+}
+
+// Boarding stays are not listed here: they have their own history on the Pet Boarding page
+
+// Sort the combined array by date and time
+usort($apptRows, function ($a, $b) {
+    $dateA = strtotime($a['appointment_date'] . ' ' . $a['appointment_time']);
+    $dateB = strtotime($b['appointment_date'] . ' ' . $b['appointment_time']);
+    return $dateB - $dateA; // DESC
+});
+
+// ── Filter for active reschedule proposals ──────────────────────────────────
+$rescheduleProposals = array_filter($apptRows, function ($r) {
+    return isset($r['client_action_needed']) && $r['client_action_needed'] == 1 &&
+        !str_contains($r['status'], 'Cancel') && !str_contains($r['status'], 'Reject');
+});
+
+// ── Fetch user address ────────────────────────────────────────────────────────
+$uStmt = $conn->prepare("SELECT address FROM users WHERE id=?");
+$uStmt->bind_param("i", $user_id);
+$uStmt->execute();
+$myAddr = $uStmt->get_result()->fetch_assoc()['address'] ?? '';
+?>
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>Appointments | PragmaVet</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+    <link rel="stylesheet" href="https://unpkg.com/mobile-select@1.1.2/dist/mobile-select.css">
+    <style>
+    /* ── Step 4 Inline Calendar Layout ── */
+    .date-time-layout {
+        display: grid;
+        grid-template-columns: 320px 1fr;
+        gap: 24px;
+        align-items: start;
+    }
+    @media(max-width:900px) { .date-time-layout { grid-template-columns: 1fr; } }
+    .cal-wrapper {
+        border: 2px solid #e2e8f0;
+        border-radius: 18px;
+        overflow: hidden;
+        background: #fff;
+        box-shadow: 0 4px 20px rgba(91,33,182,0.08);
+    }
+    .cal-wrapper .flatpickr-calendar.inline {
+        width: 100% !important;
+        box-shadow: none !important;
+        border: none !important;
+        border-radius: 0 !important;
+        padding: 0 !important;
+        background: transparent !important;
+    }
+    .cal-wrapper .flatpickr-months {
+        background: linear-gradient(135deg,#5b21b6,#4c1d95) !important;
+        padding: 12px 14px !important;
+        position: relative !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: space-between !important;
+        min-height: 46px !important;
+    }
+    .cal-wrapper .flatpickr-month { color:#fff !important; fill:#fff !important; height:34px !important; line-height:34px !important; display:flex !important; align-items:center !important; justify-content:center !important; position:relative !important; width:100% !important; overflow:visible !important; }
+    .cal-wrapper .flatpickr-current-month { font-size:16px !important; font-weight:800 !important; color:#fff !important; padding:0 !important; position:relative !important; width:100% !important; left:0 !important; display:flex !important; align-items:center !important; justify-content:center !important; gap:6px !important; transform:none !important; }
+    .cal-wrapper .flatpickr-current-month .cur-month, .cal-wrapper .flatpickr-current-month span.cur-month, .cal-wrapper .flatpickr-current-month .flatpickr-monthDropdown-months { color:#fff !important; font-weight:800 !important; font-size:16px !important; display:inline-block !important; background:transparent !important; border:none !important; appearance:none !important; -webkit-appearance:none !important; opacity:1 !important; visibility:visible !important; }
+    .cal-wrapper .flatpickr-current-month .flatpickr-monthDropdown-months option { background:#4c1d95 !important; color:#fff !important; }
+    .cal-wrapper .numInputWrapper, .cal-wrapper .flatpickr-current-month .numInputWrapper { background:transparent !important; background-color:transparent !important; border:none !important; box-shadow:none !important; width:auto !important; display:inline-flex !important; }
+    .cal-wrapper .numInputWrapper:hover, .cal-wrapper .flatpickr-current-month .numInputWrapper:hover { background:transparent !important; background-color:transparent !important; }
+    .cal-wrapper .numInputWrapper span, .cal-wrapper .flatpickr-current-month .numInputWrapper span { display:none !important; }
+    .cal-wrapper .flatpickr-current-month input.cur-year, .cal-wrapper .flatpickr-current-month .numInputWrapper input, .cal-wrapper .numInputWrapper input.cur-year { color:#ffffff !important; font-weight:800 !important; font-size:16px !important; background:transparent !important; background-color:transparent !important; border:none !important; box-shadow:none !important; outline:none !important; padding:0 !important; margin:0 !important; width:48px !important; height:auto !important; display:inline-block !important; border-radius:0 !important; }
+    .cal-wrapper .flatpickr-prev-month, .cal-wrapper .flatpickr-next-month { fill:rgba(255,255,255,.9) !important; color:rgba(255,255,255,.9) !important; padding:2px 10px !important; position:relative !important; height:34px !important; display:flex !important; align-items:center !important; }
+    .cal-wrapper .flatpickr-prev-month:hover, .cal-wrapper .flatpickr-next-month:hover { fill:#fff !important; color:#fff !important; background:rgba(255,255,255,.15) !important; border-radius:8px !important; }
+    .cal-wrapper .flatpickr-weekdays { background:#f3e8ff !important; padding:6px 0 !important; }
+    .cal-wrapper .flatpickr-weekday { color:#5b21b6 !important; font-weight:800 !important; font-size:10px !important; text-transform:uppercase !important; }
+    .cal-wrapper .flatpickr-days { border:none !important; width:100% !important; }
+    .cal-wrapper .dayContainer { width:100% !important; min-width:unset !important; max-width:unset !important; padding:8px !important; }
+    .cal-wrapper .flatpickr-day { border-radius:10px !important; font-weight:600 !important; font-size:13px !important; color:#334155 !important; height:36px !important; line-height:36px !important; max-width:unset !important; flex-basis:calc(14.28% - 4px) !important; margin:2px !important; transition:all .15s !important; }
+    .cal-wrapper .flatpickr-day:hover { background:#f3e8ff !important; border-color:#c4b5fd !important; color:#5b21b6 !important; }
+    .cal-wrapper .flatpickr-day.selected, .cal-wrapper .flatpickr-day.selected:hover { background:#5b21b6 !important; border-color:#5b21b6 !important; color:#fff !important; box-shadow:0 4px 10px rgba(91,33,182,.3) !important; font-weight:800 !important; }
+    .cal-wrapper .flatpickr-day.today { border-color:#a78bfa !important; color:#5b21b6 !important; font-weight:800 !important; }
+    .cal-wrapper .flatpickr-day.disabled, .cal-wrapper .flatpickr-day.disabled:hover,
+    .cal-wrapper .flatpickr-day.flatpickr-disabled, .cal-wrapper .flatpickr-day.flatpickr-disabled:hover { background:#f8fafc !important; color:#cbd5e1 !important; border-color:transparent !important; cursor:not-allowed !important; text-decoration:line-through !important; opacity:.5 !important; pointer-events:none !important; }
+    /* Date badge above time slots */
+    .sel-date-badge {
+        display:inline-flex; align-items:center; gap:8px;
+        background:linear-gradient(135deg,#5b21b6,#4c1d95);
+        color:#fff; font-size:12px; font-weight:700;
+        padding:5px 14px; border-radius:30px; margin-bottom:14px;
+    }
+    /* AM/PM section labels inside slot grid */
+    .slot-section-lbl {
+        grid-column:1/-1; font-size:10px; font-weight:800;
+        letter-spacing:.07em; color:#94a3b8; text-transform:uppercase;
+        display:flex; align-items:center; gap:8px; margin-top:6px;
+    }
+    .slot-section-lbl::after { content:''; flex:1; height:1px; background:#e2e8f0; }
+    .appt-slot-btn {
+        padding:9px 6px; border-radius:10px; border:2px solid #e2e8f0;
+        background:#fff; font-weight:700; font-size:12px; color:#334155;
+        cursor:pointer; text-align:center; transition:all .15s;
+    }
+    .appt-slot-btn:hover:not(:disabled) { border-color:#a78bfa; background:#f3e8ff; color:#5b21b6; transform:translateY(-1px); }
+    .appt-slot-btn.selected { background:#5b21b6 !important; color:#fff !important; border-color:#5b21b6 !important; box-shadow:0 4px 10px rgba(91,33,182,.3); }
+    .appt-slot-btn.booked { background:#f1f5f9; color:#94a3b8; border-color:#e2e8f0; cursor:not-allowed; opacity:.65; }
+    .slots-ph { grid-column:1/-1; text-align:center; padding:36px 0; color:#94a3b8; font-size:13px; }
+    .slots-ph i { font-size:30px; color:#e2e8f0; display:block; margin-bottom:10px; }
+    #slotsGrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(90px,1fr)); gap:8px; margin-top:4px; }
+    
+    /* ====== Appointment wizard look (layout & polish only — step/selection colours stay script-driven) ====== */
+    #viewWizardContainer > div:first-child { background:#fff; border:1px solid #ece8f6; border-radius:22px; padding:20px 12px 16px !important; margin-bottom:24px !important; box-shadow:0 8px 26px rgba(76,29,149,.06); }
+    #viewWizardContainer > div:first-child > div:first-child { top:40px !important; left:9% !important; right:9% !important; border-top:2px solid #ede9fe !important; }
+    #viewWizardContainer .step-circle { width:40px !important; height:40px !important; font-size:15px !important; box-shadow:0 0 0 5px #fff; transition:transform .18s ease, box-shadow .18s ease; }
+    #viewWizardContainer .step-node:hover .step-circle { transform:translateY(-2px); }
+    #viewWizardContainer .step-node.active .step-circle { box-shadow:0 0 0 5px #fff, 0 0 0 9px rgba(91,33,182,.14), 0 8px 18px rgba(91,33,182,.28); }
+    #viewWizardContainer .step-node.done .step-circle { box-shadow:0 0 0 5px #fff, 0 6px 14px rgba(16,185,129,.22); }
+    #viewWizardContainer .step-node-label { font-size:11.5px !important; margin-top:10px !important; transition:color .18s; }
+    #viewWizardContainer .step-node.active .step-node-label { color:#5b21b6 !important; font-weight:800 !important; }
+    #viewWizardContainer .step-node.done .step-node-label { color:#047857 !important; }
+
+    #viewWizardContainer > div:nth-child(2) > div:first-child { border-radius:24px !important; border-color:#ece8f6 !important; box-shadow:0 12px 32px rgba(76,29,149,.07) !important; }
+    #viewWizardContainer .wiz-panel { animation:wzPanelIn .28s ease; }
+    @keyframes wzPanelIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:none; } }
+    #viewWizardContainer .wiz-panel > div:first-child > div:first-child { background:linear-gradient(135deg,#ede9fe,#f5f3ff) !important; box-shadow:inset 0 0 0 1px #e4dcfb; }
+    #viewWizardContainer .wiz-panel h2 { letter-spacing:-.3px; }
+
+    .wz-owner { display:flex; align-items:center; gap:12px; padding:10px 14px; border-radius:14px; background:linear-gradient(135deg,#faf8ff,#f5f3ff); border:1px solid #ece8f6; }
+    .wz-owner-av { width:36px; height:36px; border-radius:50%; background:#5b21b6; color:#fff; font-weight:800; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+    .wz-owner-k { font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.06em; color:#a78bfa; }
+    .wz-owner-v { font-size:14px; font-weight:700; color:#1e1b4b; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .wz-owner-v span { font-weight:500; color:#64748b; font-size:12.5px; }
+
+    #multiPetToggle { appearance:none; -webkit-appearance:none; width:40px !important; height:22px !important; border-radius:999px; background:#e2e8f0; position:relative; outline:none; transition:background .2s; flex-shrink:0; margin:0; }
+    #multiPetToggle::before { content:''; position:absolute; top:3px; left:3px; width:16px; height:16px; border-radius:50%; background:#fff; box-shadow:0 1px 3px rgba(15,23,42,.25); transition:transform .2s; }
+    #multiPetToggle:checked { background:#5b21b6; }
+    #multiPetToggle:checked::before { transform:translateX(18px); }
+    #multiPetToggle:focus-visible { box-shadow:0 0 0 3px rgba(91,33,182,.25); }
+
+    #viewWizardContainer .pet-card-chip { transition:transform .18s ease, box-shadow .18s ease, border-color .18s ease !important; }
+    #viewWizardContainer .pet-card-chip:hover { transform:translateY(-4px); }
+    #viewWizardContainer .pet-card-chip img { transition:transform .35s ease; }
+    #viewWizardContainer .pet-card-chip:hover img { transform:scale(1.07); }
+    #viewWizardContainer .pet-card-chip .pet-sel-badge { box-shadow:0 0 0 3px #fff; }
+
+    #viewWizardContainer .btn-wiz-next { box-shadow:0 8px 18px rgba(91,33,182,.26); transition:transform .15s ease, box-shadow .15s ease; }
+    #viewWizardContainer .btn-wiz-next:hover { transform:translateY(-1px); box-shadow:0 12px 22px rgba(91,33,182,.32); }
+    #viewWizardContainer .btn-wiz-prev, #viewWizardContainer .btn-wiz-cancel { transition:border-color .15s ease, color .15s ease, background .15s ease; }
+    #viewWizardContainer .btn-wiz-prev:hover, #viewWizardContainer .btn-wiz-cancel:hover { border-color:#a78bfa !important; color:#5b21b6 !important; }
+
+    #viewWizardContainer > div:nth-child(2) > div:nth-child(2) > div { border-radius:22px !important; border-color:#ece8f6 !important; box-shadow:0 10px 28px rgba(76,29,149,.06) !important; }
+    #viewWizardContainer .process-step-item { transition:background .2s ease, color .2s ease; }
+
+    /* ====== Appointment history look — purple to match "Your Appointments" ====== */
+    #viewListContainer .card-prem { border-radius:22px !important; border:1px solid #ece8f6 !important; box-shadow:0 12px 32px rgba(76,29,149,.07) !important; overflow:hidden; }
+    #viewListContainer .card-head { gap:14px; flex-wrap:wrap; padding:18px 22px !important; border-bottom:1px solid #f1edfa !important; }
+    #viewListContainer .card-head h5 { color:#1e1b4b; font-weight:800; }
+    #viewListContainer .search-wrap input { border:1.5px solid #e9e3f7 !important; background:#faf8ff !important; border-radius:12px !important; }
+    #viewListContainer .search-wrap input:focus { border-color:#7c3aed !important; background:#fff !important; box-shadow:0 0 0 3px rgba(124,58,237,.14) !important; }
+    #viewListContainer .search-wrap .si { color:#a78bfa !important; }
+    .ah-tabs { display:flex; gap:6px; flex-wrap:wrap; }
+    #viewListContainer .filter-tab { background:#fff !important; background-image:none !important; color:#5b21b6 !important; border:1.5px solid #e4dcfb !important; border-radius:999px !important;
+        padding:8px 14px !important; font-weight:700 !important; font-size:13px !important; box-shadow:none !important; display:inline-flex; align-items:center; gap:7px; transition:background .15s, border-color .15s, transform .15s; }
+    #viewListContainer .filter-tab:hover { background:#f5f3ff !important; border-color:#c4b5fd !important; transform:translateY(-1px); }
+    #viewListContainer .filter-tab.active { background:#5b21b6 !important; border-color:#5b21b6 !important; color:#fff !important; box-shadow:0 6px 14px rgba(91,33,182,.25) !important; }
+    #viewListContainer .filter-tab .ah-n { background:#f3e8ff; color:#5b21b6; border-radius:999px; padding:0 8px; font-size:11.5px; font-weight:800; line-height:18px; }
+    #viewListContainer .filter-tab.active .ah-n { background:rgba(255,255,255,.22); color:#fff; }
+
+    #viewListContainer .appt-table thead th { background:#faf8ff !important; color:#7c6aa8 !important; font-size:11px !important; letter-spacing:.07em; border-bottom:1px solid #ede9fe !important; padding:12px 18px !important; }
+    #viewListContainer .appt-table tbody td { padding:14px 18px !important; border-bottom:1px solid #f4f1fb !important; }
+    #viewListContainer .appt-table tbody tr { transition:background .15s; }
+    #viewListContainer .appt-table tbody tr:hover { background:#faf8ff !important; }
+    .ah-pet { display:flex; align-items:center; gap:12px; }
+    .ah-av { width:38px; height:38px; border-radius:12px; background:linear-gradient(135deg,#ede9fe,#ddd6fe); color:#5b21b6; font-weight:800; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+    .ah-pet-name { font-weight:800; color:#1e1b4b; font-size:14px; }
+    .ah-pet-sub { font-size:12px; color:#64748b; margin-top:1px; }
+    .ah-date { font-size:13.5px; font-weight:700; color:#1e1b4b; }
+    .ah-time { font-size:12px; color:#64748b; margin-top:2px; }
+    .ah-date i, .ah-time i { color:#a78bfa; width:16px; margin-right:4px; }
+    .ah-loc { display:inline-flex; align-items:center; gap:6px; background:#f5f3ff; color:#5b21b6; border:1px solid #ede9fe; border-radius:999px; padding:4px 11px; font-size:12px; font-weight:700; white-space:nowrap; }
+
+    #viewListContainer .badge-pending, #viewListContainer .badge-approved, #viewListContainer .badge-completed, #viewListContainer .badge-cancelled,
+    #viewListContainer .badge-default, #viewListContainer .badge-proposed { display:inline-flex !important; align-items:center; gap:4px; border-radius:999px !important; padding:4px 12px !important; font-size:12px !important; font-weight:700 !important; white-space:nowrap; border:none !important; }
+    #viewListContainer .badge-pending   { background:#fff7ed !important; color:#c2410c !important; }
+    #viewListContainer .badge-approved  { background:#f3e8ff !important; color:#5b21b6 !important; }
+    #viewListContainer .badge-completed { background:#ecfdf5 !important; color:#047857 !important; }
+    #viewListContainer .badge-cancelled { background:#fef2f2 !important; color:#b91c1c !important; }
+    #viewListContainer .badge-proposed  { background:#fdf4ff !important; color:#a21caf !important; }
+    #viewListContainer .badge-default   { background:#f1f5f9 !important; color:#475569 !important; }
+
+    #viewListContainer .appt-table .btn-primary, #viewListContainer .appt-table .btn-success, #viewListContainer .appt-table .btn-secondary {
+        background:#5b21b6 !important; background-image:none !important; border:none !important; box-shadow:0 6px 14px rgba(91,33,182,.25) !important; transition:transform .15s, box-shadow .15s; }
+    #viewListContainer .appt-table .btn-success, #viewListContainer .appt-table .btn-secondary { background:#f3e8ff !important; box-shadow:none !important; }
+    #viewListContainer .appt-table .btn-success i, #viewListContainer .appt-table .btn-secondary i { color:#5b21b6 !important; }
+    #viewListContainer .appt-table .btn:hover { transform:scale(1.08); }
+</style>
+    <style>
+        .flatpickr-calendar {
+            border-radius: 14px !important;
+            box-shadow: 0 12px 40px rgba(0, 0, 0, .14) !important;
+            font-family: 'Inter', sans-serif !important;
+            border: 1px solid #e2e8f0 !important;
+        }
+
+        .flatpickr-day.selected,
+        .flatpickr-day.selected:hover {
+            background: #2563eb !important;
+            border-color: #2563eb !important;
+        }
+
+        .flatpickr-time input {
+            font-family: 'Inter', sans-serif !important;
+        }
+
+        .numInputWrapper:hover {
+            background: none !important;
+        }
+
+        .sidebar::-webkit-scrollbar {
+            width: 5px;
+        }
+
+        .sidebar::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+        }
+
+        .sidebar::-webkit-scrollbar-track {
+            background: transparent;
+        }
+    </style>
+    <style>
+        :root {
+            --primary: #2563eb;
+            --secondary: #3b82f6;
+            --dark: #1e40af;
+            --light-bg: #F0F4F8;
+            --sidebar-width: 260px;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            background: var(--light-bg);
+            font-family: 'Inter', sans-serif;
+            color: #333;
+            overflow-x: hidden;
+            margin: 0;
+        }
+
+        /* ── SIDEBAR ── */
+        .sidebar {
+            background: #0f172a;
+            width: var(--sidebar-width);
+            height: 100vh;
+            position: fixed;
+            top: 0;
+            left: 0;
+            padding: 24px 16px;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 5px 0 20px rgba(0, 0, 0, .2);
+            overflow-y: auto;
+        }
+
+        .sidebar-brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 6px;
+        }
+
+        .sidebar-brand-icon {
+            width: 38px;
+            height: 38px;
+            background: linear-gradient(135deg, #3b82f6, #2563eb);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .sidebar-brand span {
+            font-weight: 800;
+            font-size: 20px;
+            color: #fff;
+        }
+
+        .sidebar-user {
+            background: rgba(255, 255, 255, .06);
+            border-radius: 12px;
+            padding: 12px 14px;
+            margin: 16px 0 24px;
+        }
+
+        .sidebar-user .welcome {
+            font-size: 11px;
+            color: rgba(255, 255, 255, .45);
+            margin-bottom: 2px;
+        }
+
+        .sidebar-user .uname {
+            font-weight: 700;
+            font-size: 15px;
+            color: #fff;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .sidebar a {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 16px;
+            border-radius: 8px;
+            color: #94a3b8;
+            text-decoration: none;
+            margin-bottom: 4px;
+            font-weight: 600;
+            font-size: 15px;
+            transition: .2s;
+        }
+
+        .sidebar a i {
+            width: 20px;
+            text-align: center;
+            font-size: 15px;
+        }
+
+        .sidebar a:hover,
+        .sidebar a.active {
+            background: #2563eb;
+            color: #ffffff;
+        }
+
+        .sidebar-logout {
+            margin-top: auto;
+        }
+
+        .sidebar-logout a {
+            color: #ff7070 !important;
+        }
+
+        .sidebar-logout a:hover {
+            background: rgba(255, 112, 112, .12) !important;
+            box-shadow: none !important;
+        }
+
+        /* ── MAIN ── */
+        .main-content {
+            margin-left: var(--sidebar-width);
+            padding: 36px 44px;
+            min-height: 100vh;
+        }
+
+        .page-title {
+            font-weight: 800;
+            font-size: 26px;
+            color: var(--dark);
+            margin: 0;
+            letter-spacing: -.5px;
+        }
+
+        .page-sub {
+            color: #94a3b8;
+            font-size: 14px;
+            margin: 2px 0 0;
+        }
+
+        /* ── CARDS ── */
+        .card-prem {
+            background: #fff;
+            border: none;
+            border-radius: 20px;
+            box-shadow: 0 4px 24px rgba(0, 0, 0, .05);
+        }
+
+        .card-head {
+            padding: 22px 28px 16px;
+            border-bottom: 1px solid #f1f5f9;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .card-head h5 {
+            font-weight: 800;
+            font-size: 16px;
+            color: var(--dark);
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .card-body-p {
+            padding: 24px 28px;
+        }
+
+        /* ── SEARCH ── */
+        .search-wrap {
+            position: relative;
+            flex: 1;
+            min-width: 180px;
+        }
+
+        .search-wrap input {
+            width: 100%;
+            padding: 9px 14px 9px 38px;
+            border-radius: 10px;
+            border: 1.5px solid #e2e8f0;
+            background: #E6EEF8;
+            font-size: 13px;
+            font-family: inherit;
+            transition: .2s;
+            outline: none;
+        }
+
+        .search-wrap input:focus {
+            border-color: var(--secondary);
+            background: #fff;
+            box-shadow: 0 0 0 3px rgba(74, 127, 196, .15);
+        }
+
+        .search-wrap .si {
+            position: absolute;
+            left: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #94a3b8;
+            font-size: 13px;
+            pointer-events: none;
+        }
+
+        /* ── TABLE ── */
+        .appt-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .appt-table thead th {
+            padding: 10px 14px;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .06em;
+            color: #94a3b8;
+            border-bottom: 1.5px solid #f1f5f9;
+            white-space: nowrap;
+        }
+
+        .appt-table tbody tr {
+            cursor: pointer;
+            transition: background .12s;
+        }
+
+        .appt-table tbody tr:hover {
+            background: #E6EEF8;
+        }
+
+        .appt-table tbody td {
+            padding: 15px 14px;
+            vertical-align: middle;
+            border-bottom: 1px solid #f1f5f9;
+            font-size: 14px;
+        }
+
+        .appt-table tbody tr:last-child td {
+            border-bottom: none;
+        }
+
+        /* ── PET AVATAR ── */
+        .pet-avatar {
+            width: 42px;
+            height: 42px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #e0f2fe, #bae6fd);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            color: var(--secondary);
+            flex-shrink: 0;
+        }
+
+        /* ── STATUS BADGES ── */
+        .badge-s {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 700;
+            border: 1.5px solid transparent;
+        }
+
+        .badge-pending {
+            background: #fff7ed;
+            color: #ea580c;
+            border-color: #fed7aa;
+        }
+
+        .badge-approved {
+            background: #f0fdf4;
+            color: #16a34a;
+            border-color: #bbf7d0;
+        }
+
+        .badge-completed {
+            background: #eff6ff;
+            color: #2563eb;
+            border-color: #bfdbfe;
+        }
+
+        .badge-cancelled {
+            background: #fff1f2;
+            color: #e11d48;
+            border-color: #fecdd3;
+        }
+
+        .badge-default {
+            background: #E6EEF8;
+            color: #64748b;
+            border-color: #e2e8f0;
+        }
+
+        .badge-proposed {
+            background: #f5f3ff;
+            color: #7e22ce;
+            border-color: #ddd6fe;
+        }
+
+
+        /* ── WIZARD FORM STYLES ── */
+        .wz-container {
+            position: relative;
+        }
+
+        /* Progress Bar */
+        .wz-progress {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 28px;
+            position: relative;
+            padding: 0 4px;
+        }
+
+        .wz-progress-track {
+            position: absolute;
+            top: 50%;
+            left: 40px;
+            right: 40px;
+            height: 3px;
+            background: #e2e8f0;
+            border-radius: 4px;
+            transform: translateY(-50%);
+            z-index: 0;
+            overflow: hidden;
+        }
+
+        .wz-progress-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+            border-radius: 4px;
+            transition: width .45s cubic-bezier(.34, 1.56, .64, 1);
+        }
+
+        .wz-dot {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            background: #f1f5f9;
+            border: 2.5px solid #e2e8f0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 13px;
+            font-weight: 800;
+            color: #94a3b8;
+            position: relative;
+            z-index: 1;
+            transition: all .3s;
+            cursor: default;
+            flex-shrink: 0;
+        }
+
+        .wz-dot.wz-dot-active {
+            background: var(--primary);
+            border-color: var(--primary);
+            color: #fff;
+            box-shadow: 0 0 0 4px rgba(37, 99, 235, .15);
+            transform: scale(1.08);
+        }
+
+        .wz-dot.wz-dot-done {
+            background: #16a34a;
+            border-color: #16a34a;
+            color: #fff;
+        }
+
+        .wz-dot-label {
+            position: absolute;
+            top: calc(100% + 8px);
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .04em;
+            color: #94a3b8;
+            white-space: nowrap;
+            transition: color .3s;
+        }
+
+        .wz-dot.wz-dot-active .wz-dot-label,
+        .wz-dot.wz-dot-done .wz-dot-label {
+            color: var(--dark);
+        }
+
+        /* Steps */
+        .wz-step {
+            display: none;
+            animation: wzFadeIn .35s ease;
+        }
+
+        .wz-step.wz-active {
+            display: block;
+        }
+
+        @keyframes wzFadeIn {
+            from { opacity: 0; transform: translateX(18px); }
+            to { opacity: 1; transform: none; }
+        }
+
+        .wz-step.wz-done .wz-step-inner {
+            opacity: .5;
+        }
+
+        .wz-step-title {
+            font-size: 17px;
+            font-weight: 800;
+            color: var(--dark);
+            margin-bottom: 4px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .wz-step-sub {
+            font-size: 12px;
+            color: #94a3b8;
+            margin-bottom: 20px;
+        }
+
+        .wz-step-icon {
+            width: 32px;
+            height: 32px;
+            border-radius: 9px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            flex-shrink: 0;
+        }
+
+        /* Form fields inside wizard */
+        .wz-step label.lbl {
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .06em;
+            color: #64748b;
+            margin-bottom: 6px;
+            display: block;
+        }
+
+        .wz-step .form-control,
+        .wz-step .form-select {
+            border-radius: 10px;
+            padding: 10px 14px;
+            border: 1.5px solid #e2e8f0;
+            font-size: 14px;
+            background: #fafcff;
+            font-family: inherit;
+            transition: .2s;
+            outline: none;
+            width: 100%;
+        }
+
+        .wz-step .form-control:focus,
+        .wz-step .form-select:focus {
+            border-color: var(--secondary);
+            background: #fff;
+            box-shadow: 0 0 0 3px rgba(74, 127, 196, .12);
+        }
+
+        .wz-step .form-control.wz-error,
+        .wz-step .form-select.wz-error {
+            border-color: #e11d48;
+            box-shadow: 0 0 0 3px rgba(225, 29, 72, .12);
+        }
+
+        @keyframes wzShake {
+            0%, 100% { transform: translateX(0); }
+            20% { transform: translateX(-6px); }
+            40% { transform: translateX(6px); }
+            60% { transform: translateX(-4px); }
+            80% { transform: translateX(4px); }
+        }
+
+        .wz-shake {
+            animation: wzShake .45s ease;
+        }
+
+        /* Navigation buttons */
+        .wz-nav {
+            display: flex;
+            gap: 10px;
+            margin-top: 24px;
+            padding-top: 20px;
+            border-top: 1px solid #f1f5f9;
+        }
+
+        .wz-btn {
+            flex: 1;
+            padding: 12px 20px;
+            border-radius: 50px;
+            font-weight: 700;
+            font-size: 14px;
+            font-family: inherit;
+            cursor: pointer;
+            transition: .25s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            border: none;
+        }
+
+        .wz-btn-primary {
+            background: var(--primary);
+            color: #fff;
+            box-shadow: 0 6px 18px rgba(37, 99, 235, .25);
+        }
+
+        .wz-btn-primary:hover {
+            background: var(--dark);
+            transform: translateY(-2px);
+            box-shadow: 0 10px 28px rgba(18, 26, 47, .3);
+        }
+
+        .wz-btn-secondary {
+            background: #E6EEF8;
+            color: #64748b;
+            border: 1.5px solid #e2e8f0;
+        }
+
+        .wz-btn-secondary:hover {
+            background: #d1dce8;
+            color: #334155;
+        }
+
+        .wz-btn-success {
+            background: #16a34a;
+            color: #fff;
+            box-shadow: 0 6px 18px rgba(22, 163, 74, .25);
+        }
+
+        .wz-btn-success:hover {
+            background: #15803d;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 28px rgba(22, 163, 74, .3);
+        }
+
+        /* Review card */
+        .wz-review-card {
+            background: #f8fafc;
+            border: 1.5px solid #e2e8f0;
+            border-radius: 14px;
+            padding: 20px;
+            margin-bottom: 16px;
+        }
+
+        .wz-review-row {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            padding: 8px 0;
+            border-bottom: 1px solid #f1f5f9;
+        }
+
+        .wz-review-row:last-child {
+            border-bottom: none;
+        }
+
+        .wz-review-label {
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .05em;
+            color: #94a3b8;
+            min-width: 90px;
+            flex-shrink: 0;
+            padding-top: 2px;
+        }
+
+        .wz-review-value {
+            font-size: 14px;
+            font-weight: 600;
+            color: #0f172a;
+        }
+
+        .loc-toggle {
+            display: flex;
+            gap: 8px;
+        }
+
+        .loc-btn {
+            flex: 1;
+            padding: 10px;
+            border: 1.5px solid #e2e8f0;
+            border-radius: 10px;
+            background: #fafcff;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+            color: #64748b;
+            text-align: center;
+            transition: .2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+        }
+
+        .loc-btn.active {
+            border-color: var(--primary);
+            background: var(--primary);
+            color: #fff;
+        }
+
+        .btn-submit {
+            width: 100%;
+            padding: 13px;
+            background: var(--primary);
+            color: #fff;
+            border: none;
+            border-radius: 50px;
+            font-weight: 700;
+            font-size: 15px;
+            font-family: inherit;
+            cursor: pointer;
+            transition: .25s;
+            box-shadow: 0 6px 18px rgba(37, 99, 235, .25);
+        }
+
+        .btn-submit:hover {
+            background: var(--dark);
+            transform: translateY(-2px);
+            box-shadow: 0 10px 28px rgba(18, 26, 47, .3);
+        }
+
+        /* ── ALERT TOAST ── */
+        .alert-toast {
+            position: fixed;
+            top: 24px;
+            right: 32px;
+            z-index: 9999;
+            min-width: 320px;
+            max-width: 440px;
+            border-radius: 14px;
+            padding: 16px 20px;
+            font-weight: 500;
+            font-size: 14px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, .14);
+            animation: toastIn .4s ease;
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+        }
+
+        .alert-toast.success {
+            background: #f0fdf4;
+            border: 1.5px solid #bbf7d0;
+            color: #15803d;
+        }
+
+        /* ── FEEDBACK MODAL PREMIUM STYLES ── */
+        .feedback-stars i {
+            font-size: 32px;
+            color: #e2e8f0;
+            cursor: pointer;
+            transition: .2s;
+        }
+
+        .feedback-stars i.active {
+            color: #fbbf24;
+            transform: scale(1.1);
+        }
+
+        .feedback-modal-content {
+            border-radius: 30px;
+            border: none;
+            overflow: hidden;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.15);
+        }
+
+        .feedback-header {
+            background: #eff6ff;
+            border: none;
+            padding: 30px 30px 10px;
+            position: relative;
+        }
+
+        .feedback-body {
+            padding: 30px;
+            text-align: center;
+        }
+
+        .feedback-icon-bg {
+            width: 80px;
+            height: 80px;
+            background: #fff;
+            border-radius: 20px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 20px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05);
+        }
+
+        .feedback-btn {
+            background: #2563eb;
+            color: #fff;
+            border: none;
+            border-radius: 15px;
+            padding: 14px;
+            font-weight: 700;
+            width: 100%;
+            transition: .2s;
+            margin-top: 10px;
+        }
+
+        .feedback-btn:hover {
+            background: #1e40af;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 15px -3px rgba(37, 99, 235, 0.3);
+        }
+
+        .feedback-textarea {
+            border-radius: 15px;
+            border: 1.5px solid #e2e8f0;
+            background: #f8fafc;
+            padding: 15px;
+            font-size: 14px;
+        }
+
+        .feedback-textarea:focus {
+            border-color: #3b82f6;
+            box-shadow: none;
+            background: #fff;
+        }
+
+        .alert-toast.danger {
+            background: #fff1f2;
+            border: 1.5px solid #fecdd3;
+            color: #be123c;
+        }
+
+        @keyframes toastIn {
+            from {
+                opacity: 0;
+                transform: translateY(-16px) scale(.96);
+            }
+
+            to {
+                opacity: 1;
+                transform: none;
+            }
+        }
+
+        /* ── DETAIL MODAL ── */
+        .dmodal-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, .5);
+            z-index: 99998;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 16px;
+            opacity: 0;
+            transition: opacity .18s;
+        }
+
+        .dmodal-backdrop.open {
+            display: flex;
+            opacity: 1;
+        }
+
+        .dmodal {
+            background: #fff;
+            border-radius: 20px;
+            width: 100%;
+            max-width: 520px;
+            max-height: 88vh;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 24px 64px rgba(0, 0, 0, .2);
+            overflow: hidden;
+            transform: scale(.95) translateY(12px);
+            transition: transform .2s, opacity .2s;
+            opacity: 0;
+        }
+
+        .dmodal-backdrop.open .dmodal {
+            transform: none;
+            opacity: 1;
+        }
+
+        .dmodal-header {
+            padding: 20px 24px;
+            border-bottom: 1px solid #f1f5f9;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .dmodal-header h5 {
+            font-weight: 800;
+            font-size: 17px;
+            color: var(--dark);
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .dmodal-close {
+            width: 34px;
+            height: 34px;
+            border-radius: 50%;
+            border: 1.5px solid #e2e8f0;
+            background: #E6EEF8;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 15px;
+            color: #64748b;
+            transition: .15s;
+        }
+
+        .dmodal-close:hover {
+            background: #fee2e2;
+            border-color: #fca5a5;
+            color: #e11d48;
+        }
+
+        .dmodal-body {
+            overflow-y: auto;
+            padding: 24px;
+            flex: 1;
+        }
+
+        .dmodal-footer {
+            padding: 16px 24px;
+            border-top: 1px solid #f1f5f9;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .info-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+
+        .info-item label {
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .08em;
+            color: #94a3b8;
+            display: block;
+            margin-bottom: 3px;
+        }
+
+        .info-item .val {
+            font-size: 14px;
+            font-weight: 600;
+            color: #0f172a;
+        }
+
+        .info-item.full {
+            grid-column: 1/-1;
+        }
+
+        .service-hero {
+            text-align: center;
+            background: linear-gradient(135deg, #eff6ff, #e0f2fe);
+            border-radius: 14px;
+            padding: 18px;
+            margin-bottom: 16px;
+        }
+
+        .service-hero .sname {
+            font-size: 20px;
+            font-weight: 800;
+            color: var(--primary);
+        }
+
+        .service-hero .slim {
+            font-size: 13px;
+            color: #64748b;
+            margin-top: 2px;
+        }
+
+        .notice-box {
+            border-radius: 12px;
+            padding: 14px 16px;
+            font-size: 13px;
+            margin-bottom: 14px;
+        }
+
+        .notice-box.warn {
+            background: #fff7ed;
+            border: 1.5px solid #fed7aa;
+            color: #9a3412;
+        }
+
+        .btn-action {
+            flex: 1;
+            padding: 11px 16px;
+            border-radius: 50px;
+            border: none;
+            font-weight: 700;
+            font-size: 13px;
+            font-family: inherit;
+            cursor: pointer;
+            transition: .2s;
+        }
+
+        .btn-action.green {
+            background: #16a34a;
+            color: #fff;
+        }
+
+        .btn-action.red {
+            background: #fff;
+            border: 1.5px solid #fca5a5;
+            color: #e11d48;
+        }
+
+        .btn-action.gray {
+            background: #E6EEF8;
+            border: 1.5px solid #e2e8f0;
+            color: #64748b;
+        }
+
+        .btn-action.danger-solid {
+            background: #e11d48;
+            color: #fff;
+        }
+
+        .btn-action:hover {
+            opacity: .88;
+            transform: translateY(-1px);
+        }
+
+        #homeAddressContainer,
+        #endDateContainer {
+            display: none;
+        }
+
+        .no-appt {
+            text-align: center;
+            padding: 52px 20px;
+            color: #94a3b8;
+        }
+
+        .no-appt i {
+            font-size: 48px;
+            display: block;
+            margin-bottom: 14px;
+            opacity: .35;
+        }
+
+        /* ── NO PET MODAL ── */
+        #noPetBackdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, .6);
+            z-index: 99999;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 16px;
+            opacity: 0;
+            transition: opacity .25s;
+        }
+
+        #noPetBackdrop.visible {
+            opacity: 1;
+        }
+
+        #noPetModal {
+            background: #fff;
+            border-radius: 24px;
+            width: 100%;
+            max-width: 440px;
+            box-shadow: 0 32px 80px rgba(0, 0, 0, .22);
+            overflow: hidden;
+            transform: scale(.92) translateY(24px);
+            transition: transform .28s cubic-bezier(.34, 1.56, .64, 1), opacity .25s;
+            opacity: 0;
+        }
+
+        #noPetBackdrop.visible #noPetModal {
+            transform: none;
+            opacity: 1;
+        }
+
+        .npm-header {
+            background: linear-gradient(135deg, #2563eb 0%, #3b82f6 100%);
+            padding: 32px 28px 24px;
+            text-align: center;
+            position: relative;
+        }
+
+        .npm-icon {
+            width: 72px;
+            height: 72px;
+            background: rgba(255, 255, 255, .18);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 14px;
+            font-size: 32px;
+            color: #fff;
+            border: 2.5px solid rgba(255, 255, 255, .35);
+        }
+
+        .npm-title {
+            font-size: 20px;
+            font-weight: 800;
+            color: #fff;
+            margin: 0 0 6px;
+            letter-spacing: -.3px;
+        }
+
+        .npm-sub {
+            font-size: 13px;
+            color: rgba(255, 255, 255, .78);
+            margin: 0;
+            line-height: 1.5;
+        }
+
+        .npm-body {
+            padding: 28px;
+        }
+
+        .npm-steps {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            margin-bottom: 24px;
+        }
+
+        .npm-step {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+        }
+
+        .npm-step-num {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: #eff6ff;
+            color: #2563eb;
+            font-size: 13px;
+            font-weight: 800;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            margin-top: 1px;
+        }
+
+        .npm-step-text {
+            font-size: 13px;
+            color: #475569;
+            line-height: 1.5;
+        }
+
+        .npm-step-text strong {
+            color: #0f172a;
+            font-weight: 700;
+        }
+
+        .npm-btn-primary {
+            display: block;
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, #2563eb, #3b82f6);
+            color: #fff;
+            border: none;
+            border-radius: 50px;
+            font-weight: 700;
+            font-size: 15px;
+            font-family: 'Inter', sans-serif;
+            cursor: pointer;
+            transition: .22s;
+            text-align: center;
+            text-decoration: none;
+            box-shadow: 0 6px 20px rgba(37, 99, 235, .3);
+            margin-bottom: 10px;
+        }
+
+        .npm-btn-primary:hover {
+            opacity: .9;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 28px rgba(37, 99, 235, .4);
+        }
+
+        .npm-btn-secondary {
+            display: block;
+            width: 100%;
+            padding: 12px;
+            background: transparent;
+            color: #64748b;
+            border: 1.5px solid #e2e8f0;
+            border-radius: 50px;
+            font-weight: 600;
+            font-size: 14px;
+            font-family: 'Inter', sans-serif;
+            cursor: pointer;
+            transition: .18s;
+            text-align: center;
+        }
+
+        .npm-btn-secondary:hover {
+            background: #E6EEF8;
+            border-color: #cbd5e1;
+            color: #334155;
+        }
+
+        .pet-select-card.selected {
+            border-color: #2563eb !important;
+            background: #eff6ff !important;
+            box-shadow: 0 0 0 3px rgba(37,99,235,.12) !important;
+        }
+        .pet-select-card.selected .pet-check-badge {
+            display: inline-flex !important;
+        }
+        .pet-select-card:hover {
+            border-color: #3b82f6;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(37,99,235,.1);
+        }
+
+        .sidebar::-webkit-scrollbar {
+            width: 5px;
+        }
+
+        .sidebar::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+        }
+
+        .sidebar::-webkit-scrollbar-track {
+            background: transparent;
+        }
+    
+/* ====== WHITE SIDEBAR THEME (Reference Mockup Match) ====== */
+.sidebar {
+    background: #ffffff !important;
+    width: var(--sidebar-width, 260px) !important;
+    height: 100vh !important;
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    padding: 28px 20px 24px !important;
+    z-index: 1000 !important;
+    display: flex !important;
+    flex-direction: column !important;
+    border-right: 1px solid #eef2f6 !important;
+    box-shadow: none !important;
+    overflow-y: auto !important;
+}
+
+.sidebar-brand {
+    display: flex !important;
+    align-items: center !important;
+    gap: 12px !important;
+    margin-bottom: 24px !important;
+    padding: 0 4px !important;
+    text-decoration: none !important;
+}
+
+.sidebar-brand-icon {
+    width: 44px !important;
+    height: 44px !important;
+    min-width: 44px !important;
+    border-radius: 13px !important;
+    background: #2563eb !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    color: #ffffff !important;
+    font-size: 20px !important;
+    flex-shrink: 0 !important;
+    box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+}
+
+.sidebar-brand span {
+    font-weight: 800 !important;
+    color: #182032 !important;
+    font-size: 22px !important;
+    letter-spacing: -0.4px !important;
+}
+
+.sidebar-user {
+    margin-bottom: 24px !important;
+    padding: 15px 18px !important;
+    border-radius: 14px !important;
+    background: #f8fafc !important;
+    border: 1px solid #eef2f6 !important;
+}
+
+.sidebar-user .welcome {
+    font-size: 13px !important;
+    color: #64748b !important;
+    font-weight: 500 !important;
+    line-height: 1.3 !important;
+}
+
+.sidebar-user .uname {
+    font-weight: 700 !important;
+    color: #0f172a !important;
+    font-size: 15.5px !important;
+    margin-top: 3px !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+}
+
+.sidebar a {
+    display: flex !important;
+    align-items: center !important;
+    gap: 14px !important;
+    padding: 13px 18px !important;
+    border-radius: 12px !important;
+    color: #334155 !important;
+    text-decoration: none !important;
+    margin-bottom: 4px !important;
+    font-weight: 600 !important;
+    font-size: 15px !important;
+    transition: all 0.2s ease !important;
+    letter-spacing: -0.1px !important;
+}
+
+.sidebar a i {
+    width: 22px !important;
+    text-align: center !important;
+    font-size: 17px !important;
+    color: #64748b !important;
+    transition: color 0.2s !important;
+    flex-shrink: 0 !important;
+}
+
+.sidebar a:hover {
+    background: #f8fafc !important;
+    color: #0f172a !important;
+}
+
+.sidebar a:hover i {
+    color: #2563eb !important;
+}
+
+.sidebar a.active {
+    background: #2563eb !important;
+    color: #ffffff !important;
+    font-weight: 700 !important;
+    box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28) !important;
+}
+
+.sidebar a.active i {
+    color: #ffffff !important;
+}
+
+.sidebar .sidebar-logout {
+    margin-top: auto !important;
+    padding-top: 20px !important;
+    border-top: 1px solid #f1f5f9 !important;
+}
+
+.sidebar .sidebar-logout a {
+    color: #dc2626 !important;
+    font-weight: 600 !important;
+    margin-bottom: 0 !important;
+}
+
+.sidebar .sidebar-logout a i {
+    color: #dc2626 !important;
+}
+
+.sidebar .sidebar-logout a:hover {
+    background: #fef2f2 !important;
+    color: #b91c1c !important;
+}
+
+.sidebar .sidebar-logout a:hover i {
+    color: #b91c1c !important;
+}
+
+.sidebar::-webkit-scrollbar { width: 5px; }
+.sidebar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.06); border-radius: 10px; }
+.sidebar::-webkit-scrollbar-track { background: transparent; }
+</style>
+    <link rel="stylesheet" href="assets/pragmavet.css">
+    <link href="assets/global-style.css" rel="stylesheet">
+</head>
+
+<body>
+
+    <?php if (isset($_SESSION['message'])): ?>
+        <div class="alert-toast <?php echo $_SESSION['msg_type'] === 'success' ? 'success' : 'danger'; ?>" id="toastMsg">
+            <i class="fa <?php echo $_SESSION['msg_type'] === 'success' ? 'fa-check-circle' : 'fa-exclamation-circle'; ?>"
+                style="margin-top:1px;font-size:18px;flex-shrink:0;"></i>
+            <div><?php echo $_SESSION['message'];
+            unset($_SESSION['message'], $_SESSION['msg_type']); ?></div>
+            <button onclick="this.parentElement.remove()"
+                style="background:none;border:none;cursor:pointer;margin-left:auto;font-size:16px;color:inherit;opacity:.6;">&#x2715;</button>
+        </div>
+    <?php endif; ?>
+
+    <!-- SIDEBAR -->
+<div class="sidebar">
+        <div class="sidebar-brand">
+            <div class="sidebar-brand-icon"><i class="fa fa-paw"></i></div>
+            <span>PragmaVet</span>
+        </div>
+        <div class="sidebar-user">
+            <div class="welcome">Welcome back,</div>
+            <div class="uname"><?php echo htmlspecialchars($user_name ?? ''); ?></div>
+        </div>
+        <a href="dashboard.php"><i class="fa fa-home"></i> <span>Dashboard</span></a>
+        <a href="appointments.php" class="active"><i class="fa fa-calendar-alt"></i> <span>Appointments</span></a>
+        <a href="boarding.php"><i class="fa fa-hotel"></i> <span>Pet Boarding</span></a>
+        <a href="pets.php"><i class="fa fa-notes-medical"></i> <span>Profile & Pets</span></a>
+        <a href="billing.php"><i class="fa fa-file-invoice-dollar"></i> <span>Billing</span></a>
+        <a href="settings.php"><i class="fa fa-cog"></i> <span>Account Settings</span></a>
+        <div class="sidebar-logout"><a href="logout.php"><i class="fa fa-sign-out-alt"></i> <span>Logout</span></a></div>
+    </div>
+
+<div class="main-content" style="margin-left:260px;padding:28px 36px 60px;">
+
+    <!-- Header Breadcrumb & View Tabs -->
+    <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-3">
+        <div>
+            <h1 id="apptPageTitle" style="font-size:24px;font-weight:800;color:#1e1b4b;margin:0;">New Appointment Wizard</h1>
+            <div style="font-size:13px;color:#64748b;" id="bCrumbText">
+                <a href="appointments.php" style="color:#5b21b6;text-decoration:none;font-weight:600;">Appointment</a> &gt; <span id="bCrumbSub">New Appointment</span>
+            </div>
+        </div>
+
+        <div class="d-flex gap-2">
+            <button type="button" class="btn rounded-pill px-4 fw-bold" id="btnTabWiz" onclick="switchApptView('wizard')" style="background:#5b21b6;color:#fff;font-size:13px;box-shadow:0 4px 14px rgba(91,33,182,0.3);">
+                <i class="fa fa-magic me-2"></i>New Appointment Wizard
+            </button>
+            <button type="button" class="btn btn-outline-secondary rounded-pill px-4 fw-bold" id="btnTabList" onclick="switchApptView('list')" style="font-size:13px;">
+                <i class="fa fa-list me-2"></i>Your Appointments (<?=count($apptRows)?>)
+            </button>
+        </div>
+    </div>
+
+    <!-- ════════════════════════════════════════════════════════════════════════
+         VIEW 1: NEW APPOINTMENT WIZARD (MATCHING SCREENSHOT MOCKUP)
+    ════════════════════════════════════════════════════════════════════════════ -->
+    <div id="viewWizardContainer">
+
+        <!-- 7-STEP HORIZONTAL TIMELINE STEPPER -->
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;position:relative;margin-bottom:36px;padding:0 10px;">
+            <div style="position:absolute;top:18px;left:40px;right:40px;height:2px;border-top:2px dashed #cbd5e1;z-index:0;pointer-events:none;"></div>
+            <?php
+            $step_names = [
+                1 => 'Select Pet',
+                2 => 'Select Service',
+                3 => 'Select Veterinarian',
+                4 => 'Date, Time & Details',
+                5 => 'Review & Confirm',
+                6 => 'Reservation Fee',
+                7 => 'Booking Confirmed'
+            ];
+            for ($i = 1; $i <= 7; $i++):
+            ?>
+            <div class="step-node <?=$i===1?'active':''?>" id="step-node-<?=$i?>" onclick="jumpToStep(<?=$i?>)" style="display:flex;flex-direction:column;align-items:center;position:relative;z-index:1;cursor:pointer;flex:1;">
+                <div class="step-circle" style="width:36px;height:36px;border-radius:50%;background:#fff;border:2px solid #cbd5e1;color:#64748b;font-weight:700;font-size:14px;display:flex;align-items:center;justify-content:center;transition:all .3s;"><?=$i?></div>
+                <div class="step-node-label" style="font-size:11px;font-weight:600;color:#64748b;margin-top:8px;text-align:center;white-space:nowrap;"><?=$step_names[$i]?></div>
+            </div>
+            <?php endfor; ?>
+        </div>
+
+        <!-- MAIN WIZARD GRID (70% Left Panel, 30% Right Panel) -->
+        <div style="display:grid;grid-template-columns:1fr 340px;gap:28px;align-items:start;">
+            
+            <!-- LEFT PANEL CARD -->
+            <div style="background:#fff;border-radius:20px;border:1px solid #e2e8f0;padding:32px;box-shadow:0 4px 20px rgba(0,0,0,0.03);">
+
+                <!-- STEP 1: Select Pet -->
+                <div class="wiz-panel" id="panel-1" style="display:block;">
+                    <div style="display:flex;align-items:center;gap:14px;margin-bottom:6px;">
+                        <div style="width:42px;height:42px;border-radius:12px;background:#f3e8ff;color:#5b21b6;display:flex;align-items:center;justify-content:center;font-size:20px;"><i class="fa fa-paw"></i></div>
+                        <h2 style="font-size:20px;font-weight:800;color:#1e1b4b;margin:0;">Step 1 of 6: Select Pet</h2>
+                    </div>
+                    <div style="font-size:13px;color:#64748b;margin-bottom:24px;margin-left:56px;">Choose the pet (or pets) this appointment is for.</div>
+
+                    <div class="d-flex align-items-center gap-2 mb-3">
+                        <input type="checkbox" id="multiPetToggle" onchange="toggleMultiPetMode(this)" style="width:18px;height:18px;cursor:pointer;">
+                        <label for="multiPetToggle" class="fw-bold" style="font-size:13px;color:#334155;cursor:pointer;">Book for multiple pets</label>
+                    </div>
+
+                    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:16px;margin-bottom:24px;" id="petGrid">
+                        <?php if (empty($pets_for_form)): ?>
+                        <div style="grid-column:1/-1;padding:28px;text-align:center;color:#64748b;font-size:14px;border:2px dashed #cbd5e1;border-radius:16px;">
+                            <i class="fa fa-paw" style="font-size:32px;color:#c4b5fd;display:block;margin-bottom:12px;"></i>
+                            No registered pets found. <a href="pets.php" style="color:#5b21b6;font-weight:700;text-decoration:none;">+ Register a Pet Profile</a> before booking.
+                        </div>
+                        <?php else: ?>
+                        <?php foreach ($pets_for_form as $idx => $p):
+                            $is_sel = ($idx === 0);
+                            $spec_info = trim(($p['breed'] ?? '') . ' ' . ($p['species'] ?? 'Pet'));
+                            $has_pic = !empty($p['pet_picture']);
+                            $initials = strtoupper(substr($p['name'] ?? 'P', 0, 2));
+                        ?>
+                        <div class="pet-card-chip <?=$is_sel?'selected':''?>"
+                             data-pet-id="<?=(int)$p['id']?>"
+                             data-pet-name="<?=htmlspecialchars($p['name'])?>"
+                             data-pet-spec="<?=htmlspecialchars($spec_info)?>"
+                             data-pet-age="<?=htmlspecialchars($p['age'] ?? 'Active Profile')?>"
+                             onclick="togglePetChip(this)"
+                             style="border-radius:18px;border:2px solid <?=$is_sel?'#5b21b6':'#e2e8f0'?>;background:<?=$is_sel?'#f3e8ff':'#fff'?>;cursor:pointer;padding:0;overflow:hidden;transition:all .2s;box-shadow:<?=$is_sel?'0 4px 16px rgba(91,33,182,0.18)':'0 2px 8px rgba(0,0,0,0.04)'?>;">
+                            <!-- Pet Photo / Initials Avatar -->
+                            <div style="width:100%;height:110px;position:relative;overflow:hidden;background:linear-gradient(135deg,#ede9fe,#ddd6fe);">
+                                <?php if ($has_pic): ?>
+                                <img src="uploads/pets/<?=htmlspecialchars($p['pet_picture'])?>" alt="<?=htmlspecialchars($p['name'])?>" style="width:100%;height:100%;object-fit:cover;display:block;">
+                                <?php else: ?>
+                                <div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:900;color:#7c3aed;letter-spacing:-1px;"><?=$initials?></div>
+                                <?php endif; ?>
+                                <!-- Selected checkmark overlay -->
+                                <div class="pet-sel-badge" style="position:absolute;top:8px;right:8px;width:22px;height:22px;border-radius:50%;background:#5b21b6;color:#fff;font-size:11px;display:<?=$is_sel?'flex':'none'?>;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(91,33,182,0.4);">
+                                    <i class="fa fa-check"></i>
+                                </div>
+                            </div>
+                            <!-- Pet Info -->
+                            <div style="padding:12px 14px 14px;">
+                                <div style="font-weight:800;font-size:14px;color:<?=$is_sel?'#5b21b6':'#1e1b4b'?>;margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"><?=htmlspecialchars($p['name'])?></div>
+                                <div style="font-size:11px;color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"><?=htmlspecialchars(trim($p['species'] ?? 'Pet'))?></div>
+                                <?php if (!empty($p['breed'])): ?>
+                                <div style="font-size:10px;color:#94a3b8;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"><?=htmlspecialchars($p['breed'])?></div>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+                        <?php endforeach; ?>
+                        <?php endif; ?>
+                    </div>
+
+                    <div class="wiz-alert-err" id="err-1" style="display:none;background:#fef2f2;border:1px solid #fca5a5;color:#dc2626;border-radius:10px;padding:10px 16px;font-size:13px;font-weight:600;margin-top:14px;">Please select at least one pet to proceed.</div>
+
+                    <div style="display:flex;align-items:center;justify-content:space-between;padding-top:16px;border-top:1px solid #f1f5f9;">
+                        <div></div>
+                        <div>
+                            <button type="button" class="btn-wiz-next" onclick="goNext(1)" style="padding:10px 28px;border-radius:10px;background:#5b21b6;color:#fff;font-weight:700;font-size:13px;border:none;cursor:pointer;box-shadow:0 4px 12px rgba(91,33,182,0.3);">Next &gt;</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- STEP 2: Select Service (3x3 Grid matching mockup) -->
+                <div class="wiz-panel" id="panel-2" style="display:none;">
+                    <div style="display:flex;align-items:center;gap:14px;margin-bottom:6px;">
+                        <div style="width:42px;height:42px;border-radius:12px;background:#f3e8ff;color:#5b21b6;display:flex;align-items:center;justify-content:center;font-size:20px;"><i class="fa fa-clipboard-list"></i></div>
+                        <h2 style="font-size:20px;font-weight:800;color:#1e1b4b;margin:0;">Step 2 of 6: Select Service</h2>
+                    </div>
+                    <div style="font-size:13px;color:#64748b;margin-bottom:24px;margin-left:56px;">Choose the type of service you need for your pet.</div>
+
+                    <?php
+                    $preset_services = [
+                        ['id' => 1, 'name' => 'Consultation', 'description' => 'General check-up and health consultation', 'duration_minutes' => 30, 'price' => 500, 'icon' => 'fa-stethoscope', 'bg' => '#f3e8ff', 'color' => '#7c3aed', 'info' => 'Consultation includes: Physical examination, health assessment, and basic treatment recommendation.'],
+                        ['id' => 2, 'name' => 'Vaccination', 'description' => 'Routine vaccination services', 'duration_minutes' => 20, 'price' => 350, 'icon' => 'fa-syringe', 'bg' => '#dcfce7', 'color' => '#16a34a', 'info' => 'Vaccination includes: Vaccine administration, health check before injection, and passport update.'],
+                        ['id' => 3, 'name' => 'Laboratory Test', 'description' => 'Blood test, fecal test, urinalysis, etc.', 'duration_minutes' => 45, 'price' => 600, 'icon' => 'fa-flask', 'bg' => '#e0f2fe', 'color' => '#0284c7', 'info' => 'Laboratory Test includes: Blood, urine, or stool sample extraction, laboratory processing, and diagnostic report.'],
+                        ['id' => 4, 'name' => 'Deworming', 'description' => 'Internal and external deworming', 'duration_minutes' => 15, 'price' => 250, 'icon' => 'fa-first-aid', 'bg' => '#ffedd5', 'color' => '#ea580c', 'info' => 'Deworming includes: Oral broad-spectrum dewormer dosage, parasite preventive guidance, and weight check.'],
+                        ['id' => 5, 'name' => 'Dental Cleaning', 'description' => 'Teeth cleaning and oral care', 'duration_minutes' => 60, 'price' => 700, 'icon' => 'fa-tooth', 'bg' => '#ccfbf1', 'color' => '#0d9488', 'info' => 'Dental Cleaning includes: Ultrasonic scaling, tooth polishing, gum health assessment, and oral hygiene check.'],
+                        ['id' => 6, 'name' => 'Grooming', 'description' => 'Bath, nail trimming, ear cleaning, etc.', 'duration_minutes' => 60, 'price' => 400, 'icon' => 'fa-paw', 'bg' => '#fce7f3', 'color' => '#db2777', 'info' => 'Grooming includes: Medicated shampoo bath, coat blow dry, nail clipping, ear cleaning, and sanitary trim.'],
+                    ];
+                    // Prices shown here must match what billing charges (System Settings → Service Prices)
+                    foreach ($preset_services as &$ps) {
+                        $ps['price'] = sp_price($conn, $ps['name']);
+                        unset($ps['price_display']);
+                    }
+                    unset($ps);
+                    ?>
+
+                    <div style="display:grid;grid-template-columns:repeat(3, 1fr);gap:16px;margin-bottom:24px;">
+                        <?php foreach ($preset_services as $idx => $s): 
+                            $is_sel = ($idx === 0);
+                            $price_txt = isset($s['price_display']) ? $s['price_display'] : '&#8369;' . number_format((float)$s['price'], 2) . ($s['price_unit'] ?? '');
+                        ?>
+                        <div class="svc-item-card <?=$is_sel?'selected':''?>"
+                             data-svc-id="<?=(int)$s['id']?>"
+                             data-svc-name="<?=htmlspecialchars($s['name'])?>"
+                             data-svc-dur="<?=(int)$s['duration_minutes']?>"
+                             data-svc-price="<?=(float)$s['price']?>"
+                             data-svc-pricetxt="<?=htmlspecialchars(strip_tags($price_txt))?>"
+                             data-svc-info="<?=htmlspecialchars($s['info'])?>"
+                             onclick="selectServiceCard(this)"
+                             style="border:2px solid <?=$is_sel?'#5b21b6':'#e2e8f0'?>;border-radius:16px;padding:20px;background:<?=$is_sel?'#fcfaff':'#fff'?>;cursor:pointer;position:relative;display:flex;flex-direction:column;">
+                            <div class="svc-check-radio" style="width:20px;height:20px;border-radius:50%;border:2px solid <?=$is_sel?'#5b21b6':'#cbd5e1'?>;background:<?=$is_sel?'#5b21b6':'transparent'?>;position:absolute;top:18px;right:18px;display:flex;align-items:center;justify-content:center;">
+                                <?php if($is_sel): ?><div style="width:6px;height:6px;border-radius:50%;background:#fff;"></div><?php endif; ?>
+                            </div>
+                            <div style="width:46px;height:46px;border-radius:50%;background:<?=$s['bg']?>;color:<?=$s['color']?>;display:flex;align-items:center;justify-content:center;font-size:20px;margin-bottom:14px;">
+                                <i class="fa <?=$s['icon']?>"></i>
+                            </div>
+                            <div style="font-size:15px;font-weight:800;color:#1e1b4b;margin-bottom:6px;"><?=htmlspecialchars($s['name'])?></div>
+                            <div style="font-size:12px;color:#64748b;line-height:1.4;margin-bottom:14px;flex-grow:1;"><?=htmlspecialchars($s['description'])?></div>
+                        </div>
+                        <?php endforeach; ?>
+                    </div>
+
+                    <!-- Yellow/Cream Service Information Callout Box -->
+                    <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:14px;padding:16px 20px;margin-bottom:28px;" id="svcInfoBox">
+                        <div style="font-size:13px;font-weight:800;color:#92400e;margin-bottom:4px;">Service Information</div>
+                        <div style="font-size:13px;color:#b45309;margin:0;" id="svcInfoText">
+                            <strong>Consultation includes:</strong> Physical examination, health assessment, and basic treatment recommendation.
+                        </div>
+                    </div>
+
+                    <div class="wiz-alert-err" id="err-2" style="display:none;background:#fef2f2;border:1px solid #fca5a5;color:#dc2626;border-radius:10px;padding:10px 16px;font-size:13px;font-weight:600;margin-top:14px;">Please select a service to proceed.</div>
+
+                    <div style="display:flex;align-items:center;justify-content:space-between;padding-top:16px;border-top:1px solid #f1f5f9;">
+                        <button type="button" class="btn-wiz-prev" onclick="goPrev(2)" style="padding:10px 24px;border-radius:10px;border:1.5px solid #cbd5e1;background:#fff;font-weight:700;font-size:13px;color:#475569;cursor:pointer;">&lt; Previous</button>
+                        <div>
+                            <button type="button" class="btn-wiz-cancel" onclick="resetWizard()" style="padding:10px 20px;border-radius:10px;border:1.5px solid #e2e8f0;background:#fff;font-weight:700;font-size:13px;color:#64748b;cursor:pointer;margin-right:10px;">Cancel</button>
+                            <button type="button" class="btn-wiz-next" onclick="goNext(2)" style="padding:10px 28px;border-radius:10px;background:#5b21b6;color:#fff;font-weight:700;font-size:13px;border:none;cursor:pointer;box-shadow:0 4px 12px rgba(91,33,182,0.3);">Next &gt;</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- STEP 3: Select Veterinarian -->
+                <div class="wiz-panel" id="panel-3" style="display:none;">
+                    <div style="display:flex;align-items:center;gap:14px;margin-bottom:6px;">
+                        <div style="width:42px;height:42px;border-radius:12px;background:#f3e8ff;color:#5b21b6;display:flex;align-items:center;justify-content:center;font-size:20px;"><i class="fa fa-user-md"></i></div>
+                        <h2 style="font-size:20px;font-weight:800;color:#1e1b4b;margin:0;">Step 3 of 6: Select Veterinarian</h2>
+                    </div>
+                    <div style="font-size:13px;color:#64748b;margin-bottom:24px;margin-left:56px;">We recommend the veterinarian with the most open time in the coming week. You can choose any vet; the next step only shows times they are free.</div>
+
+                    <div style="display:grid;grid-template-columns:repeat(auto-fill, minmax(220px, 1fr));gap:16px;margin-bottom:24px;">
+                        <?php foreach ($doctors as $doc): 
+                            $words = explode(' ', $doc['fullname']);
+                            $inits = strtoupper(substr($words[0]??'D', 0, 1) . substr($words[1]??'V', 0, 1));
+                        ?>
+                        <div class="vet-card" data-vet-id="<?=(int)$doc['id']?>" data-vet-name="<?=htmlspecialchars($doc['fullname'])?>" data-vet-spec="Veterinarian" onclick="selectVetCard(this)" style="border:2px solid #e2e8f0;border-radius:16px;padding:20px;background:#fff;cursor:pointer;text-align:center;">
+                            <div style="width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg, #6d28d9, #4c1d95);color:#fff;font-size:20px;font-weight:800;display:flex;align-items:center;justify-content:center;margin:0 auto 12px;"><?=$inits?></div>
+                            <div style="font-weight:700;font-size:15px;color:#1e1b4b;"><?=htmlspecialchars($doc['fullname'])?></div>
+                            <div style="font-size:12px;color:#64748b;margin-top:4px;">Veterinary Specialist</div>
+                            <?php $vs = $vet_smart[(int)$doc['id']] ?? null; ?>
+                            <div class="vet-avail">
+                                <?php if ($vs && $vs['next']): ?>
+                                    <div><i class="fa fa-calendar-check"></i> Next open: <b><?= date('D, M j', strtotime($vs['next'])) ?></b></div>
+                                    <div><i class="fa fa-chart-simple"></i> <?= $vs['booked7'] ?> booked · <?= $vs['days7'] ?> open day<?= $vs['days7'] === 1 ? '' : 's' ?> this week</div>
+                                <?php else: ?>
+                                    <div class="vet-full"><i class="fa fa-calendar-xmark"></i> No openings in the next 30 days</div>
+                                <?php endif; ?>
+                            </div>
+                            <?php if ((int)$doc['id'] === $recommended_vet): ?><span class="vet-reco"><i class="fa fa-star"></i> Recommended</span><?php endif; ?>
+                        </div>
+                        <?php endforeach; ?>
+                        <?php if (empty($doctors)): ?>
+                            <div class="text-muted small">No veterinarians are available for online booking right now. Please contact the clinic.</div>
+                        <?php endif; ?>
+                    </div>
+                    <style>
+                        .vet-card { position: relative; }
+                        .vet-avail { margin-top: 10px; padding-top: 10px; border-top: 1px dashed #e9e3f7; font-size: 11.5px; color: #475569; line-height: 1.7; }
+                        .vet-avail i { color: #7c3aed; width: 14px; }
+                        .vet-avail .vet-full, .vet-avail .vet-full i { color: #b91c1c; }
+                        .vet-reco { position: absolute; top: 10px; right: 10px; background: #5b21b6; color: #fff; font-size: 10.5px; font-weight: 800; padding: 3px 9px; border-radius: 999px; }
+                        .vet-reco i { font-size: 9px; margin-right: 2px; }
+                    </style>
+
+                    <div class="wiz-alert-err" id="err-3" style="display:none;background:#fef2f2;border:1px solid #fca5a5;color:#dc2626;border-radius:10px;padding:10px 16px;font-size:13px;font-weight:600;margin-top:14px;">Please select a veterinarian option.</div>
+
+                    <div style="display:flex;align-items:center;justify-content:space-between;padding-top:16px;border-top:1px solid #f1f5f9;">
+                        <button type="button" class="btn-wiz-prev" onclick="goPrev(3)" style="padding:10px 24px;border-radius:10px;border:1.5px solid #cbd5e1;background:#fff;font-weight:700;font-size:13px;color:#475569;cursor:pointer;">&lt; Previous</button>
+                        <div>
+                            <button type="button" class="btn-wiz-cancel" onclick="resetWizard()" style="padding:10px 20px;border-radius:10px;border:1.5px solid #e2e8f0;background:#fff;font-weight:700;font-size:13px;color:#64748b;cursor:pointer;margin-right:10px;">Cancel</button>
+                            <button type="button" class="btn-wiz-next" onclick="goNext(3)" style="padding:10px 28px;border-radius:10px;background:#5b21b6;color:#fff;font-weight:700;font-size:13px;border:none;cursor:pointer;box-shadow:0 4px 12px rgba(91,33,182,0.3);">Next &gt;</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- STEP 4: Date & Time — Inline Calendar + Time Slots -->
+                <div class="wiz-panel" id="panel-4" style="display:none;">
+                    <div style="display:flex;align-items:center;gap:14px;margin-bottom:6px;">
+                        <div style="width:42px;height:42px;border-radius:12px;background:#f3e8ff;color:#5b21b6;display:flex;align-items:center;justify-content:center;font-size:20px;"><i class="fa fa-calendar-alt"></i></div>
+                        <h2 style="font-size:20px;font-weight:800;color:#1e1b4b;margin:0;">Step 4 of 6: Date, Time &amp; Details</h2>
+                    </div>
+                    <div style="font-size:13px;color:#64748b;margin-bottom:20px;margin-left:56px;">Pick a date, choose a time slot, and set your service preferences.</div>
+
+                    <!-- Notice banner: Same day booking disabled -->
+                    <div class="p-3 rounded-3 mb-4" style="background:#fff7ed;border:1px solid #ffedd5;color:#c2410c;font-size:13px;display:flex;align-items:center;gap:10px;">
+                        <i class="fa fa-exclamation-circle" style="font-size:16px;"></i>
+                        <div>Same-day booking is disabled. Bookings start from <strong>Tomorrow</strong>. Sundays &amp; holidays are unavailable.</div>
+                    </div>
+
+                    <!-- Side-by-side: calendar left, time slots right -->
+                    <div class="date-time-layout">
+
+                        <!-- Left: Inline Calendar -->
+                        <div>
+                            <div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;">Select Date</div>
+                            <!-- Hidden input – flatpickr attaches here, calendar renders inline inside .cal-wrapper -->
+                            <input type="text" id="wizDatePicker" style="position:absolute;opacity:0;pointer-events:none;width:0;height:0;" readonly>
+                            <div class="cal-wrapper" id="calWrapper"></div>
+                            <!-- Legend -->
+                            <div style="display:flex;align-items:center;gap:14px;margin-top:12px;font-size:11px;font-weight:600;color:#64748b;">
+                                <span style="display:flex;align-items:center;gap:5px;"><span style="width:11px;height:11px;border-radius:3px;background:#5b21b6;display:inline-block;"></span>Selected</span>
+                                <span style="display:flex;align-items:center;gap:5px;"><span style="width:11px;height:11px;border-radius:3px;border:2px solid #a78bfa;display:inline-block;"></span>Today</span>
+                                <span style="display:flex;align-items:center;gap:5px;"><span style="width:11px;height:11px;border-radius:3px;background:#f1f5f9;display:inline-block;"></span>Unavailable</span>
+                            </div>
+                        </div>
+
+                        <!-- Right: Time Slots -->
+                        <div>
+                            <div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px;">Available Time Slots</div>
+                            <div id="selDateBadge" class="sel-date-badge" style="display:none;">
+                                <i class="fa fa-calendar-check"></i>
+                                <span id="slotDateDisplay">&mdash;</span>
+                            </div>
+                            <!-- Quick-pick buttons -->
+                            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">
+                                <button type="button" onclick="quickPickDate(1)" style="padding:6px 14px;border-radius:20px;border:1.5px solid #5b21b6;background:#fff;color:#5b21b6;font-weight:700;font-size:12px;cursor:pointer;">Tomorrow</button>
+                                <button type="button" onclick="quickPickDate(2)" style="padding:6px 14px;border-radius:20px;border:1.5px solid #5b21b6;background:#fff;color:#5b21b6;font-weight:700;font-size:12px;cursor:pointer;">In 2 Days</button>
+                                <button type="button" onclick="quickPickDate(3)" style="padding:6px 14px;border-radius:20px;border:1.5px solid #5b21b6;background:#fff;color:#5b21b6;font-weight:700;font-size:12px;cursor:pointer;">In 3 Days</button>
+                            </div>
+                            <div id="slotsGrid">
+                                <div class="slots-ph">
+                                    <i class="fa fa-calendar-day"></i>
+                                    Select a date to see available time slots.
+                                </div>
+                            </div>
+                        </div>
+
+                    </div><!-- /date-time-layout -->
+
+                    <!-- ── Smart Scheduling Suggestion Box ── -->
+                    <div id="smartSuggestionBox" style="display:none;margin-top:20px;border-radius:16px;overflow:hidden;border:1.5px solid #fcd34d;background:linear-gradient(135deg,#fffbeb,#fef3c7);transition:all .3s;">
+                        <div style="padding:16px 18px 0;display:flex;align-items:center;gap:12px;">
+                            <div style="width:38px;height:38px;border-radius:10px;background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;">💡</div>
+                            <div style="flex:1;">
+                                <div style="font-weight:800;font-size:13px;color:#92400e;letter-spacing:.01em;">Smart Scheduling Suggestion</div>
+                                <div style="font-size:11px;color:#b45309;font-weight:500;">Based on current clinic load and availability</div>
+                            </div>
+                            <button onclick="keepSelection()" style="background:none;border:none;color:#b45309;font-size:16px;cursor:pointer;padding:4px;line-height:1;opacity:.7;" title="Dismiss">&times;</button>
+                        </div>
+                        <div style="padding:14px 18px 18px;">
+                            <div id="suggestionReason" style="font-size:13px;color:#78350f;margin-bottom:14px;line-height:1.6;"></div>
+                            <div style="background:#fff;border-radius:12px;padding:13px 16px;border:1.5px solid #fde68a;display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px;">
+                                <div>
+                                    <div style="font-size:10px;font-weight:700;color:#b45309;text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px;">Recommended Slot</div>
+                                    <div style="font-weight:800;font-size:15px;color:#1e1b4b;" id="suggestionDateTimeLabel">—</div>
+                                    <div style="font-size:11px;color:#64748b;margin-top:2px;" id="suggestionReasonTag"></div>
+                                </div>
+                                <div style="text-align:right;flex-shrink:0;">
+                                    <div style="font-size:10px;color:#94a3b8;margin-bottom:5px;font-weight:600;">CLINIC LOAD</div>
+                                    <div style="display:flex;gap:3px;justify-content:flex-end;" id="suggestionLoadDots"></div>
+                                </div>
+                            </div>
+                            <div style="display:flex;gap:10px;">
+                                <button type="button" onclick="acceptSuggestion(event)" id="btnAcceptSuggestion" style="flex:1;padding:10px 16px;border-radius:10px;background:#5b21b6;color:#fff;font-weight:700;font-size:13px;border:none;cursor:pointer;box-shadow:0 4px 12px rgba(91,33,182,0.25);transition:all .2s;">
+                                    <i class="fa fa-check me-1"></i> Accept Suggestion
+                                </button>
+                                <button type="button" onclick="keepSelection(event)" style="flex:1;padding:10px 16px;border-radius:10px;border:1.5px solid #d1d5db;background:#fff;font-weight:700;font-size:13px;color:#475569;cursor:pointer;transition:all .2s;">
+                                    Keep My Choice
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- ── Optimal Badge (shown when selection is already best) ── -->
+                    <div id="smartOptimalBox" style="display:none;margin-top:16px;padding:12px 16px;border-radius:12px;background:linear-gradient(135deg,#f0fdf4,#dcfce7);border:1.5px solid #86efac;display:flex;align-items:center;gap:10px;">
+                        <div style="font-size:20px;">✅</div>
+                        <div>
+                            <div style="font-weight:800;font-size:13px;color:#166534;">Great choice!</div>
+                            <div style="font-size:12px;color:#15803d;">Your selected slot is already well-optimized for this date.</div>
+                        </div>
+                    </div>
+
+                    <!-- ── Service Location & Notes (merged from old Step 5) ── -->
+                    <div style="margin-top:28px;padding-top:24px;border-top:1px solid #f1f5f9;">
+                        <div style="font-size:14px;font-weight:800;color:#1e1b4b;margin-bottom:14px;"><i class="fa fa-map-marker-alt me-2" style="color:#5b21b6;"></i>Service Location</div>
+                        <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+                            <label style="flex:1;min-width:200px;padding:14px 16px;border:2px solid #5b21b6;border-radius:14px;display:flex;align-items:center;gap:12px;cursor:pointer;background:#f3e8ff;" id="locClinicLabel">
+                                <input type="radio" name="wiz_location" value="Clinic Visit" checked onchange="toggleLocation(this)" style="accent-color:#5b21b6;width:16px;height:16px;">
+                                <div>
+                                    <div style="font-weight:700;font-size:14px;color:#1e1b4b;"><i class="fa fa-clinic-medical me-1" style="color:#5b21b6;"></i> Clinic Visit</div>
+                                    <div style="font-size:11px;color:#64748b;">Bring your pet to PragmaVet Animal Clinic</div>
+                                </div>
+                            </label>
+                            <label style="flex:1;min-width:200px;padding:14px 16px;border:2px solid #e2e8f0;border-radius:14px;display:flex;align-items:center;gap:12px;cursor:pointer;background:#f8fafc;" id="locHomeLabel">
+                                <input type="radio" name="wiz_location" value="Home Service" onchange="toggleLocation(this)" style="accent-color:#5b21b6;width:16px;height:16px;">
+                                <div>
+                                    <div style="font-weight:700;font-size:14px;color:#1e1b4b;"><i class="fa fa-home me-1" style="color:#5b21b6;"></i> Home Service</div>
+                                    <div style="font-size:11px;color:#64748b;">Vet visits your residence address</div>
+                                </div>
+                            </label>
+                        </div>
+
+                        <div id="homeAddrBox" style="display:none;margin-bottom:14px;">
+                            <label style="font-size:13px;font-weight:700;color:#334155;display:block;margin-bottom:6px;">Complete Home Address</label>
+                            <input type="text" id="wizHomeAddr" class="form-control rounded-3" value="<?=htmlspecialchars($myAddr)?>" placeholder="Street, Barangay, City, Province…">
+                        </div>
+
+                        <div>
+                            <label style="font-size:13px;font-weight:700;color:#334155;display:block;margin-bottom:6px;">Reason for Visit &amp; Symptoms <span style="font-weight:500;color:#94a3b8;">(Optional)</span></label>
+                            <textarea id="wizNotes" class="form-control rounded-3" rows="3" placeholder="Describe any symptoms, medical history, or specific requirements…"></textarea>
+                        </div>
+                    </div>
+
+                    <div class="wiz-alert-err" id="err-4" style="display:none;background:#fef2f2;border:1px solid #fca5a5;color:#dc2626;border-radius:10px;padding:10px 16px;font-size:13px;font-weight:600;margin-top:14px;">Please select a date and time slot.</div>
+
+                    <div style="display:flex;align-items:center;justify-content:space-between;padding-top:16px;border-top:1px solid #f1f5f9;margin-top:24px;">
+                        <button type="button" onclick="goPrev(4)" style="padding:10px 24px;border-radius:10px;border:1.5px solid #cbd5e1;background:#fff;font-weight:700;font-size:13px;color:#475569;cursor:pointer;">&lt; Previous</button>
+                        <div>
+                            <button type="button" onclick="resetWizard()" style="padding:10px 20px;border-radius:10px;border:1.5px solid #e2e8f0;background:#fff;font-weight:700;font-size:13px;color:#64748b;cursor:pointer;margin-right:10px;">Cancel</button>
+                            <button type="button" onclick="goNext(4)" style="padding:10px 28px;border-radius:10px;background:#5b21b6;color:#fff;font-weight:700;font-size:13px;border:none;cursor:pointer;box-shadow:0 4px 12px rgba(91,33,182,0.3);">Next &gt;</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Step 5 merged into Step 4 above -->
+
+                <!-- STEP 5: Review & Confirm -->
+                <div class="wiz-panel" id="panel-5" style="display:none;">
+                    <div style="display:flex;align-items:center;gap:14px;margin-bottom:6px;">
+                        <div style="width:42px;height:42px;border-radius:12px;background:#f3e8ff;color:#5b21b6;display:flex;align-items:center;justify-content:center;font-size:20px;"><i class="fa fa-check-double"></i></div>
+                        <h2 style="font-size:20px;font-weight:800;color:#1e1b4b;margin:0;">Step 5 of 6: Review &amp; Confirm</h2>
+                    </div>
+                    <div style="font-size:13px;color:#64748b;margin-bottom:24px;margin-left:56px;">Review all appointment details before final confirmation.</div>
+
+                    <div class="card border-0 rounded-4 p-4 mb-4" style="background:#f8fafc;">
+                        <h5 class="fw-bold mb-3" style="color:#1e1b4b;"><i class="fa fa-clipboard-check me-2" style="color:#5b21b6;"></i>Booking Summary</h5>
+                        <div class="row g-3" style="font-size:14px;">
+                            <div class="col-md-6">
+                                <span class="text-muted d-block font-size-12" style="font-size:11px;font-weight:700;text-transform:uppercase;">Client Name</span>
+                                <span class="fw-bold" id="rvClientName">—</span>
+                            </div>
+                            <div class="col-md-6">
+                                <span class="text-muted d-block font-size-12" style="font-size:11px;font-weight:700;text-transform:uppercase;">Pet(s)</span>
+                                <span class="fw-bold" id="rvPetName">—</span>
+                            </div>
+                            <div class="col-md-6">
+                                <span class="text-muted d-block font-size-12" style="font-size:11px;font-weight:700;text-transform:uppercase;">Service</span>
+                                <span class="fw-bold" id="rvService">—</span>
+                            </div>
+                            <div class="col-md-6">
+                                <span class="text-muted d-block font-size-12" style="font-size:11px;font-weight:700;text-transform:uppercase;">Veterinarian</span>
+                                <span class="fw-bold" id="rvVet">—</span>
+                            </div>
+                            <div class="col-md-6">
+                                <span class="text-muted d-block font-size-12" style="font-size:11px;font-weight:700;text-transform:uppercase;">Date &amp; Time</span>
+                                <span class="fw-bold" id="rvDateTime">—</span>
+                            </div>
+                            <div class="col-md-6">
+                                <span class="text-muted d-block font-size-12" style="font-size:11px;font-weight:700;text-transform:uppercase;">Location</span>
+                                <span class="fw-bold" id="rvLocation">—</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="p-3 rounded-3 mb-4" style="background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af;font-size:13px;">
+                        <i class="fa fa-info-circle me-2"></i>By clicking Confirm Booking, your appointment schedule request will be transmitted to the clinic staff for approval.
+                    </div>
+
+                    <div class="wiz-alert-err" id="err-5" style="display:none;background:#fef2f2;border:1px solid #fca5a5;color:#dc2626;border-radius:10px;padding:10px 16px;font-size:13px;font-weight:600;margin-top:14px;"></div>
+
+                    <div style="display:flex;align-items:center;justify-content:space-between;padding-top:16px;border-top:1px solid #f1f5f9;">
+                        <button type="button" onclick="goPrev(5)" style="padding:10px 24px;border-radius:10px;border:1.5px solid #cbd5e1;background:#fff;font-weight:700;font-size:13px;color:#475569;cursor:pointer;">&lt; Previous</button>
+                        <div>
+                            <button type="button" onclick="resetWizard()" style="padding:10px 20px;border-radius:10px;border:1.5px solid #e2e8f0;background:#fff;font-weight:700;font-size:13px;color:#64748b;cursor:pointer;margin-right:10px;">Cancel</button>
+                            <button type="button" id="submitBtn" onclick="submitAppointment()" style="padding:10px 28px;border-radius:10px;background:#5b21b6;color:#fff;font-weight:700;font-size:13px;border:none;cursor:pointer;box-shadow:0 4px 12px rgba(91,33,182,0.3);">Confirm Booking &gt;</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- STEP 6: Reservation Fee Payment -->
+                <div class="wiz-panel" id="panel-6" style="display:none;">
+                    <div style="display:flex;align-items:center;gap:14px;margin-bottom:6px;">
+                        <div style="width:42px;height:42px;border-radius:12px;background:#fef3c7;color:#d97706;display:flex;align-items:center;justify-content:center;font-size:20px;"><i class="fa fa-credit-card"></i></div>
+                        <h2 style="font-size:20px;font-weight:800;color:#1e1b4b;margin:0;">Step 6 of 7: Reservation Fee</h2>
+                    </div>
+                    <div style="font-size:13px;color:#64748b;margin-bottom:24px;margin-left:56px;">Pay a ₱150 reservation fee to secure your appointment slot.</div>
+
+                    <div class="card border-0 rounded-4 p-4 mb-4" style="background:#fffbeb;border:1px solid #fde68a !important;">
+                        <div class="d-flex align-items-center gap-3 mb-3">
+                            <div style="width:48px;height:48px;border-radius:12px;background:#fef3c7;color:#d97706;display:flex;align-items:center;justify-content:center;font-size:22px;"><i class="fa fa-shield-halved"></i></div>
+                            <div>
+                                <div style="font-weight:800;font-size:15px;color:#92400e;">Secure Your Slot</div>
+                                <div style="font-size:13px;color:#78350f;">One-time reservation fee to hold your appointment</div>
+                            </div>
+                        </div>
+                        <div style="background:#fff;border-radius:12px;padding:16px;border:1px solid #fde68a;">
+                            <div class="d-flex justify-content-between align-items-center">
+                                <span style="font-size:14px;color:#64748b;font-weight:600;">Reservation Fee</span>
+                                <span style="font-size:20px;font-weight:800;color:#2563eb;">₱150.00</span>
+                            </div>
+                            <div style="font-size:12px;color:#94a3b8;margin-top:4px;">This will be deducted from your final consultation bill.</div>
+                        </div>
+                    </div>
+
+                    <div class="p-3 rounded-3 mb-4" style="background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af;font-size:13px;">
+                        <i class="fa fa-info-circle me-2"></i>Your appointment has been saved. Pay the reservation fee to secure your slot. Staff will confirm after payment.
+                    </div>
+
+                    <div id="payment-loading-msg" style="display:none;text-align:center;padding:20px;color:#64748b;font-size:14px;">
+                        <i class="fa fa-spinner fa-spin me-2"></i> Redirecting to secure payment...
+                    </div>
+
+                    <div style="display:flex;align-items:center;justify-content:space-between;padding-top:16px;border-top:1px solid #f1f5f9;">
+                        <div></div>
+                        <div style="display:flex;gap:10px;">
+                            <button type="button" onclick="skipReservationFee()" style="padding:10px 20px;border-radius:10px;border:1.5px solid #e2e8f0;background:#fff;font-weight:700;font-size:13px;color:#64748b;cursor:pointer;">
+                                Skip for Now
+                            </button>
+                            <button type="button" id="payReservationBtn" onclick="payReservationFee()" style="padding:10px 28px;border-radius:10px;background:#2563eb;color:#fff;font-weight:700;font-size:14px;border:none;cursor:pointer;box-shadow:0 4px 12px rgba(37,99,235,0.35);display:flex;align-items:center;gap:8px;">
+                                <i class="fa fa-credit-card"></i> Pay ₱150 via PayMongo
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- STEP 7: Appointment Created -->
+                <div class="wiz-panel" id="panel-7" style="display:none;">
+                    <div class="text-center py-5">
+                        <div style="width:80px;height:80px;border-radius:50%;background:#d1fae5;color:#10b981;display:flex;align-items:center;justify-content:center;font-size:36px;margin:0 auto 20px;">
+                            <i class="fa fa-check"></i>
+                        </div>
+                        <h2 class="fw-bold" style="color:#1e1b4b;font-size:24px;margin-bottom:8px;">Appointment Created!</h2>
+                        <div class="fw-bold text-purple mb-3" style="font-size:20px;color:#5b21b6;" id="confirmRefNum">#PV-202608-8842</div>
+                        <p class="text-muted mx-auto mb-4" style="max-width:460px;font-size:14px;">
+                            Your appointment has been successfully scheduled. A confirmation notification will be sent shortly.
+                        </p>
+
+                        <div class="d-flex justify-content-center gap-3">
+                            <button type="button" class="btn btn-outline-secondary rounded-3 px-4 py-2 fw-bold" style="font-size:13px;" onclick="switchApptView('list')">
+                                View Appointments List
+                            </button>
+                            <button type="button" class="btn btn-primary rounded-3 px-4 py-2 fw-bold" style="font-size:13px;background:#5b21b6;border:none;" onclick="resetWizard()">
+                                Book Another
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+            </div><!-- /Left Panel Card -->
+
+            <!-- RIGHT PANEL: STICKY SUMMARY & PROCESS CARDS -->
+            <div style="display:flex;flex-direction:column;gap:20px;position:sticky;top:88px;">
+                
+                <!-- APPOINTMENT SUMMARY CARD -->
+                <div style="background:#fff;border-radius:20px;border:1px solid #e2e8f0;padding:24px;box-shadow:0 4px 20px rgba(0,0,0,0.03);">
+                    <div style="font-size:16px;font-weight:800;color:#1e1b4b;margin-bottom:20px;">Appointment Summary</div>
+
+                    <div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:16px;">
+                        <div style="width:32px;height:32px;border-radius:50%;background:#f1f5f9;color:#5b21b6;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;"><i class="fa fa-user"></i></div>
+                        <div>
+                            <div style="font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.04em;margin-bottom:2px;">Client</div>
+                            <div style="font-size:13px;font-weight:700;color:#1e1b4b;line-height:1.3;" id="sumClientName"><?=htmlspecialchars($user_name ?? '')?></div>
+                            <div style="font-size:11px;color:#64748b;" id="sumClientPhone"><?=htmlspecialchars($myAddr ? $myAddr : 'Registered Client')?></div>
+                        </div>
+                    </div>
+
+                    <div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:16px;">
+                        <div style="width:32px;height:32px;border-radius:50%;background:#f1f5f9;color:#5b21b6;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;"><i class="fa fa-paw"></i></div>
+                        <div>
+                            <div style="font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.04em;margin-bottom:2px;">Pet</div>
+                            <div style="font-size:13px;font-weight:700;color:#1e1b4b;line-height:1.3;" id="sumPetName">Select a pet</div>
+                            <div style="font-size:11px;color:#64748b;" id="sumPetSub">Pet Profile</div>
+                            <div style="font-size:11px;color:#64748b;" id="sumPetAge"></div>
+                        </div>
+                    </div>
+
+                    <div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:16px;">
+                        <div style="width:32px;height:32px;border-radius:50%;background:#f1f5f9;color:#5b21b6;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;"><i class="fa fa-clipboard-list"></i></div>
+                        <div>
+                            <div style="font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.04em;margin-bottom:2px;">Service</div>
+                            <div style="font-size:13px;font-weight:700;color:#1e1b4b;line-height:1.3;" id="sumServiceName">Consultation</div>
+                            <div style="font-size:11px;color:#64748b;" id="sumServicePrice"></div>
+                        </div>
+                    </div>
+
+                    <div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:16px;">
+                        <div style="width:32px;height:32px;border-radius:50%;background:#f1f5f9;color:#5b21b6;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;"><i class="fa fa-user-md"></i></div>
+                        <div>
+                            <div style="font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.04em;margin-bottom:2px;">Veterinarian</div>
+                            <div style="font-size:13px;font-weight:700;color:#64748b;line-height:1.3;" id="sumVetName">Not selected yet</div>
+                        </div>
+                    </div>
+
+                    <div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:16px;">
+                        <div style="width:32px;height:32px;border-radius:50%;background:#f1f5f9;color:#5b21b6;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;"><i class="fa fa-calendar-alt"></i></div>
+                        <div>
+                            <div style="font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.04em;margin-bottom:2px;">Date &amp; Time</div>
+                            <div style="font-size:13px;font-weight:700;color:#64748b;line-height:1.3;" id="sumDateTime">Not selected yet</div>
+                        </div>
+                    </div>
+
+                    <div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:16px;">
+                        <div style="width:32px;height:32px;border-radius:50%;background:#f1f5f9;color:#5b21b6;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;"><i class="fa fa-file-alt"></i></div>
+                        <div>
+                            <div style="font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.04em;margin-bottom:2px;">Appointment Details</div>
+                            <div style="font-size:13px;font-weight:700;color:#64748b;line-height:1.3;" id="sumDetails">Not added yet</div>
+                        </div>
+                    </div>
+
+                    <div style="height:1px;background:#e2e8f0;margin:18px 0;"></div>
+
+                    <div style="display:flex;align-items:center;justify-content:space-between;">
+                        <div style="font-size:14px;font-weight:800;color:#1e1b4b;">Reservation Fee</div>
+                        <div style="font-size:18px;font-weight:800;color:#5b21b6;" id="sumEstimatedTotal">&#8369;150.00</div>
+                    </div>
+                </div>
+
+                <!-- APPOINTMENT PROCESS LIST CARD -->
+                <div style="background:#fff;border-radius:20px;border:1px solid #e2e8f0;padding:24px;box-shadow:0 4px 20px rgba(0,0,0,0.03);">
+                    <div style="font-size:16px;font-weight:800;color:#1e1b4b;margin-bottom:20px;">Appointment Process</div>
+                    <div style="display:flex;flex-direction:column;gap:10px;">
+                        <?php for ($k = 1; $k <= 7; $k++): ?>
+                        <div class="process-step-item <?=$k===1?'active':''?>" id="proc-item-<?=$k?>" style="display:flex;align-items:center;gap:12px;padding:8px 12px;border-radius:10px;font-size:13px;font-weight:600;color:#64748b;">
+                            <div class="process-badge" id="proc-badge-<?=$k?>" style="width:22px;height:22px;border-radius:50%;background:<?=$k===1?'#5b21b6':'#e2e8f0'?>;color:<?=$k===1?'#fff':'#64748b'?>;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;"><?=$k?></div>
+                            <div><?=$k?>. <?=$step_names[$k]?></div>
+                        </div>
+                        <?php endfor; ?>
+                    </div>
+                </div>
+
+            </div><!-- /Right Panel -->
+
+        </div><!-- /Main Grid -->
+
+        <!-- BOTTOM BANNER: HOW THE APPOINTMENT PROCESS WORKS -->
+        <div style="background:#fff;border-radius:20px;border:1px solid #e2e8f0;padding:28px 32px;margin-top:36px;box-shadow:0 4px 20px rgba(0,0,0,0.03);">
+            <div style="font-size:16px;font-weight:800;color:#1e1b4b;margin-bottom:24px;">How the Appointment Process Works</div>
+            <div style="display:grid;grid-template-columns:repeat(6, 1fr);gap:14px;">
+                <div style="display:flex;flex-direction:column;align-items:flex-start;">
+                    <div style="width:28px;height:28px;border-radius:8px;background:#f3e8ff;color:#5b21b6;font-size:13px;font-weight:800;display:flex;align-items:center;justify-content:center;margin-bottom:8px;">1</div>
+                    <div style="font-size:12px;font-weight:800;color:#1e1b4b;margin-bottom:4px;">Select Pet</div>
+                    <div style="font-size:11px;color:#64748b;line-height:1.3;">Choose the pet for the appointment</div>
+                </div>
+                <div style="display:flex;flex-direction:column;align-items:flex-start;">
+                    <div style="width:28px;height:28px;border-radius:8px;background:#f3e8ff;color:#5b21b6;font-size:13px;font-weight:800;display:flex;align-items:center;justify-content:center;margin-bottom:8px;">2</div>
+                    <div style="font-size:12px;font-weight:800;color:#1e1b4b;margin-bottom:4px;">Select Service</div>
+                    <div style="font-size:11px;color:#64748b;line-height:1.3;">Choose the type of service needed</div>
+                </div>
+                <div style="display:flex;flex-direction:column;align-items:flex-start;">
+                    <div style="width:28px;height:28px;border-radius:8px;background:#f3e8ff;color:#5b21b6;font-size:13px;font-weight:800;display:flex;align-items:center;justify-content:center;margin-bottom:8px;">3</div>
+                    <div style="font-size:12px;font-weight:800;color:#1e1b4b;margin-bottom:4px;">Select Veterinarian</div>
+                    <div style="font-size:11px;color:#64748b;line-height:1.3;">Choose the available veterinarian</div>
+                </div>
+                <div style="display:flex;flex-direction:column;align-items:flex-start;">
+                    <div style="width:28px;height:28px;border-radius:8px;background:#f3e8ff;color:#5b21b6;font-size:13px;font-weight:800;display:flex;align-items:center;justify-content:center;margin-bottom:8px;">4</div>
+                    <div style="font-size:12px;font-weight:800;color:#1e1b4b;margin-bottom:4px;">Date, Time &amp; Details</div>
+                    <div style="font-size:11px;color:#64748b;line-height:1.3;">Pick date, time, location &amp; notes</div>
+                </div>
+                <div style="display:flex;flex-direction:column;align-items:flex-start;">
+                    <div style="width:28px;height:28px;border-radius:8px;background:#f3e8ff;color:#5b21b6;font-size:13px;font-weight:800;display:flex;align-items:center;justify-content:center;margin-bottom:8px;">5</div>
+                    <div style="font-size:12px;font-weight:800;color:#1e1b4b;margin-bottom:4px;">Review</div>
+                    <div style="font-size:11px;color:#64748b;line-height:1.3;">Review all details before confirmation</div>
+                </div>
+                <div style="display:flex;flex-direction:column;align-items:flex-start;">
+                    <div style="width:28px;height:28px;border-radius:8px;background:#f3e8ff;color:#5b21b6;font-size:13px;font-weight:800;display:flex;align-items:center;justify-content:center;margin-bottom:8px;">6</div>
+                    <div style="font-size:12px;font-weight:800;color:#1e1b4b;margin-bottom:4px;">Confirmed</div>
+                    <div style="font-size:11px;color:#64748b;line-height:1.3;">Appointment is created and confirmed</div>
+                </div>
+            </div>
+        </div>
+
+    </div><!-- /viewWizardContainer -->
+
+    <!-- ════════════════════════════════════════════════════════════════════════
+         VIEW 2: YOUR APPOINTMENTS LIST TABLE (TOGGLE TAB)
+    ════════════════════════════════════════════════════════════════════════════ -->
+    <div id="viewListContainer" style="display:none;">
+        <div class="card-prem">
+            <div class="card-head">
+                <h5><span style="width:34px;height:34px;border-radius:10px;background:#f3e8ff;display:inline-flex;align-items:center;justify-content:center;color:#5b21b6;font-size:14px;"><i class="fa fa-list-alt"></i></span> Your Appointments History</h5>
+
+                <!-- Live Search -->
+                <div class="search-wrap">
+                    <span class="si"><i class="fa fa-search"></i></span>
+                    <input type="text" id="apptSearch" placeholder="Search pet, service, status…" autocomplete="off">
+                </div>
+
+                <!-- Filter tabs -->
+                <?php $fc = array_count_values(array_column($apptRows, 'status')); $fcn = fn($k) => (int)($fc[$k] ?? 0); ?>
+                <div class="ah-tabs">
+                    <button class="filter-tab active" data-filter="all">All <span class="ah-n"><?= count($apptRows) ?></span></button>
+                    <button class="filter-tab" data-filter="Pending">Pending <span class="ah-n"><?= $fcn('Pending') ?></span></button>
+                    <?php if (count($rescheduleProposals) > 0): ?>
+                        <button class="filter-tab" data-filter="action_needed" style="border-color:#7e22ce; color:#7e22ce; background:#f5f3ff;">
+                            <i class="fa fa-exclamation-circle me-1"></i> Reschedule Alerts <span style="background:#7e22ce; color:#fff; padding:1px 6px; border-radius:50px; font-size:10px; margin-left:4px;"><?php echo count($rescheduleProposals); ?></span>
+                        </button>
+                    <?php endif; ?>
+                    <button class="filter-tab" data-filter="Approved">Approved <span class="ah-n"><?= $fcn('Approved') ?></span></button>
+                    <button class="filter-tab" data-filter="Completed">Completed <span class="ah-n"><?= $fcn('Completed') ?></span></button>
+                    <button class="filter-tab" data-filter="Cancelled">Cancelled <span class="ah-n"><?= $fcn('Cancelled') ?></span></button>
+                </div>
+            </div>
+
+            <div style="overflow-x:auto;">
+                <?php if (count($apptRows) > 0): ?>
+                    <table class="appt-table" id="apptTable">
+                        <thead>
+                            <tr>
+                                <th>Details</th>
+                                <th>Schedule</th>
+                                <th>Service Flow</th>
+                                <th>Status</th>
+                                <th style="text-align:right;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="apptBody">
+                            <?php foreach ($apptRows as $row):
+                                $status = $row['status'];
+                                $badgeCls = match (true) {
+                                    $status === 'Pending' => 'badge-pending',
+                                    $status === 'Approved' => 'badge-approved',
+                                    $status === 'Completed' => 'badge-completed',
+                                    $status === 'Reschedule Proposed' => 'badge-proposed',
+                                    $status === 'Reschedule Requested' => 'badge-proposed',
+                                    str_contains($status, 'Cancel') || str_contains($status, 'Reject') => 'badge-cancelled',
+                                    default => 'badge-default'
+                                };
+                                $rowData = json_encode($row, JSON_HEX_TAG | JSON_HEX_QUOT | JSON_HEX_AMP);
+                                ?>
+                                <tr class="appt-row" data-appt-id="<?php echo (int)$row['id']; ?>" data-status="<?php echo htmlspecialchars($status); ?>"
+                                    data-action-needed="<?php echo (isset($row['client_action_needed']) && $row['client_action_needed'] == 1 && !str_contains($status, 'Cancel') && !str_contains($status, 'Reject')) ? '1' : '0'; ?>"
+                                    onclick="openDetailModal(<?php echo htmlspecialchars($rowData, ENT_QUOTES); ?>)" style="cursor:pointer;">
+                                    <td>
+                                        <div class="ah-pet">
+                                            <span class="ah-av"><?=htmlspecialchars(strtoupper(substr(trim($row['pet_name'] ?: 'P'), 0, 1)))?></span>
+                                            <div style="min-width:0;">
+                                                <div class="ah-pet-name"><?=htmlspecialchars($row['pet_name'])?></div>
+                                                <div class="ah-pet-sub"><?=htmlspecialchars($row['service_type'])?></div>
+                                            </div>
+                                        </div>
+                                    </td>
+                                    <td>
+                                        <div class="ah-date"><i class="fa fa-calendar-alt"></i><?=htmlspecialchars($row['appointment_date'] ? date('M j, Y', strtotime($row['appointment_date'])) : '')?></div>
+                                        <div class="ah-time"><i class="fa fa-clock"></i><?=htmlspecialchars(!empty($row['appointment_time']) ? date('g:i A', strtotime($row['appointment_time'])) : '')?></div>
+                                    </td>
+                                    <td>
+                                        <span class="ah-loc"><i class="fa fa-<?= ($row['service_location'] ?? '') === 'Home Service' ? 'house' : 'location-dot' ?>"></i><?=htmlspecialchars($row['service_location']??'On-Site')?></span>
+                                    </td>
+                                    <td>
+                                        <span class="<?=$badgeCls?>">&bull; <?=htmlspecialchars($status)?></span>
+                                    </td>
+                                    <td style="text-align:right;">
+                                        <div class="d-inline-flex gap-1">
+                                            <?php if (isset($row['client_action_needed']) && $row['client_action_needed'] == 1 && !str_contains($status, 'Cancel') && !str_contains($status, 'Reject')): ?>
+                                                <button type="button" class="btn btn-warning rounded-circle d-flex align-items-center justify-content-center" style="width:36px;height:36px;padding:0;box-shadow:0 2px 4px rgba(0,0,0,0.1);" title="Review Proposal" onclick="event.stopPropagation(); openDetailModal(<?php echo htmlspecialchars($rowData, ENT_QUOTES); ?>)">
+                                                    <i class="fa fa-exclamation-circle text-dark"></i>
+                                                </button>
+                                            <?php elseif ($status === 'Pending' || $status === 'Approved'): ?>
+                                                <button type="button" class="btn btn-primary rounded-circle d-flex align-items-center justify-content-center" style="width:36px;height:36px;padding:0;background:#2563eb;border:none;box-shadow:0 2px 4px rgba(37,99,235,0.2);" title="View Details" onclick="event.stopPropagation(); openDetailModal(<?php echo htmlspecialchars($rowData, ENT_QUOTES); ?>)">
+                                                    <i class="fa fa-eye text-white"></i>
+                                                </button>
+                                            <?php elseif ($status === 'Completed'): ?>
+                                                <button type="button" class="btn btn-success rounded-circle d-flex align-items-center justify-content-center" style="width:36px;height:36px;padding:0;background:#10b981;border:none;box-shadow:0 2px 4px rgba(16,185,129,0.2);" title="View Receipt" onclick="event.stopPropagation(); openDetailModal(<?php echo htmlspecialchars($rowData, ENT_QUOTES); ?>)">
+                                                    <i class="fa fa-eye text-white"></i>
+                                                </button>
+                                            <?php else: ?>
+                                                <button type="button" class="btn btn-secondary rounded-circle d-flex align-items-center justify-content-center" style="width:36px;height:36px;padding:0;background:#94a3b8;border:none;box-shadow:0 2px 4px rgba(148,163,184,0.2);" title="View Details" onclick="event.stopPropagation(); openDetailModal(<?php echo htmlspecialchars($rowData, ENT_QUOTES); ?>)">
+                                                    <i class="fa fa-eye text-white"></i>
+                                                </button>
+                                            <?php endif; ?>
+                                        </div>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                <?php else: ?>
+                    <div class="text-center py-5 text-muted">
+                        <i class="fa fa-calendar-times fa-3x mb-3 text-secondary"></i>
+                        <div>No appointments found. Use the Wizard above to book a new appointment.</div>
+                    </div>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
+
+    <!-- ════════════════════════════════════════════════════════════════════════
+         APPOINTMENT DETAIL & ACTION MODAL
+    ════════════════════════════════════════════════════════════════════════════ -->
+    <div class="dmodal-backdrop" id="detailModalBackdrop" onclick="if(event.target===this) closeDetailModal()">
+        <div class="dmodal">
+            <div class="dmodal-header">
+                <h5><i class="fa fa-calendar-check" style="color:#5b21b6;"></i> <span id="dmTitle">Appointment Details</span></h5>
+                <button type="button" class="dmodal-close" onclick="closeDetailModal()">&times;</button>
+            </div>
+            <div class="dmodal-body">
+                <!-- Hero service banner -->
+                <div class="service-hero">
+                    <div class="sname" id="dmService">General Checkup</div>
+                    <div class="slim" id="dmPet">Pet: Milo</div>
+                </div>
+
+                <!-- Reschedule Proposal Alert Banner (shown if clinic proposed a new date) -->
+                <div id="dmRescheduleAlert" class="notice-box warn" style="display:none;">
+                    <div class="fw-bold mb-1"><i class="fa fa-clock me-1"></i> Clinic Proposed a New Schedule</div>
+                    <div class="small mb-2" id="dmProposalText">The clinic proposed shifting your appointment.</div>
+                    <div class="d-flex gap-2 mt-2">
+                        <form method="POST" style="flex:1;">
+                            <input type="hidden" name="reschedule_apt_id" id="dmAcceptAptId" value="">
+                            <input type="hidden" name="appt_type" id="dmAcceptApptType" value="Appointment">
+                            <button type="submit" name="accept_reschedule" class="btn btn-sm btn-success w-100 fw-bold rounded-pill">
+                                <i class="fa fa-check me-1"></i> Accept Proposal
+                            </button>
+                        </form>
+                        <form method="POST" style="flex:1;">
+                            <input type="hidden" name="reschedule_apt_id" id="dmDeclineAptId" value="">
+                            <input type="hidden" name="appt_type" id="dmDeclineApptType" value="Appointment">
+                            <button type="button" class="btn btn-sm btn-outline-danger w-100 fw-bold rounded-pill" onclick="startDeclineRebook()">
+                                <i class="fa fa-times me-1"></i> Decline
+                            </button>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Details Grid -->
+                <div class="info-grid">
+                    <div class="info-item">
+                        <label>Appointment ID</label>
+                        <div class="val" id="dmApptId">#--</div>
+                    </div>
+                    <div class="info-item">
+                        <label>Status</label>
+                        <div class="val" id="dmStatus">--</div>
+                    </div>
+                    <div class="info-item">
+                        <label>Date &amp; Time</label>
+                        <div class="val" id="dmDateTime">--</div>
+                    </div>
+                    <div class="info-item">
+                        <label>Location</label>
+                        <div class="val" id="dmLocation">--</div>
+                    </div>
+                    <div class="info-item full">
+                        <label>Veterinarian</label>
+                        <div class="val" id="dmVet">To be assigned by the clinic</div>
+                    </div>
+                    <div class="info-item full" id="dmNotesWrap" style="display:none;">
+                        <label>Notes &amp; Reason</label>
+                        <div class="val text-muted small" id="dmNotes" style="font-weight:400; line-height:1.5;"></div>
+                    </div>
+                </div>
+
+                <!-- Audit Trail Section -->
+                <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:12px; padding:16px; margin-bottom:16px;">
+                    <h6 style="font-size:12px; font-weight:800; color:#64748b; text-transform:uppercase; letter-spacing:.05em; margin-bottom:12px;"><i class="fa fa-history me-1"></i> Audit Trail</h6>
+                    <ul style="list-style:none; padding:0; margin:0; font-size:13px; color:#475569;" id="dmAuditTrail">
+                        <!-- Populated via JS -->
+                    </ul>
+                </div>
+
+                <!-- Reschedule Request Form (Hidden by default, shown when clicking Request Reschedule) -->
+                <div id="dmRescheduleFormWrap" style="display:none; border-top:1px dashed #cbd5e1; padding-top:16px; margin-top:16px;">
+                    <h6 class="fw-bold text-dark mb-2"><i class="fa fa-calendar-alt me-1" style="color:#5b21b6;"></i> <span id="dmReschedHeading">Request Reschedule</span></h6>
+                    <div id="dmRebookNote" class="small text-muted mb-2" style="display:none;"><i class="fa fa-circle-info me-1"></i>Choose a date that works for you. Your reservation fee already paid still applies — no need to pay again.</div>
+                    <form method="POST" action="appointments.php">
+                        <input type="hidden" name="request_reschedule" value="1">
+                        <input type="hidden" name="decline_rebook" id="dmDeclineRebook" value="">
+                        <input type="hidden" name="reschedule_apt_id" id="dmReqReschedId" value="">
+                        <input type="hidden" name="appt_type" id="dmReqReschedType" value="Appointment">
+                        <div class="row g-2 mb-2">
+                            <div class="col-7">
+                                <label class="form-label small fw-bold text-muted">New Preferred Date *</label>
+                                <input type="date" name="new_proposed_date" class="form-control form-control-sm" min="<?= date('Y-m-d', strtotime('+1 day')); ?>" required>
+                            </div>
+                            <div class="col-5">
+                                <label class="form-label small fw-bold text-muted">Time Slot</label>
+                                <select name="new_proposed_time" class="form-select form-select-sm">
+                                    <option value="08:00">08:00 AM</option>
+                                    <option value="08:30">08:30 AM</option>
+                                    <option value="09:00">09:00 AM</option>
+                                    <option value="09:30">09:30 AM</option>
+                                    <option value="10:00">10:00 AM</option>
+                                    <option value="10:30">10:30 AM</option>
+                                    <option value="11:00">11:00 AM</option>
+                                    <option value="11:30">11:30 AM</option>
+                                    <option value="13:00">01:00 PM</option>
+                                    <option value="13:30">01:30 PM</option>
+                                    <option value="14:00">02:00 PM</option>
+                                    <option value="14:30">02:30 PM</option>
+                                    <option value="15:00">03:00 PM</option>
+                                    <option value="15:30">03:30 PM</option>
+                                    <option value="16:00">04:00 PM</option>
+                                    <option value="16:30">04:30 PM</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label small fw-bold text-muted">Reason for Reschedule *</label>
+                            <input type="text" name="reschedule_reason" class="form-control form-control-sm" placeholder="e.g. Schedule conflict, work emergency" required>
+                        </div>
+                        <div class="d-flex gap-2">
+                            <button type="submit" class="btn btn-sm btn-primary rounded-pill px-3 fw-bold" style="background:#5b21b6;border:none;">
+                                <i class="fa fa-paper-plane me-1"></i> Submit Request
+                            </button>
+                            <button type="button" class="btn btn-sm btn-outline-secondary rounded-pill px-3" onclick="toggleRescheduleForm(false)">
+                                Cancel
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+            <div class="dmodal-footer" id="dmFooterActions">
+                <!-- Injected dynamically in openDetailModal -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Hidden Form for POST submission to appointments.php -->
+    <form id="wizForm" method="POST" action="appointments.php" style="display:none;">
+        <input type="hidden" name="book" value="1">
+        <input type="hidden" name="pet_name" id="f_pet">
+        <input type="hidden" name="service_type" id="f_svc">
+        <input type="hidden" name="appointment_date" id="f_date">
+        <input type="hidden" name="appointment_time" id="f_time">
+        <input type="hidden" name="service_location" id="f_loc">
+        <input type="hidden" name="home_address" id="f_addr">
+        <input type="hidden" name="doctor_id" id="f_doc">
+        <input type="hidden" name="notes" id="f_notes">
+    </form>
+
+    <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+    <script>
+    // Registered Pets Data passed from PHP
+    const DB_PETS           = <?php echo json_encode($pets_for_form); ?>;
+    const BOOKED_SLOTS      = <?php echo $bookedSlotsJSON ?? '{}'; ?>;
+    const BOOKED_DETAILED   = <?php echo $bookedDetailedJSON ?? '{}'; ?>;
+    const TOMORROW_STR      = '<?=date('Y-m-d', strtotime('+1 day'))?>';
+    const HOLIDAYS          = <?php echo $holidaysJSON ?? '[]'; ?>;
+    const DOCTOR_SCHEDULES  = <?php echo $doctorSchedulesJSON ?? '{}'; ?>;
+    const DOCTOR_WEEKLY     = <?php echo $doctorWeeklyJSON ?? '{}'; ?>;
+    const DOCTOR_LEAVES     = <?php echo $doctorLeavesJSON ?? '{}'; ?>;
+    const SVC_DURATIONS     = <?php echo $serviceDurationsJSON ?? '{}'; ?>;
+    const APPT_DENSITY      = <?php echo $apptDensityJSON ?? '{}'; ?>;
+    const MAX_DAILY_APPTS   = 10;
+
+    // Global State for Interactive 7-Step Appointment Wizard
+    const S = {
+        step: 1,
+        clientName: <?=json_encode($user_name ?? 'Client')?>,
+        clientPhone: <?=json_encode($myAddr ? $myAddr : 'Registered Client')?>,
+        pets: [],
+        multi: false,
+        svcId: 1,
+        svcName: "Consultation",
+        svcDur: 30,
+        svcPrice: <?= json_encode((float)sp_price($conn, 'Consultation')) ?>,
+        svcPriceTxt: <?= json_encode('₱' . number_format(sp_price($conn, 'Consultation'), 2)) ?>,
+        svcInfo: "Consultation includes: Physical examination, health assessment, and basic treatment recommendation.",
+        vetId: <?= json_encode((string)$recommended_vet) ?>,
+        vetName: <?= json_encode($recommended_name ?: 'Choose a veterinarian') ?>,
+        vetSpec: "Auto-assigned by clinic",
+        date: "",
+        time: "",
+        timeLabel: "",
+        loc: "Clinic Visit",
+        addr: <?=json_encode($myAddr ?? '')?>,
+        notes: ""
+    };
+
+    // Initialize default selected pet from DB_PETS
+    if (Array.isArray(DB_PETS) && DB_PETS.length > 0) {
+        S.pets = [{
+            id: DB_PETS[0].id,
+            name: DB_PETS[0].name,
+            spec: (DB_PETS[0].breed || '') + ' ' + (DB_PETS[0].species || 'Pet'),
+            age: DB_PETS[0].age || 'Active Profile'
+        }];
+    }
+
+    function switchApptView(mode) {
+        const wizCon = document.getElementById('viewWizardContainer');
+        const listCon = document.getElementById('viewListContainer');
+        const btnWiz = document.getElementById('btnTabWiz');
+        const btnList = document.getElementById('btnTabList');
+        const bSub = document.getElementById('bCrumbSub');
+
+        if (mode === 'wizard') {
+            if (wizCon) wizCon.style.display = 'block';
+            if (listCon) listCon.style.display = 'none';
+            if (btnWiz) { btnWiz.style.background = '#5b21b6'; btnWiz.style.color = '#fff'; }
+            if (btnList) { btnList.style.background = '#fff'; btnList.style.color = '#64748b'; }
+            if (bSub) bSub.textContent = 'New Appointment';
+            var pt = document.getElementById('apptPageTitle'); if (pt) pt.textContent = 'New Appointment Wizard';
+        } else {
+            if (wizCon) wizCon.style.display = 'none';
+            if (listCon) listCon.style.display = 'block';
+            if (btnList) { btnList.style.background = '#5b21b6'; btnList.style.color = '#fff'; }
+            if (btnWiz) { btnWiz.style.background = '#fff'; btnWiz.style.color = '#64748b'; }
+            if (bSub) bSub.textContent = 'Appointments History';
+            var pt = document.getElementById('apptPageTitle'); if (pt) pt.textContent = 'Your Appointments';
+        }
+    }
+
+    document.addEventListener("DOMContentLoaded", function() {
+        initFlatpickr();
+        quickPickDate(1); // Default to Tomorrow
+        calcEstimatedTotal();
+        updateSummaryWidget();
+        showStep(1);
+    });
+
+    function jumpToStep(n) {
+        if (n < S.step) {
+            showStep(n);
+        } else if (n > S.step) {
+            if (validateStep(S.step)) showStep(n);
+        }
+    }
+
+    function goNext(from) {
+        if (!validateStep(from)) return;
+        showStep(from + 1);
+    }
+
+    function goPrev(from) {
+        showStep(from - 1);
+    }
+
+    function showStep(n) {
+        S.step = n;
+
+        for (let i = 1; i <= 7; i++) {
+            const p = document.getElementById('panel-' + i);
+            if (p) p.style.display = (i === n) ? 'block' : 'none';
+
+            const node = document.getElementById('step-node-' + i);
+            if (node) {
+                node.classList.remove('active', 'done');
+                if (i === n) node.classList.add('active');
+                else if (i < n) node.classList.add('done');
+
+                const circle = node.querySelector('.step-circle');
+                if (circle) {
+                    if (i === n) {
+                        circle.style.background = '#5b21b6';
+                        circle.style.borderColor = '#5b21b6';
+                        circle.style.color = '#ffffff';
+                    } else if (i < n) {
+                        circle.style.background = '#10b981';
+                        circle.style.borderColor = '#10b981';
+                        circle.style.color = '#ffffff';
+                    } else {
+                        circle.style.background = '#ffffff';
+                        circle.style.borderColor = '#cbd5e1';
+                        circle.style.color = '#64748b';
+                    }
+                }
+            }
+
+            const pItem = document.getElementById('proc-item-' + i);
+            const pBadge = document.getElementById('proc-badge-' + i);
+            if (pItem && pBadge) {
+                pItem.classList.remove('active', 'done');
+                if (i === n) {
+                    pItem.classList.add('active');
+                    pItem.style.background = '#f3e8ff';
+                    pItem.style.color = '#5b21b6';
+                    pBadge.style.background = '#5b21b6';
+                    pBadge.style.color = '#fff';
+                    pBadge.textContent = i;
+                } else if (i < n) {
+                    pItem.classList.add('done');
+                    pItem.style.background = 'transparent';
+                    pItem.style.color = '#10b981';
+                    pBadge.style.background = '#10b981';
+                    pBadge.style.color = '#fff';
+                    pBadge.innerHTML = '<i class="fa fa-check"></i>';
+                } else {
+                    pItem.style.background = 'transparent';
+                    pItem.style.color = '#64748b';
+                    pBadge.style.background = '#e2e8f0';
+                    pBadge.style.color = '#64748b';
+                    pBadge.textContent = i;
+                }
+            }
+        }
+
+        if (n === 5) fillReviewData();
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    function validateStep(n) {
+        clearErr(n);
+        if (n === 1 && S.pets.length === 0) { showErr(1, "Please select at least one pet."); return false; }
+        if (n === 2 && !S.svcName) { showErr(2, "Please select a service."); return false; }
+        if (n === 3 && !S.vetId) { showErr(3, "Please choose a veterinarian."); return false; }
+        if (n === 4 && (!S.date || !S.time)) { showErr(4, "Please select a date and available time slot."); return false; }
+        return true;
+    }
+
+    function clearErr(n) { const e = document.getElementById('err-' + n); if (e) e.style.display = 'none'; }
+    function showErr(n, msg) { const e = document.getElementById('err-' + n); if (e) { e.textContent = msg; e.style.display = 'block'; } }
+
+    function toggleMultiPetMode(cb) {
+        S.multi = cb.checked;
+        const chips = document.querySelectorAll('.pet-card-chip');
+        if (!S.multi && chips.length > 0) {
+            chips.forEach((c, idx) => {
+                const badge = c.querySelector('.pet-sel-badge');
+                const nameEl = c.querySelector('[data-name-el]');
+                if (idx === 0) {
+                    c.classList.add('selected');
+                    c.style.border = '2px solid #5b21b6';
+                    c.style.background = '#f3e8ff';
+                    c.style.boxShadow = '0 4px 16px rgba(91,33,182,0.18)';
+                    if (badge) badge.style.display = 'flex';
+                } else {
+                    c.classList.remove('selected');
+                    c.style.border = '2px solid #e2e8f0';
+                    c.style.background = '#fff';
+                    c.style.boxShadow = '0 2px 8px rgba(0,0,0,0.04)';
+                    if (badge) badge.style.display = 'none';
+                }
+            });
+            if (DB_PETS.length > 0) {
+                S.pets = [{
+                    id: DB_PETS[0].id,
+                    name: DB_PETS[0].name,
+                    spec: (DB_PETS[0].breed || '') + ' ' + (DB_PETS[0].species || 'Pet'),
+                    age: DB_PETS[0].age || 'Active Profile'
+                }];
+            }
+        }
+        calcEstimatedTotal();
+        updateSummaryWidget();
+    }
+
+    function togglePetChip(chip) {
+        const id = chip.dataset.petId;
+        const name = chip.dataset.petName;
+        const spec = chip.dataset.petSpec || 'Pet Profile';
+        const age = chip.dataset.petAge || '';
+
+        // Helper to style a card as selected or deselected
+        function setCardState(c, selected) {
+            const badge = c.querySelector('.pet-sel-badge');
+            const nameDiv = c.querySelector('[data-name-ref]');
+            c.classList.toggle('selected', selected);
+            c.style.border = selected ? '2px solid #5b21b6' : '2px solid #e2e8f0';
+            c.style.background = selected ? '#f3e8ff' : '#fff';
+            c.style.boxShadow = selected ? '0 4px 16px rgba(91,33,182,0.18)' : '0 2px 8px rgba(0,0,0,0.04)';
+            if (badge) badge.style.display = selected ? 'flex' : 'none';
+        }
+
+        if (!S.multi) {
+            document.querySelectorAll('.pet-card-chip').forEach(c => setCardState(c, false));
+            setCardState(chip, true);
+            S.pets = [{ id, name, spec, age }];
+        } else {
+            const nowSelected = !chip.classList.contains('selected');
+            setCardState(chip, nowSelected);
+            if (nowSelected) {
+                S.pets.push({ id, name, spec, age });
+            } else {
+                S.pets = S.pets.filter(p => p.id !== id);
+            }
+        }
+        calcEstimatedTotal();
+        updateSummaryWidget();
+    }
+
+    function selectServiceCard(card) {
+        document.querySelectorAll('.svc-item-card').forEach(c => {
+            c.classList.remove('selected');
+            c.style.border = '2px solid #e2e8f0';
+            c.style.background = '#fff';
+            const rad = c.querySelector('.svc-check-radio');
+            if (rad) { rad.style.border = '2px solid #cbd5e1'; rad.style.background = 'transparent'; rad.innerHTML = ''; }
+        });
+        card.classList.add('selected');
+        card.style.border = '2px solid #5b21b6';
+        card.style.background = '#fcfaff';
+        const rad = card.querySelector('.svc-check-radio');
+        if (rad) { rad.style.border = '2px solid #5b21b6'; rad.style.background = '#5b21b6'; rad.innerHTML = '<div style="width:6px;height:6px;border-radius:50%;background:#fff;"></div>'; }
+
+        S.svcId   = card.dataset.svcId;
+        S.svcName = card.dataset.svcName;
+        S.svcDur  = parseInt(card.dataset.svcDur) || 30;
+        S.svcPrice = parseFloat(card.dataset.svcPrice) || 0;
+        S.svcInfo  = card.dataset.svcInfo;
+
+        const infoEl = document.getElementById('svcInfoText');
+        if (infoEl) infoEl.innerHTML = '<strong>' + S.svcName + ' includes:</strong> ' + S.svcInfo.replace(/^.*includes:\s*/i, '');
+
+        calcEstimatedTotal();
+        updateSummaryWidget();
+        // Re-render slots: service duration affects which slots are available
+        if (S.date) renderDefaultTimeSlots();
+    }
+
+    // Service prices are not shown; the only amount at booking is the fixed reservation fee
+    const RESERVATION_FEE_TXT = '₱150.00';
+    function calcEstimatedTotal() {
+        const sumPriceEl = document.getElementById('sumServicePrice');
+        if (sumPriceEl) sumPriceEl.textContent = '';
+        const sumTotEl = document.getElementById('sumEstimatedTotal');
+        if (sumTotEl) sumTotEl.textContent = RESERVATION_FEE_TXT;
+    }
+
+    // Pre-select the recommended veterinarian when the wizard opens
+    document.addEventListener('DOMContentLoaded', function () {
+        var rc = document.querySelector('.vet-card[data-vet-id="' + S.vetId + '"]');
+        if (rc) selectVetCard(rc);
+    });
+
+    function selectVetCard(card) {
+        document.querySelectorAll('.vet-card').forEach(c => {
+            c.classList.remove('selected');
+            c.style.border = '2px solid #e2e8f0';
+            c.style.background = '#fff';
+        });
+        card.classList.add('selected');
+        card.style.border = '2px solid #5b21b6';
+        card.style.background = '#fcfaff';
+
+        S.vetId   = card.dataset.vetId;
+        S.vetName = card.dataset.vetName;
+        S.vetSpec = card.dataset.vetSpec;
+        updateSummaryWidget();
+        // Refresh the date picker so this doctor's days off are greyed out
+        if (fpInstance) fpInstance.redraw();
+        // Re-render slots with the selected doctor's schedule
+        if (S.date) renderDefaultTimeSlots();
+    }
+
+    let fpInstance = null;
+    function initFlatpickr() {
+        const el = document.getElementById('wizDatePicker');
+        const wrapper = document.getElementById('calWrapper');
+        if (!el || !wrapper) return;
+        fpInstance = flatpickr(el, {
+            inline: true,
+            appendTo: wrapper,
+            minDate: TOMORROW_STR,
+            dateFormat: 'Y-m-d',
+            disable: [
+                // Sundays
+                d => d.getDay() === 0,
+                // Public holidays from DB
+                d => {
+                    const y = d.getFullYear();
+                    const mo = String(d.getMonth() + 1).padStart(2, '0');
+                    const dy = String(d.getDate()).padStart(2, '0');
+                    return HOLIDAYS.includes(`${y}-${mo}-${dy}`);
+                },
+                // Selected doctor's day off or leave
+                d => !getDayAvailability(ymd(d)).working
+            ],
+            onChange: function(sel, str) {
+                onDateSelected(str);
+            }
+        });
+    }
+
+    function quickPickDate(offsetDays) {
+        const d = new Date();
+        d.setDate(d.getDate() + offsetDays);
+        const str = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+        if (fpInstance) fpInstance.setDate(str, true);
+        onDateSelected(str);
+    }
+
+    function onDateSelected(str) {
+        S.date = str;
+        S.time = '';
+        S.timeLabel = '';
+
+        const dObj = new Date(str + 'T12:00:00');
+        const dtDisp = document.getElementById('slotDateDisplay');
+        if (dtDisp) dtDisp.textContent = dObj.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+
+        // Show the selected-date badge
+        const badge = document.getElementById('selDateBadge');
+        if (badge) badge.style.display = 'inline-flex';
+
+        renderDefaultTimeSlots();
+        updateSummaryWidget();
+    }
+
+    // Convert "HH:MM" string to total minutes
+    function timeStrToMins(t) {
+        if (!t) return 0;
+        const [h, m] = t.split(':').map(Number);
+        return h * 60 + m;
+    }
+
+    // Availability of the selected doctor on a date, from their weekly schedule + leaves.
+    // Returns {working, reason, start, end, breakStart, breakEnd} (minutes).
+    const DAY_NAMES = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    function getDayAvailability(dateStr, vetId = S.vetId) {
+        const clinicDefault = { working: true, start: 8 * 60, end: 17 * 60, breakStart: 12 * 60, breakEnd: 13 * 60 };
+        if (!vetId || !dateStr) return clinicDefault;
+        if ((DOCTOR_LEAVES[vetId] || []).includes(dateStr)) {
+            return { working: false, reason: `${S.vetName || 'This doctor'} is on leave on this date.` };
+        }
+        const dow = new Date(dateStr + 'T12:00:00').getDay();
+        const ds  = (DOCTOR_WEEKLY[vetId] || {})[dow];
+        if (!ds) return clinicDefault;
+        if (!ds.is_working) {
+            return { working: false, reason: `${S.vetName || 'This doctor'} does not work on ${DAY_NAMES[dow]}s.` };
+        }
+        const hasBreak = ds.break_start && ds.break_end;
+        return {
+            working: true,
+            start: timeStrToMins(ds.work_start),
+            end: timeStrToMins(ds.work_end),
+            breakStart: hasBreak ? timeStrToMins(ds.break_start) : null,
+            breakEnd: hasBreak ? timeStrToMins(ds.break_end) : null
+        };
+    }
+
+    // 30-minute slot start times within the doctor's hours for a date
+    function buildSlotTimes(dateStr) {
+        const av = getDayAvailability(dateStr);
+        const times = [];
+        if (!av.working) return times;
+        for (let m = av.start; m + 30 <= av.end; m += 30) {
+            times.push(String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0'));
+        }
+        return times;
+    }
+
+    function ymd(d) {
+        return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    }
+
+    function renderDefaultTimeSlots() {
+        const grid = document.getElementById('slotsGrid');
+        if (!grid) return;
+
+        if (!S.date) {
+            grid.innerHTML = '<div class="slots-ph"><i class="fa fa-calendar-day"></i>Select a date to see available time slots.</div>';
+            return;
+        }
+
+        // Slots come from the selected doctor's weekly schedule (clinic default 08:00-17:00)
+        const av = getDayAvailability(S.date);
+        if (!av.working) {
+            grid.innerHTML = `<div class="slots-ph"><i class="fa fa-user-clock" style="color:#fca5a5;"></i>${av.reason} Please pick another day or doctor.</div>`;
+            return;
+        }
+        const allTimes = buildSlotTimes(S.date);
+        const amTimes = allTimes.filter(t => timeStrToMins(t) < 12 * 60);
+        const pmTimes = allTimes.filter(t => timeStrToMins(t) >= 12 * 60);
+
+        let html = '';
+        const amBtns = amTimes.map(t => buildSlotBtn(t)).filter(b => b !== null);
+        const pmBtns = pmTimes.map(t => buildSlotBtn(t)).filter(b => b !== null);
+
+        if (amBtns.length > 0) {
+            html += '<div class="slot-section-lbl"><i class="fa fa-sun" style="color:#f59e0b;"></i> Morning</div>';
+            html += amBtns.join('');
+        }
+        if (pmBtns.length > 0) {
+            html += '<div class="slot-section-lbl"><i class="fa fa-cloud-sun" style="color:#6366f1;"></i> Afternoon</div>';
+            html += pmBtns.join('');
+        }
+        if (amBtns.length === 0 && pmBtns.length === 0) {
+            html = '<div class="slots-ph"><i class="fa fa-times-circle" style="color:#fca5a5;"></i>No available slots for this date. Please pick another day.</div>';
+        }
+        grid.innerHTML = html;
+    }
+
+    function buildSlotBtn(t) {
+        const lbl = fmt12(t);
+        const [h, m] = t.split(':').map(Number);
+        const slotStartMins = h * 60 + m;
+        const slotDur       = S.svcDur || 30;
+        const slotEndMins   = slotStartMins + slotDur;
+
+        // ── Doctor schedule constraints ───────────────────────────────────
+        const docSched   = S.vetId ? DOCTOR_SCHEDULES[S.vetId] : null;
+        const av         = getDayAvailability(S.date);
+        const bufferMins = docSched ? parseInt(docSched.buffer_mins) : 15;
+        if (!av.working) return null;
+
+        // Outside working hours → hide slot entirely
+        if (slotStartMins < av.start || slotEndMins > av.end) return null;
+
+        // Overlaps break time → hide slot
+        if (av.breakStart !== null && !(slotEndMins <= av.breakStart || slotStartMins >= av.breakEnd)) return null;
+
+        // ── Duration-aware conflict check ─────────────────────────────────
+        const bookedOnDate = BOOKED_DETAILED[S.date] || [];
+        const isConflict = bookedOnDate.some(b => {
+            const bWinStart = b.s - bufferMins;
+            const bWinEnd   = b.s + b.d + bufferMins;
+            return !(slotEndMins <= bWinStart || slotStartMins >= bWinEnd);
+        });
+
+        if (isConflict) {
+            return `<button type="button" class="appt-slot-btn booked" disabled title="Already booked">
+                        <div>${lbl}</div>
+                        <div style="font-size:9px;color:#dc2626;font-weight:800;margin-top:1px;">BOOKED</div>
+                    </button>`;
+        }
+        const isSel = (S.time === t);
+        return `<button type="button" class="appt-slot-btn${isSel ? ' selected' : ''}" data-time="${t}" data-label="${lbl}" onclick="selectSlotBtn(this)">${lbl}</button>`;
+    }
+
+    function selectSlotBtn(btn) {
+        if (btn.disabled || btn.classList.contains('booked')) return;
+        document.querySelectorAll('.appt-slot-btn').forEach(b => {
+            if (!b.classList.contains('booked')) b.classList.remove('selected');
+        });
+        btn.classList.add('selected');
+        S.time = btn.dataset.time;
+        S.timeLabel = btn.dataset.label;
+        updateSummaryWidget();
+        // Trigger smart suggestion analysis with slight delay for feel
+        setTimeout(analyzeAndSuggest, 350);
+    }
+
+    function fmt12(t) {
+        const [h, m] = t.split(':').map(Number);
+        const h12 = h > 12 ? h - 12 : (h || 12);
+        return `${h12}:${String(m).padStart(2, '0')} ${h >= 12 ? 'PM' : 'AM'}`;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  SMART SCHEDULING SUGGESTION ENGINE
+    // ══════════════════════════════════════════════════════════════════════════
+    let _pendingSuggestion = null;
+
+    function analyzeAndSuggest() {
+        if (!S.date || !S.time) { hideSuggestionUI(); return; }
+
+        const suggestion = computeSuggestion();
+        if (suggestion === 'optimal') {
+            showOptimalBadge();
+        } else if (suggestion) {
+            _pendingSuggestion = suggestion;
+            showSuggestionCard(suggestion);
+        } else {
+            hideSuggestionUI();
+        }
+    }
+
+    function computeSuggestion() {
+        const [sh, sm] = S.time.split(':').map(Number);
+        const selMins    = sh * 60 + sm;
+        const curLoad    = APPT_DENSITY[S.date] || 0;
+        const docSched   = S.vetId ? DOCTOR_SCHEDULES[S.vetId] : null;
+        const bufferMins = docSched ? parseInt(docSched.buffer_mins) : 15;
+
+        // Suggestions stay in the shift the client picked: AM → AM, PM → PM
+        const isAM       = selMins < 12 * 60;
+        const shiftStart = isAM ? 0 : 12 * 60;
+        const shiftEnd   = isAM ? 12 * 60 : 24 * 60;
+
+        // ── Rule 1: Earliest available slot in the same shift ────────────────
+        const earliest = findEarliestFreeSlot(S.date, shiftStart, shiftEnd);
+        if (earliest && timeStrToMins(earliest) < selMins) {
+            return {
+                type: 'time', date: S.date, time: earliest,
+                reason: isAM
+                    ? '🌅 <strong>An earlier morning slot is available.</strong> This is the earliest open time this morning — arrive sooner and get your pet checked before the mid-morning rush.'
+                    : '🌤️ <strong>An earlier afternoon slot is available.</strong> This is the earliest open time this afternoon — shorter wait and more time with the doctor.',
+                tag: isAM ? 'Earliest Morning Slot' : 'Earliest Afternoon Slot',
+                load: curLoad
+            };
+        }
+
+        // ── Rule 2: Busy day (≥6 appts) → lighter nearby day, same shift ─────
+        if (curLoad >= 6) {
+            const lighter = findLighterDay();
+            if (lighter) {
+                const slot = findEarliestFreeSlot(lighter.date, shiftStart, shiftEnd);
+                if (slot) {
+                    return {
+                        type: 'day', date: lighter.date, time: slot,
+                        reason: `📊 <strong>${formatDateLabel(S.date)}</strong> is getting busy with <strong>${curLoad} appointments</strong>. <strong>${formatDateLabel(lighter.date)}</strong> has only <strong>${lighter.count}</strong> — your pet will receive more dedicated care time.`,
+                        tag: 'Less Busy Day',
+                        load: lighter.count
+                    };
+                }
+            }
+        }
+
+        // Already optimal
+        return 'optimal';
+    }
+
+    function findEarliestFreeSlot(date, fromMins, toMins) {
+        const av       = getDayAvailability(date);
+        const allSlots = buildSlotTimes(date).filter(t => {
+            const s = timeStrToMins(t), e = s + (S.svcDur || 30);
+            return e <= av.end && (av.breakStart === null || e <= av.breakStart || s >= av.breakEnd);
+        });
+        const docSched   = S.vetId ? DOCTOR_SCHEDULES[S.vetId] : null;
+        const bufferMins = docSched ? parseInt(docSched.buffer_mins) : 15;
+        const svcDur     = S.svcDur || 30;
+        const bookedOnDate = BOOKED_DETAILED[date] || [];
+
+        for (const t of allSlots) {
+            const [h, m] = t.split(':').map(Number);
+            const tMins    = h * 60 + m;
+            const tEndMins = tMins + svcDur;
+            if (tMins < fromMins || tMins >= toMins) continue;
+            const conflict = bookedOnDate.some(b => {
+                const bWin = [b.s - bufferMins, b.s + b.d + bufferMins];
+                return !(tEndMins <= bWin[0] || tMins >= bWin[1]);
+            });
+            if (!conflict) return t;
+        }
+        return null;
+    }
+
+    function findLighterDay() {
+        const selectedDate = new Date(S.date + 'T00:00:00');
+        const threshold    = Math.max(0, (APPT_DENSITY[S.date] || 0) - 2);
+        let best = null, bestCnt = 999;
+        for (let offset = 1; offset <= 14; offset++) {
+            const d = new Date(selectedDate);
+            d.setDate(d.getDate() + offset);
+            if (d.getDay() === 0) continue; // skip Sunday
+            const dStr = ymd(d);
+            if (HOLIDAYS.includes(dStr)) continue;
+            if (!getDayAvailability(dStr).working) continue; // doctor's day off / leave
+            const cnt = APPT_DENSITY[dStr] || 0;
+            if (cnt <= threshold && cnt < bestCnt) { bestCnt = cnt; best = { date: dStr, count: cnt }; }
+        }
+        return best;
+    }
+
+    function formatDateLabel(dateStr) {
+        const d = new Date(dateStr + 'T00:00:00');
+        const days   = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+        const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        return `${days[d.getDay()]}, ${months[d.getMonth()]} ${d.getDate()}`;
+    }
+
+    function buildLoadDots(count) {
+        const filled = Math.min(5, Math.round((count / MAX_DAILY_APPTS) * 5));
+        let html = '';
+        for (let i = 0; i < 5; i++) {
+            let color;
+            if (i >= filled) { color = '#e2e8f0'; }
+            else if (filled >= 4) { color = '#ef4444'; }
+            else if (filled >= 3) { color = '#f59e0b'; }
+            else { color = '#10b981'; }
+            html += `<span style="width:11px;height:11px;border-radius:50%;background:${color};display:inline-block;"></span>`;
+        }
+        return html;
+    }
+
+    function showSuggestionCard(s) {
+        const box     = document.getElementById('smartSuggestionBox');
+        const optBox  = document.getElementById('smartOptimalBox');
+        const reason  = document.getElementById('suggestionReason');
+        const dtLbl   = document.getElementById('suggestionDateTimeLabel');
+        const tagEl   = document.getElementById('suggestionReasonTag');
+        const dotsEl  = document.getElementById('suggestionLoadDots');
+
+        if (optBox) optBox.style.display = 'none';
+        if (!box) return;
+
+        const dateLabel = formatDateLabel(s.date);
+        const timeLabel = fmt12(s.time);
+
+        if (reason)  reason.innerHTML  = s.reason;
+        if (dtLbl)   dtLbl.textContent = `${dateLabel} · ${timeLabel}`;
+        if (tagEl)   tagEl.textContent = s.tag;
+        if (dotsEl)  dotsEl.innerHTML  = buildLoadDots(s.load);
+
+        box.style.display    = 'block';
+        box.style.opacity    = '0';
+        box.style.transform  = 'translateY(8px)';
+        box.style.transition = 'all .35s cubic-bezier(.4,0,.2,1)';
+        requestAnimationFrame(() => {
+            box.style.opacity   = '1';
+            box.style.transform = 'translateY(0)';
+        });
+    }
+
+    function showOptimalBadge() {
+        const box    = document.getElementById('smartSuggestionBox');
+        const optBox = document.getElementById('smartOptimalBox');
+        if (box)    box.style.display    = 'none';
+        if (optBox) {
+            optBox.style.display    = 'flex';
+            optBox.style.opacity    = '0';
+            optBox.style.transform  = 'translateY(6px)';
+            optBox.style.transition = 'all .35s';
+            requestAnimationFrame(() => {
+                optBox.style.opacity   = '1';
+                optBox.style.transform = 'translateY(0)';
+            });
+        }
+        _pendingSuggestion = null;
+    }
+
+    function hideSuggestionUI() {
+        const box    = document.getElementById('smartSuggestionBox');
+        const optBox = document.getElementById('smartOptimalBox');
+        if (box)    box.style.display = 'none';
+        if (optBox) optBox.style.display = 'none';
+        _pendingSuggestion = null;
+    }
+
+    function acceptSuggestion(e) {
+        if (e) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+        if (!_pendingSuggestion) return;
+        const s = _pendingSuggestion;
+
+        // Apply the suggestion to global appointment state
+        S.date      = s.date;
+        S.time      = s.time;
+        S.timeLabel = fmt12(s.time);
+
+        // Update flatpickr calendar to the new date WITHOUT triggering onChange (pass false)
+        if (fpInstance) {
+            fpInstance.setDate(s.date, false);
+        }
+
+        // Update the date display badge
+        const badge   = document.getElementById('selDateBadge');
+        const dtDisp  = document.getElementById('slotDateDisplay');
+        if (badge)  badge.style.display = 'inline-flex';
+        if (dtDisp) dtDisp.textContent  = formatDateLabel(s.date);
+
+        // Capture notes & location preferences from Step 4 inputs
+        const notes = document.getElementById('wizNotes');
+        if (notes) S.notes = notes.value;
+        const homeAddr = document.getElementById('wizHomeAddr');
+        if (homeAddr && S.loc === 'Home Service') S.addr = homeAddr.value;
+
+        // Re-render slots for new date (suggested slot will be marked selected)
+        renderDefaultTimeSlots();
+
+        hideSuggestionUI();
+        _pendingSuggestion = null;
+        clearErr(4);
+        updateSummaryWidget();
+
+        // Immediately transition directly to Step 5: Review & Confirm
+        showStep(5);
+    }
+
+    function keepSelection() {
+        const box    = document.getElementById('smartSuggestionBox');
+        const optBox = document.getElementById('smartOptimalBox');
+        const fadeOut = el => {
+            if (!el) return;
+            el.style.transition = 'all .25s';
+            el.style.opacity    = '0';
+            el.style.transform  = 'translateY(-6px)';
+            setTimeout(() => { el.style.display = 'none'; el.style.opacity = '1'; el.style.transform = ''; }, 260);
+        };
+        fadeOut(box);
+        fadeOut(optBox);
+        _pendingSuggestion = null;
+    }
+
+    function toggleLocation(radio) {
+        S.loc = radio.value;
+        const box = document.getElementById('homeAddrBox');
+        if (box) box.style.display = (radio.value === 'Home Service') ? 'block' : 'none';
+        updateSummaryWidget();
+    }
+
+    function updateSummaryWidget() {
+        const cName = document.getElementById('sumClientName');
+        if (cName) cName.textContent = S.clientName || '—';
+        const cPhone = document.getElementById('sumClientPhone');
+        if (cPhone) cPhone.textContent = S.clientPhone || '—';
+
+        const pName = document.getElementById('sumPetName');
+        const pSub = document.getElementById('sumPetSub');
+        const pAge = document.getElementById('sumPetAge');
+        if (pName) {
+            if (S.pets.length > 0) {
+                pName.textContent = S.pets.map(p => p.name).join(', ');
+                if (pSub) pSub.textContent = S.pets[0].spec || 'Pet Profile';
+                if (pAge) pAge.textContent = S.pets[0].age || 'Active Profile';
+            } else {
+                pName.textContent = 'Select a pet';
+                if (pSub) pSub.textContent = '';
+                if (pAge) pAge.textContent = '';
+            }
+        }
+
+        const sName = document.getElementById('sumServiceName');
+        if (sName) sName.textContent = S.svcName;
+
+        const vNameEl = document.getElementById('sumVetName');
+        if (vNameEl) {
+            if (S.vetName) {
+                vNameEl.textContent = S.vetName;
+                vNameEl.style.color = '#1e1b4b';
+            } else {
+                vNameEl.textContent = 'Not selected yet';
+                vNameEl.style.color = '#94a3b8';
+            }
+        }
+
+        const dtEl = document.getElementById('sumDateTime');
+        if (dtEl) {
+            if (S.date && S.timeLabel) {
+                const dObj = new Date(S.date + 'T12:00:00');
+                const dStr = dObj.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                dtEl.textContent = dStr + ' @ ' + S.timeLabel;
+                dtEl.style.color = '#1e1b4b';
+            } else {
+                dtEl.textContent = 'Not selected yet';
+                dtEl.style.color = '#94a3b8';
+            }
+        }
+
+        calcEstimatedTotal();
+    }
+
+    function fillReviewData() {
+        const rClient = document.getElementById('rvClientName'); if (rClient) rClient.textContent = S.clientName;
+        const rPet = document.getElementById('rvPetName'); if (rPet) rPet.textContent = S.pets.map(p => p.name).join(', ');
+        const rSvc = document.getElementById('rvService'); if (rSvc) rSvc.textContent = S.svcName;
+        const rVet = document.getElementById('rvVet'); if (rVet) rVet.textContent = S.vetName || 'Not selected';
+        const rDt = document.getElementById('rvDateTime'); if (rDt) rDt.textContent = (S.date ? S.date : '—') + ' at ' + (S.timeLabel ? S.timeLabel : '—');
+        const rLoc = document.getElementById('rvLocation'); if (rLoc) rLoc.textContent = S.loc + (S.addr ? ' (' + S.addr + ')' : '');
+    }
+
+    function submitAppointment() {
+        const btn = document.getElementById('submitBtn');
+        if (btn) {
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fa fa-spinner fa-spin me-2"></i>Submitting…';
+        }
+
+        const petVal = S.pets.length === 1
+            ? S.pets[0].name
+            : JSON.stringify(S.pets.map(p => ({ name: p.name, id: p.id })));
+
+        const fPet = document.getElementById('f_pet'); if (fPet) fPet.value = petVal;
+        const fSvc = document.getElementById('f_svc'); if (fSvc) fSvc.value = S.svcName;
+        const fDate = document.getElementById('f_date'); if (fDate) fDate.value = S.date;
+        const fTime = document.getElementById('f_time'); if (fTime) fTime.value = S.time;
+        const fLoc = document.getElementById('f_loc'); if (fLoc) fLoc.value = S.loc;
+        const fAddr = document.getElementById('f_addr'); if (fAddr) fAddr.value = S.addr;
+        const fDoc = document.getElementById('f_doc'); if (fDoc) fDoc.value = S.vetId;
+        const fNotes = document.getElementById('f_notes');
+        const wizNotes = document.getElementById('wizNotes');
+        if (fNotes && wizNotes) fNotes.value = wizNotes.value;
+
+        const form = document.getElementById('wizForm');
+        if (form) {
+            const fd = new FormData(form);
+            fd.append('return_appt_id', '1'); // Signal we want the appointment ID back
+            fetch('appointments.php', { method: 'POST', body: fd })
+                .then(async r => {
+                    const text = await r.text();
+                    // Try to extract appointment ID from response
+                    const idMatch = text.match(/APPT_ID:(\d+)/);
+                    const errorMatch = text.match(/APPT_ERROR:(.*)/);
+                    if (idMatch && idMatch[1]) {
+                        window._newApptId = idMatch[1];
+                        showStep(6);
+                    } else if (errorMatch && errorMatch[1]) {
+                        alert("Booking Failed: " + errorMatch[1].replace(/<\/?[^>]+(>|$)/g, ""));
+                        const btn = document.getElementById('submitBtn');
+                        if (btn) {
+                            btn.disabled = false;
+                            btn.innerHTML = 'Confirm Booking &gt;';
+                        }
+                    } else {
+                        alert("An unexpected error occurred. Please try again.");
+                        window.location.reload();
+                    }
+                })
+                .catch(() => {
+                    alert('Network error while booking. Please try again.');
+                    window.location.reload();
+                });
+        }
+    }
+
+    function payReservationFee() {
+        if (!window._newApptId) {
+            alert('Appointment ID not found. Please try again.');
+            return;
+        }
+        document.getElementById('payReservationBtn').disabled = true;
+        document.getElementById('payReservationBtn').innerHTML = '<i class="fa fa-spinner fa-spin me-2"></i> Redirecting...';
+        document.getElementById('payment-loading-msg').style.display = 'block';
+        window.location.href = 'appointments.php?initpay=reservation&appt_id=' + window._newApptId;
+    }
+
+    function skipReservationFee() {
+        showStep(7);
+    }
+
+    function resetWizard() {
+        S.step = 1;
+        S.date = "";
+        S.time = "";
+        S.timeLabel = "";
+        S.loc = "Clinic Visit";
+        S.addr = "";
+        // Reset location radio to Clinic Visit
+        const clinicRadio = document.querySelector('input[name="wiz_location"][value="Clinic Visit"]');
+        if (clinicRadio) { clinicRadio.checked = true; }
+        const addrBox = document.getElementById('homeAddrBox');
+        if (addrBox) addrBox.style.display = 'none';
+        const notes = document.getElementById('wizNotes'); if (notes) notes.value = "";
+        if (fpInstance) fpInstance.clear();
+        // Hide date badge
+        const badge = document.getElementById('selDateBadge');
+        if (badge) badge.style.display = 'none';
+        const slotsGrid = document.getElementById('slotsGrid');
+        if (slotsGrid) slotsGrid.innerHTML = '<div class="slots-ph"><i class="fa fa-calendar-day"></i>Select a date to see available time slots.</div>';
+        showStep(1);
+    }
+
+    // ── APPOINTMENT DETAIL & ACTION MODAL HANDLERS ──
+    function openDetailModal(row) {
+        if (!row) return;
+        const dmTitle = document.getElementById('dmTitle');
+        const dmService = document.getElementById('dmService');
+        const dmPet = document.getElementById('dmPet');
+        const dmApptId = document.getElementById('dmApptId');
+        const dmStatus = document.getElementById('dmStatus');
+        const dmDateTime = document.getElementById('dmDateTime');
+        const dmLocation = document.getElementById('dmLocation');
+        const dmVet = document.getElementById('dmVet');
+
+        if (dmTitle) dmTitle.textContent = 'Appointment #' + row.id;
+        if (dmService) dmService.textContent = row.service_type || 'General Consultation';
+        if (dmPet) dmPet.textContent = 'Pet: ' + (row.pet_name || 'Pet');
+        if (dmApptId) dmApptId.textContent = '#' + row.id;
+        if (dmStatus) dmStatus.textContent = row.status || 'Pending';
+        if (dmDateTime) dmDateTime.textContent = (row.appointment_date || '—') + (row.appointment_time ? ' at ' + row.appointment_time : '');
+        if (dmLocation) dmLocation.textContent = row.service_location || 'On-Site';
+        if (dmVet) dmVet.textContent = row.doctor_name || row.doctor_fullname || 'To be assigned by the clinic';
+
+        // Audit Trail
+        const auditWrap = document.getElementById('dmAuditTrail');
+        if (auditWrap) {
+            let html = '';
+            
+            function formatDateStr(dStr) {
+                if (!dStr) return '';
+                const d = new Date(dStr);
+                return isNaN(d) ? dStr : d.toLocaleString();
+            }
+
+            if (row.created_at) {
+                html += `<li style="margin-bottom:6px;"><i class="fa fa-circle text-primary" style="font-size:8px; margin-right:6px; vertical-align:middle;"></i> <strong>Booked:</strong> ${formatDateStr(row.created_at)}</li>`;
+            }
+            if (row.downpayment_paid_at) {
+                html += `<li style="margin-bottom:6px;"><i class="fa fa-circle text-warning" style="font-size:8px; margin-right:6px; vertical-align:middle;"></i> <strong>Payment Captured:</strong> ${formatDateStr(row.downpayment_paid_at)}</li>`;
+            }
+            if (row.approved_at) {
+                html += `<li style="margin-bottom:6px;"><i class="fa fa-circle text-success" style="font-size:8px; margin-right:6px; vertical-align:middle;"></i> <strong>Approved:</strong> ${formatDateStr(row.approved_at)}</li>`;
+            }
+            
+            if (row.status === 'Cancelled' || row.status === 'Rejected') {
+                html += `<li style="margin-bottom:6px;"><i class="fa fa-circle text-danger" style="font-size:8px; margin-right:6px; vertical-align:middle;"></i> <strong>${row.status}:</strong> (Updated by Clinic/User)</li>`;
+            } else if (row.status === 'Completed') {
+                html += `<li style="margin-bottom:6px;"><i class="fa fa-circle text-info" style="font-size:8px; margin-right:6px; vertical-align:middle;"></i> <strong>Completed:</strong> (Service Delivered)</li>`;
+            }
+
+            if (html === '') {
+                html = '<li>No audit trail records available.</li>';
+            }
+            auditWrap.innerHTML = html;
+        }
+
+        // Notes
+        const notesWrap = document.getElementById('dmNotesWrap');
+        const notesVal = document.getElementById('dmNotes');
+        if (notesWrap && notesVal) {
+            if (row.notes || row.admin_message) {
+                notesVal.textContent = row.admin_message ? ('Clinic Message: ' + row.admin_message + (row.notes ? '\nYour Notes: ' + row.notes : '')) : row.notes;
+                notesWrap.style.display = 'block';
+            } else {
+                notesWrap.style.display = 'none';
+            }
+        }
+
+        // Reschedule proposal alert banner
+        const alertBox = document.getElementById('dmRescheduleAlert');
+        const pText = document.getElementById('dmProposalText');
+        const accId = document.getElementById('dmAcceptAptId');
+        const decId = document.getElementById('dmDeclineAptId');
+        if (alertBox && pText && accId && decId) {
+            if (row.client_action_needed == 1 && row.proposed_reschedule_date) {
+                alertBox.style.display = 'block';
+                accId.value = row.id;
+                decId.value = row.id;
+                const pTime = row.proposed_reschedule_time ? ' at ' + row.proposed_reschedule_time : '';
+                pText.innerHTML = 'The clinic proposed shifting this visit to <strong>' + row.proposed_reschedule_date + pTime + '</strong>.' + (row.admin_message ? '<br><em>Reason: ' + row.admin_message + '</em>' : '');
+            } else {
+                alertBox.style.display = 'none';
+            }
+        }
+
+        // Reset reschedule form
+        toggleRescheduleForm(false);
+        const reqId = document.getElementById('dmReqReschedId');
+        if (reqId) reqId.value = row.id;
+
+        // Action buttons in footer
+        const footer = document.getElementById('dmFooterActions');
+        if (footer) {
+            footer.innerHTML = '';
+            const status = row.status || '';
+            const isCancelable = (status === 'Pending' || status === 'Approved');
+
+            if (isCancelable) {
+                // Request Reschedule Button
+                const btnResched = document.createElement('button');
+                btnResched.type = 'button';
+                btnResched.className = 'btn-action gray';
+                btnResched.innerHTML = '<i class="fa fa-calendar-alt me-1"></i> Request Reschedule';
+                btnResched.onclick = function() { toggleRescheduleForm(true); };
+                footer.appendChild(btnResched);
+
+                // Cancel Appointment Button
+                const cancelForm = document.createElement('form');
+                cancelForm.method = 'POST';
+                cancelForm.style.flex = '1';
+                cancelForm.onsubmit = function() {
+                    return pvNoRefundDialog(this, {
+                        kind: 'appointment',
+                        what: (row.pet_name || '') + ' · ' + (row.service_type || '') + ' on ' + (row.appointment_date ? new Date(row.appointment_date + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : ''),
+                        paid: row.downpayment_status === 'Paid' ? row.downpayment_amount : 0
+                    });
+                };
+                cancelForm.innerHTML = `
+                    <input type="hidden" name="cancel_appt" value="1">
+                    <input type="hidden" name="cancel_appt_id" value="${row.id}">
+                    <input type="hidden" name="appt_type" value="Appointment">
+                    <button type="submit" class="btn-action red w-100">
+                        <i class="fa fa-times me-1"></i> Cancel Appointment
+                    </button>
+                `;
+                footer.appendChild(cancelForm);
+            } else if (status === 'Completed') {
+                const btnBill = document.createElement('a');
+                btnBill.href = 'billing.php';
+                btnBill.className = 'btn-action green';
+                btnBill.style.textAlign = 'center';
+                btnBill.style.textDecoration = 'none';
+                btnBill.innerHTML = '<i class="fa fa-file-invoice-dollar me-1"></i> View Billing';
+                footer.appendChild(btnBill);
+            }
+
+            // Close button
+            const btnClose = document.createElement('button');
+            btnClose.type = 'button';
+            btnClose.className = 'btn-action gray';
+            btnClose.style.flex = '0 0 auto';
+            btnClose.textContent = 'Close';
+            btnClose.onclick = closeDetailModal;
+            footer.appendChild(btnClose);
+        }
+
+        // Open modal
+        const bd = document.getElementById('detailModalBackdrop');
+        if (bd) bd.classList.add('open');
+    }
+
+    function closeDetailModal() {
+        const bd = document.getElementById('detailModalBackdrop');
+        if (bd) bd.classList.remove('open');
+        toggleRescheduleForm(false);
+    }
+
+    function toggleRescheduleForm(show) {
+        const wrap = document.getElementById('dmRescheduleFormWrap');
+        if (wrap) wrap.style.display = show ? 'block' : 'none';
+        if (!show) setRebookMode(false);
+    }
+
+    // Declining a clinic proposal: pick your own new date instead (no new reservation fee)
+    function setRebookMode(on) {
+        const flag = document.getElementById('dmDeclineRebook');
+        const head = document.getElementById('dmReschedHeading');
+        const note = document.getElementById('dmRebookNote');
+        if (flag) flag.value = on ? '1' : '';
+        if (head) head.textContent = on ? 'Decline & Choose a New Date' : 'Request Reschedule';
+        if (note) note.style.display = on ? 'block' : 'none';
+    }
+    function startDeclineRebook() {
+        const id = document.getElementById('dmDeclineAptId');
+        const reqId = document.getElementById('dmReqReschedId');
+        if (id && reqId) reqId.value = id.value;
+        const wrap = document.getElementById('dmRescheduleFormWrap');
+        if (wrap) wrap.style.display = 'block';
+        setRebookMode(true);
+        if (wrap) wrap.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    // Opened from a notification: show that appointment's details (or the pending proposal)
+    document.addEventListener('DOMContentLoaded', function () {
+        const p = new URLSearchParams(location.search);
+        let row = null;
+        if (p.get('open_appt')) row = document.querySelector('.appt-row[data-appt-id="' + parseInt(p.get('open_appt')) + '"]');
+        if (!row && p.has('open_resched')) row = document.querySelector('.appt-row[data-action-needed="1"]');
+        if (row) setTimeout(function () { row.click(); }, 300);
+    });
+
+    // Filter tabs listener
+    document.addEventListener('DOMContentLoaded', function() {
+        document.querySelectorAll('.filter-tab').forEach(tab => {
+            tab.addEventListener('click', function() {
+                document.querySelectorAll('.filter-tab').forEach(t => t.classList.remove('active'));
+                this.classList.add('active');
+                const filter = this.dataset.filter;
+                document.querySelectorAll('.appt-row').forEach(row => {
+                    const status = row.dataset.status;
+                    const actionNeeded = row.dataset.actionNeeded;
+                    if (filter === 'all') {
+                        row.style.display = '';
+                    } else if (filter === 'action_needed') {
+                        row.style.display = (actionNeeded === '1') ? '' : 'none';
+                    } else {
+                        row.style.display = (status === filter) ? '' : 'none';
+                    }
+                });
+            });
+        });
+    });
+    </script>
+</div>
+<!-- FEEDBACK MODAL -->
+    <?php if ($pending_feedback): ?>
+        <div class="modal fade" id="autoFeedbackModal" tabindex="-1">
+            <div class="modal-dialog modal-dialog-centered">
+                <div class="modal-content feedback-modal-content">
+                    <div class="feedback-header text-center">
+                        <button type="button" class="btn-close position-absolute" data-bs-dismiss="modal"
+                            style="top:20px; right:20px;"></button>
+                        <div class="feedback-icon-bg">
+                            <i class="fa fa-comments text-primary" style="font-size:35px;"></i>
+                        </div>
+                        <h3 class="fw-bold text-dark mb-1">Submit Your Feedback</h3>
+                        <p class="text-muted small">We'd love to hear about your experience with
+                            <b><?php echo htmlspecialchars($pending_feedback['pet_name']); ?></b>'s
+                            <?php echo htmlspecialchars($pending_feedback['service_type']); ?>.</p>
+                    </div>
+                    <div class="feedback-body">
+                        <div class="feedback-stars mb-4 d-flex justify-content-center gap-2">
+                            <i class="fa fa-star star-item" data-value="1"></i>
+                            <i class="fa fa-star star-item" data-value="2"></i>
+                            <i class="fa fa-star star-item" data-value="3"></i>
+                            <i class="fa fa-star star-item" data-value="4"></i>
+                            <i class="fa fa-star star-item" data-value="5"></i>
+                        </div>
+
+                        <form id="feedbackForm">
+                            <input type="hidden" name="appointment_id" value="<?php echo $pending_feedback['id']; ?>">
+                            <input type="hidden" name="rating" id="feedbackRatingInput" value="0">
+                            <input type="hidden" name="submit_review" value="1">
+
+                            <div class="mb-3 text-start">
+                                <textarea name="comments" class="form-control feedback-textarea" rows="3"
+                                    placeholder="Your message (Optional)..."></textarea>
+                            </div>
+
+                            <button type="button" class="feedback-btn" onclick="submitFeedbackAjax()">
+                                <i class="fa fa-paper-plane me-2"></i> SEND FEEDBACK
+                            </button>
+                            <div class="text-center mt-2">
+                                <a href="#" class="text-muted small text-decoration-none" onclick="event.preventDefault(); dismissFeedbackPrompt();">Maybe later</a>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <script>
+            // Ask once per visit: "Maybe later" / closing remembers this visit and stops asking about it
+            var FB_KEY = 'pv_feedback_dismissed_<?php echo (int)$pending_feedback['id']; ?>';
+            function feedbackDismissed() { try { return localStorage.getItem(FB_KEY) === '1'; } catch (e) { return false; } }
+            function dismissFeedbackPrompt() {
+                try { localStorage.setItem(FB_KEY, '1'); } catch (e) {}
+                var inst = window.bootstrap && bootstrap.Modal.getInstance(document.getElementById('autoFeedbackModal'));
+                if (inst) inst.hide();
+            }
+
+            // Bootstrap is loaded later on this page, so wait for it before showing the prompt
+            function showFeedbackPrompt(tries) {
+                if (feedbackDismissed()) return;
+                if (!window.bootstrap) { if (tries < 40) setTimeout(function () { showFeedbackPrompt(tries + 1); }, 250); return; }
+                var el = document.getElementById('autoFeedbackModal');
+                el.addEventListener('hide.bs.modal', function () { try { localStorage.setItem(FB_KEY, '1'); } catch (e) {} });
+                setTimeout(function waitForOtherPopups() {
+                    // Don't stack on top of another popup (e.g. clinic reminders) — wait until it's closed
+                    if (document.querySelector('.modal.show')) { setTimeout(waitForOtherPopups, 600); return; }
+                    if (!feedbackDismissed()) new bootstrap.Modal(el).show();
+                }, 1200); // let the page settle first
+            }
+
+            document.addEventListener('DOMContentLoaded', function () {
+                showFeedbackPrompt(0);
+
+                // Star Interaction
+                const stars = document.querySelectorAll('.star-item');
+                stars.forEach(s => {
+                    s.addEventListener('click', function () {
+                        const val = this.getAttribute('data-value');
+                        document.getElementById('feedbackRatingInput').value = val;
+                        stars.forEach(st => {
+                            if (st.getAttribute('data-value') <= val) st.classList.add('active');
+                            else st.classList.remove('active');
+                        });
+                    });
+                });
+            });
+
+            function submitFeedbackAjax() {
+                const rating = document.getElementById('feedbackRatingInput').value;
+                if (rating == "0") {
+                    alert("Please select a rating star first.");
+                    return;
+                }
+
+                const btn = document.querySelector('.feedback-btn');
+                const originalText = btn.innerHTML;
+                btn.innerHTML = '<i class="fa fa-spinner fa-spin me-2"></i> SENDING...';
+                btn.disabled = true;
+
+                const formData = new FormData(document.getElementById('feedbackForm'));
+                fetch('feedback.php', {
+                    method: 'POST',
+                    body: formData
+                })
+                    .then(() => {
+                        btn.innerHTML = '<i class="fa fa-check me-2"></i> THANK YOU!';
+                        btn.style.background = '#10b981';
+                        setTimeout(() => {
+                            bootstrap.Modal.getInstance(document.getElementById('autoFeedbackModal')).hide();
+                        }, 1500);
+                    })
+                    .catch(() => {
+                        alert("Something went wrong. Please try again.");
+                        btn.innerHTML = originalText;
+                        btn.disabled = false;
+                    });
+            }
+        </script>
+    <?php endif; ?>
+
+    <?php include("chat_widget.php"); ?>
+    <script src="mousetrail.js"></script>
+    <?php include_once("includes/reminder_popup.php"); ?>
+<?php include_once("includes/cancel_policy_dialog.php"); ?>
+</body>
+
+</html>
